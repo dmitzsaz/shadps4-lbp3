@@ -1,0 +1,308 @@
+diff --git a/src/kosmickrisp/bridge/mtl_encoder.h b/src/kosmickrisp/bridge/mtl_encoder.h
+index 07d8bd03eab..569df6fbc8b 100644
+--- a/src/kosmickrisp/bridge/mtl_encoder.h
++++ b/src/kosmickrisp/bridge/mtl_encoder.h
+@@ -14,7 +14,8 @@
+ /* Common encoder utils */
+ void mtl_end_encoding(void *encoder);
+ void mtl_barrier_after_stages(void *encoder, enum mtl_stages after_stages,
+-                              enum mtl_stages before_queue_stages);
++                              enum mtl_stages before_queue_stages,
++                              enum mtl_visibility_options visibility_options);
+ void mtl_barrier_after_encoder_stages(void *encoder,
+                                       enum mtl_stages after_stages,
+                                       enum mtl_stages before_queue_stages);
+diff --git a/src/kosmickrisp/bridge/mtl_encoder.m b/src/kosmickrisp/bridge/mtl_encoder.m
+index 3735d6a8636..3179277a213 100644
+--- a/src/kosmickrisp/bridge/mtl_encoder.m
++++ b/src/kosmickrisp/bridge/mtl_encoder.m
+@@ -24,14 +24,13 @@
+ 
+ void
+ mtl_barrier_after_stages(void *encoder, enum mtl_stages after_stages,
+-                         enum mtl_stages before_queue_stages)
++                         enum mtl_stages before_queue_stages,
++                         enum mtl_visibility_options visibility_options)
+ {
+    @autoreleasepool {
+       id<MTL4CommandEncoder> enc = (id<MTL4CommandEncoder>)encoder;
+-      /* TODO_KOSMICKRISP Expose visibility option since resource alias should only be required
+-       * if occlusion queries are used */
+       [enc barrierAfterStages:(MTLStages)after_stages beforeQueueStages:(MTLStages)before_queue_stages
+-           visibilityOptions:MTL4VisibilityOptionResourceAlias];
++           visibilityOptions:(MTL4VisibilityOptions)visibility_options];
+    }
+ }
+ 
+diff --git a/src/kosmickrisp/bridge/mtl_types.h b/src/kosmickrisp/bridge/mtl_types.h
+index 76256c2f86a..8be00fd0517 100644
+--- a/src/kosmickrisp/bridge/mtl_types.h
++++ b/src/kosmickrisp/bridge/mtl_types.h
+@@ -235,6 +235,12 @@ enum mtl_barrier_scope {
+    MTL_BARRIER_SCOPE_RENDER_TARGETS = 1 << 2,
+ };
+ 
++enum mtl_visibility_options {
++   MTL_VISIBILITY_OPTION_NONE = 0,
++   MTL_VISIBILITY_OPTION_DEVICE = 1 << 0,
++   MTL_VISIBILITY_OPTION_RESOURCE_ALIAS = 1 << 1,
++};
++
+ enum mtl_stages {
+    MTL_STAGE_VERTEX = 1 << 0,
+    MTL_STAGE_FRAGMENT = 1 << 1,
+diff --git a/src/kosmickrisp/bridge/stubs/mtl_encoder.c b/src/kosmickrisp/bridge/stubs/mtl_encoder.c
+index a64f73a9806..ea2ad40fe38 100644
+--- a/src/kosmickrisp/bridge/stubs/mtl_encoder.c
++++ b/src/kosmickrisp/bridge/stubs/mtl_encoder.c
+@@ -14,7 +14,8 @@ mtl_end_encoding(void *encoder)
+ 
+ void
+ mtl_barrier_after_stages(void *encoder, enum mtl_stages after_stages,
+-                         enum mtl_stages before_queue_stages)
++                         enum mtl_stages before_queue_stages,
++                         enum mtl_visibility_options visibility_options)
+ {
+ }
+ 
+diff --git a/src/kosmickrisp/vulkan/kk_cmd_buffer.c b/src/kosmickrisp/vulkan/kk_cmd_buffer.c
+index f9ff3360b5d..ef37149c285 100644
+--- a/src/kosmickrisp/vulkan/kk_cmd_buffer.c
++++ b/src/kosmickrisp/vulkan/kk_cmd_buffer.c
+@@ -175,6 +175,23 @@ kk_reset_encoder_state(struct kk_encoder_state *es)
+    mtl_command_allocator_reset(es->allocator);
+ }
+ 
++static void
++kk_release_encoder_resources(struct kk_encoder_state *es,
++                             mtl_device *device)
++{
++   /* MTL4CommandAllocator reset keeps its high-water backing allocations.
++    * Honor Vulkan's explicit release request by replacing the allocator.
++    * Allocate first so an allocation failure can safely fall back to the
++    * already-reset allocator. */
++   mtl_command_allocator *new_allocator =
++      mtl_new_command_allocator(device);
++   if (new_allocator == NULL)
++      return;
++
++   mtl_release(es->allocator);
++   es->allocator = new_allocator;
++}
++
+ void
+ kk_reset_cmd_buffer_internal(struct kk_cmd_buffer *cmd)
+ {
+@@ -195,17 +212,24 @@ kk_reset_cmd_buffer_internal(struct kk_cmd_buffer *cmd)
+ 
+    memset(&cmd->state, 0, sizeof(cmd->state));
+    cmd->uses_heap = false;
++   cmd->uses_occlusion_queries = false;
+ }
+ 
+ static void
+ kk_reset_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer,
+-                    UNUSED VkCommandBufferResetFlags flags)
++                    VkCommandBufferResetFlags flags)
+ {
+    struct kk_cmd_buffer *cmd =
+       container_of(vk_cmd_buffer, struct kk_cmd_buffer, vk);
+ 
+    vk_command_buffer_reset(&cmd->vk);
+    kk_reset_cmd_buffer_internal(cmd);
++   if (flags & VK_COMMAND_BUFFER_RESET_RELEASE_RESOURCES_BIT) {
++      struct kk_device *dev = kk_cmd_buffer_device(cmd);
++      kk_release_encoder_resources(&cmd->cmp[0], dev->mtl_handle);
++      kk_release_encoder_resources(&cmd->cmp[1], dev->mtl_handle);
++      kk_release_encoder_resources(&cmd->gfx, dev->mtl_handle);
++   }
+    cmd->submitted = false;
+    cmd->one_time_submit = false;
+ }
+@@ -262,8 +286,16 @@ cs_start_render(struct kk_cmd_buffer *cmd)
+    uint32_t view_mask = state->render.view_mask;
+    assert(state->render_pass_descriptor);
+ 
+-   cmd->gfx.cmd_buf = mtl_new_command_buffer(dev->mtl_handle);
+-   mtl_begin_command_buffer(cmd->gfx.cmd_buf, cmd->gfx.allocator);
++   if (cmd->gfx.cmd_buf == NULL) {
++      cmd->gfx.cmd_buf = mtl_new_command_buffer(dev->mtl_handle);
++      mtl_begin_command_buffer(cmd->gfx.cmd_buf, cmd->gfx.allocator);
++   } else {
++      /* A graphics command buffer can only remain pending when no compute
++       * work was recorded between the two render passes. */
++      assert(cmd->gfx.encoder == NULL);
++      assert(cmd->pre_gfx->encoder == NULL);
++      assert(cmd->post_gfx->encoder == NULL);
++   }
+    cmd->gfx.encoder = mtl_new_render_command_encoder_with_descriptor(
+       cmd->gfx.cmd_buf, state->render_pass_descriptor);
+ 
+@@ -312,11 +344,22 @@ kk_start_compute_encoder(struct kk_encoder_state *es, mtl_device *handle,
+    mtl_compute_set_argument_table(es->encoder, argument_table);
+ }
+ 
++static void
++kk_finish_command_buffer(struct kk_cmd_buffer *cmd,
++                         struct kk_encoder_state *es);
++
+ mtl_compute_encoder *
+ cs_get_compute(struct kk_cmd_buffer *cmd, bool pre_gfx)
+ {
+    struct kk_device *dev = kk_cmd_buffer_device(cmd);
+    mtl_compute_encoder *encoder;
++
++   /* A compute command recorded between two render passes must follow the
++    * retained graphics work, so finish and append graphics before opening (or
++    * extending) the compute command buffer. */
++   if (!cmd->gfx.encoder && cmd->gfx.cmd_buf)
++      kk_finish_command_buffer(cmd, &cmd->gfx);
++
+    /* If we are not inside a render, we can just take pre_gfx. */
+    if (!cmd->gfx.encoder || pre_gfx) {
+       if (!cmd->pre_gfx->encoder) {
+@@ -336,10 +379,19 @@ cs_get_compute(struct kk_cmd_buffer *cmd, bool pre_gfx)
+ }
+ 
+ static void
+-kk_stop_encoder(struct kk_cmd_buffer *cmd, struct kk_encoder_state *es)
+-{
+-   /* TODO_KOSMICKRISP This is probably overkill */
+-   mtl_barrier_after_stages(es->encoder, MTL_STAGE_ALL, MTL_STAGE_ALL);
++kk_end_encoder(struct kk_cmd_buffer *cmd, struct kk_encoder_state *es)
++{
++   assert(es->encoder != NULL);
++   assert(es->cmd_buf != NULL);
++
++   /* ResourceAlias is required for Metal's aliased visibility-result storage.
++    * Ordinary Vulkan command buffers only need device-visible writes here; the
++    * stronger alias coherence point is measurably expensive on Metal 4. */
++   const enum mtl_visibility_options visibility =
++      cmd->uses_occlusion_queries ? MTL_VISIBILITY_OPTION_RESOURCE_ALIAS
++                                  : MTL_VISIBILITY_OPTION_DEVICE;
++   mtl_barrier_after_stages(es->encoder, MTL_STAGE_ALL, MTL_STAGE_ALL,
++                            visibility);
+    mtl_end_encoding(es->encoder);
+    mtl_release(es->encoder);
+    es->encoder = NULL;
+@@ -351,6 +403,18 @@ kk_stop_encoder(struct kk_cmd_buffer *cmd, struct kk_encoder_state *es)
+    }
+ 
+    util_dynarray_clear(&es->ts_resolves);
++}
++
++static void
++kk_finish_command_buffer(struct kk_cmd_buffer *cmd,
++                         struct kk_encoder_state *es)
++{
++   assert(es->encoder == NULL);
++   assert(util_dynarray_num_elements(&es->ts_resolves,
++                                     struct kk_ts_resolve) == 0);
++
++   if (es->cmd_buf == NULL)
++      return;
+ 
+    mtl_end_command_buffer(es->cmd_buf);
+ 
+@@ -358,11 +422,50 @@ kk_stop_encoder(struct kk_cmd_buffer *cmd, struct kk_encoder_state *es)
+    es->cmd_buf = NULL;
+ }
+ 
++static void
++kk_stop_encoder(struct kk_cmd_buffer *cmd, struct kk_encoder_state *es)
++{
++   kk_end_encoder(cmd, es);
++   kk_finish_command_buffer(cmd, es);
++}
++
++void
++cs_end_render(struct kk_cmd_buffer *cmd)
++{
++   assert(cmd);
++
++   if (cmd->pre_gfx->encoder) {
++      /* This compute work precedes graphics.  Append it before retaining or
++       * finishing the graphics command buffer. */
++      kk_stop_encoder(cmd, cmd->pre_gfx);
++      SWAP(cmd->pre_gfx, cmd->post_gfx);
++   } else if (cmd->post_gfx->encoder) {
++      SWAP(cmd->pre_gfx, cmd->post_gfx);
++   }
++
++   if (!cmd->gfx.encoder)
++      return;
++
++   kk_end_encoder(cmd, &cmd->gfx);
++
++   /* Compute recorded while the render encoder was active must execute after
++    * this graphics work.  Finish graphics now so the promoted compute command
++    * buffer can be appended after it by the next cs_end(). */
++   if (cmd->pre_gfx->encoder)
++      kk_finish_command_buffer(cmd, &cmd->gfx);
++}
++
+ void
+ cs_end(struct kk_cmd_buffer *cmd)
+ {
+    assert(cmd);
+ 
++   /* With a retained render-only command buffer, any current pre_gfx work is
++    * necessarily compute recorded after it.  Preserve that order before the
++    * normal pre/gfx/post encoder handling below. */
++   if (!cmd->gfx.encoder && cmd->gfx.cmd_buf)
++      kk_finish_command_buffer(cmd, &cmd->gfx);
++
+    if (cmd->pre_gfx->encoder) {
+       /* Submit pre_gfx now that its encoder is closed. Command buffers are
+        * appended here (rather than at creation) so submit_cmd_bufs stays in
+diff --git a/src/kosmickrisp/vulkan/kk_cmd_buffer.h b/src/kosmickrisp/vulkan/kk_cmd_buffer.h
+index fa923006278..4418cde4643 100644
+--- a/src/kosmickrisp/vulkan/kk_cmd_buffer.h
++++ b/src/kosmickrisp/vulkan/kk_cmd_buffer.h
+@@ -254,6 +254,10 @@ struct kk_cmd_buffer {
+    /* Metal command buffers are single-shot: a resubmission must re-record
+     * by replaying the enqueued commands (see rerecord_cmd_buffer). */
+    bool submitted;
++
++   /* ResourceAlias visibility is only needed when an occlusion query records
++    * results into Metal's aliased visibility-result storage. */
++   bool uses_occlusion_queries;
+ };
+ 
+ VK_DEFINE_HANDLE_CASTS(kk_cmd_buffer, vk.base, VkCommandBuffer,
+@@ -291,6 +295,7 @@ void kk_reset_cmd_buffer_internal(struct kk_cmd_buffer *cmd);
+ void cs_start_render(struct kk_cmd_buffer *cmd);
+ mtl_render_encoder *cs_get_render(struct kk_cmd_buffer *cmd);
+ mtl_compute_encoder *cs_get_compute(struct kk_cmd_buffer *cmd, bool pre_gfx);
++void cs_end_render(struct kk_cmd_buffer *cmd);
+ void cs_end(struct kk_cmd_buffer *cmd);
+ void kk_cmd_bind_root_to_argument_table(struct kk_cmd_buffer *cmd,
+                                         uint64_t addr);
+diff --git a/src/kosmickrisp/vulkan/kk_cmd_draw.c b/src/kosmickrisp/vulkan/kk_cmd_draw.c
+index 924eb2d6e54..828f8b56427 100644
+--- a/src/kosmickrisp/vulkan/kk_cmd_draw.c
++++ b/src/kosmickrisp/vulkan/kk_cmd_draw.c
+@@ -557,8 +557,9 @@ kk_CmdEndRendering2KHR(VkCommandBuffer commandBuffer,
+ 
+    kk_apply_attachment_store_ops(cmd, false);
+ 
+-   /* Clean up previous encoder */
+-   cs_end(cmd);
++   /* End this render encoder.  MTL4 can retain its command buffer for a
++    * following render pass when no compute work must be interposed. */
++   cs_end_render(cmd);
+    mtl_release(cmd->state.gfx.render_pass_descriptor);
+    cmd->state.gfx.render_pass_descriptor = NULL;
+ 
+diff --git a/src/kosmickrisp/vulkan/kk_query_pool.c b/src/kosmickrisp/vulkan/kk_query_pool.c
+index f8c35afdd8d..6ea63cda5c3 100644
+--- a/src/kosmickrisp/vulkan/kk_query_pool.c
++++ b/src/kosmickrisp/vulkan/kk_query_pool.c
+@@ -412,6 +412,7 @@ kk_CmdBeginQuery(VkCommandBuffer commandBuffer, VkQueryPool queryPool,
+ {
+    VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
+    VK_FROM_HANDLE(kk_query_pool, pool, queryPool);
++   cmd->uses_occlusion_queries = true;
+    cmd->state.gfx.occlusion.mode = flags & VK_QUERY_CONTROL_PRECISE_BIT
+                                       ? MTL_VISIBILITY_RESULT_MODE_COUNTING
+                                       : MTL_VISIBILITY_RESULT_MODE_BOOLEAN;

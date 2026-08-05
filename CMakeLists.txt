@@ -42,6 +42,42 @@ include(ExternalProject)
 set(MESA_CROSSFILES_DIR ${CMAKE_CURRENT_SOURCE_DIR}/crossfiles)
 set(MESA_SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/externals/mesa)
 set(MESA_BINARY_DIR ${CMAKE_CURRENT_BINARY_DIR}/externals/mesa)
+
+# Keep the LBP3 Metal compatibility fixes reproducible without carrying a
+# hundreds-of-megabytes Mesa fork in the shadPS4 repository. Applying the
+# patch is idempotent, so an existing developer checkout may already contain
+# the same changes.
+set(MESA_LBP3_PATCH ${CMAKE_CURRENT_SOURCE_DIR}/patches/lbp3-metal-fixes.patch)
+find_program(KK_GIT_EXECUTABLE REQUIRED NAMES git)
+execute_process(
+    COMMAND ${KK_GIT_EXECUTABLE} apply --reverse --check ${MESA_LBP3_PATCH}
+    WORKING_DIRECTORY ${MESA_SOURCE_DIR}
+    RESULT_VARIABLE MESA_LBP3_PATCH_APPLIED
+    OUTPUT_QUIET
+    ERROR_QUIET)
+if (NOT MESA_LBP3_PATCH_APPLIED EQUAL 0)
+    execute_process(
+        COMMAND ${KK_GIT_EXECUTABLE} apply --check ${MESA_LBP3_PATCH}
+        WORKING_DIRECTORY ${MESA_SOURCE_DIR}
+        RESULT_VARIABLE MESA_LBP3_PATCH_CHECK
+        OUTPUT_QUIET
+        ERROR_VARIABLE MESA_LBP3_PATCH_ERROR)
+    if (NOT MESA_LBP3_PATCH_CHECK EQUAL 0)
+        message(FATAL_ERROR
+            "Cannot apply the LBP3 KosmicKrisp patch: ${MESA_LBP3_PATCH_ERROR}")
+    endif()
+    execute_process(
+        COMMAND ${KK_GIT_EXECUTABLE} apply ${MESA_LBP3_PATCH}
+        WORKING_DIRECTORY ${MESA_SOURCE_DIR}
+        RESULT_VARIABLE MESA_LBP3_PATCH_RESULT
+        ERROR_VARIABLE MESA_LBP3_PATCH_ERROR)
+    if (NOT MESA_LBP3_PATCH_RESULT EQUAL 0)
+        message(FATAL_ERROR
+            "Failed to apply the LBP3 KosmicKrisp patch: ${MESA_LBP3_PATCH_ERROR}")
+    endif()
+    message(STATUS "Applied the LBP3 KosmicKrisp Metal patch")
+endif()
+
 set(MESA_COMMON_CONFIGURE_ARGS
     -Dplatforms=macos
     -Dvulkan-drivers=kosmickrisp
