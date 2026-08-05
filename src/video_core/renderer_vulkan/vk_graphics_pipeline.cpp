@@ -355,6 +355,12 @@ GraphicsPipeline::GraphicsPipeline(
 
     const vk::GraphicsPipelineCreateInfo pipeline_info = {
         .pNext = &pipeline_rendering_ci,
+        // Keep first-use creation latency bounded. The pipeline key and SPIR-V are persisted;
+        // WarmUp recreates them without this flag on subsequent runs, so only the unavoidable
+        // cache-miss session trades driver optimization time for smoother frame delivery.
+        .flags = preloading
+                     ? vk::PipelineCreateFlags{}
+                     : vk::PipelineCreateFlags{vk::PipelineCreateFlagBits::eDisableOptimization},
         .stageCount = static_cast<u32>(shader_stages.size()),
         .pStages = shader_stages.data(),
         .pVertexInputState = !instance.IsVertexInputDynamicState() ? &vertex_input_info : nullptr,

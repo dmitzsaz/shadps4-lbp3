@@ -17,7 +17,11 @@ class TileManager {
     static constexpr size_t NUM_BPPS = 5;
 
 public:
-    using ScratchBuffer = std::pair<vk::Buffer, VmaAllocation>;
+    struct ScratchBuffer {
+        vk::Buffer buffer;
+        u32 offset;
+        VmaAllocation allocation;
+    };
     using Result = std::pair<vk::Buffer, u32>;
 
     explicit TileManager(const Vulkan::Instance& instance, Vulkan::Scheduler& scheduler,
@@ -37,6 +41,7 @@ private:
     const Vulkan::Instance& instance;
     Vulkan::Scheduler& scheduler;
     StreamBuffer& stream_buffer;
+    StreamBuffer scratch_buffer;
     vk::UniqueDescriptorSetLayout desc_layout;
     vk::UniquePipelineLayout pl_layout;
     std::array<vk::UniquePipeline, AmdGpu::NUM_TILE_MODES * NUM_BPPS> detilers{};

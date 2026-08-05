@@ -149,8 +149,8 @@
 	url = https://github.com/miniupnp/miniupnp.git
 [submodule "externals/mesa-kosmickrisp"]
 	path = externals/mesa-kosmickrisp
-	url = https://github.com/shadexternals/mesa-kosmickrisp
-	shallow = true
+	url = https://github.com/dmitzsaz/shadps4-lbp3.git
+	branch = vendor/mesa-kosmickrisp-lbp3
 [submodule "externals/vulkan-loader"]
 	path = externals/vulkan-loader
 	url = https://github.com/KhronosGroup/Vulkan-Loader

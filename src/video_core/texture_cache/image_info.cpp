@@ -81,6 +81,8 @@ ImageInfo::ImageInfo(const AmdGpu::ColorBuffer& buffer, AmdGpu::CbDbExtent hint)
         guest_size *= resources.layers;
         mips_layout[0] = MipInfo(guest_size, pitch, size.height, 0);
     }
+    guest_resources = resources;
+    guest_mips_layout = mips_layout;
     alt_tile = Libraries::Kernel::sceKernelIsNeoMode() && buffer.info.alt_tile_mode;
 }
 
@@ -115,6 +117,8 @@ ImageInfo::ImageInfo(const AmdGpu::DepthBuffer& buffer, u32 num_slices, VAddr ht
         guest_size *= resources.layers;
         mips_layout[0] = MipInfo(guest_size, pitch, size.height, 0);
     }
+    guest_resources = resources;
+    guest_mips_layout = mips_layout;
 }
 
 ImageInfo::ImageInfo(const AmdGpu::Image& image, const Shader::ImageResource& desc) noexcept {
@@ -152,31 +156,34 @@ bool ImageInfo::IsCompatible(const ImageInfo& info) const {
            num_samples == info.num_samples && num_bits == info.num_bits;
 }
 
-void ImageInfo::UpdateSize() {
-    guest_size = 0;
-    for (s32 mip = 0; mip < resources.levels; ++mip) {
-        u32 mip_w = pitch >> mip;
-        u32 mip_h = size.height >> mip;
-        if (props.is_block) {
+static u32 CalculateSize(const ImageInfo& info, const SubresourceExtent& resources,
+                         std::array<ImageInfo::MipInfo, 16>& mips_layout) {
+    ASSERT(resources.levels <= mips_layout.size());
+
+    u32 total_size = 0;
+    for (u32 mip = 0; mip < resources.levels; ++mip) {
+        u32 mip_w = info.pitch >> mip;
+        u32 mip_h = info.size.height >> mip;
+        if (info.props.is_block) {
             mip_w = (mip_w + 3) / 4;
             mip_h = (mip_h + 3) / 4;
         }
         mip_w = std::max(mip_w, 1u);
         mip_h = std::max(mip_h, 1u);
-        u32 mip_d = std::max(size.depth >> mip, 1u);
+        u32 mip_d = std::max(info.size.depth >> mip, 1u);
         u32 thickness = 1;
 
-        if (props.is_pow2) {
+        if (info.props.is_pow2) {
             mip_w = std::bit_ceil(mip_w);
             mip_h = std::bit_ceil(mip_h);
             mip_d = std::bit_ceil(mip_d);
         }
 
         auto& mip_info = mips_layout[mip];
-        switch (array_mode) {
+        switch (info.array_mode) {
         case AmdGpu::ArrayMode::ArrayLinearAligned: {
             std::tie(mip_info.pitch, mip_info.height, mip_info.size) =
-                ImageSizeLinearAligned(mip_w, mip_h, num_bits, num_samples);
+                ImageSizeLinearAligned(mip_w, mip_h, info.num_bits, info.num_samples);
             break;
         }
         case AmdGpu::ArrayMode::Array1DTiledThick:
@@ -185,7 +192,7 @@ void ImageInfo::UpdateSize() {
             [[fallthrough]];
         case AmdGpu::ArrayMode::Array1DTiledThin1: {
             std::tie(mip_info.pitch, mip_info.height, mip_info.size) =
-                ImageSizeMicroTiled(mip_w, mip_h, thickness, num_bits, num_samples);
+                ImageSizeMicroTiled(mip_w, mip_h, thickness, info.num_bits, info.num_samples);
             break;
         }
         case AmdGpu::ArrayMode::Array2DTiledThick:
@@ -193,23 +200,39 @@ void ImageInfo::UpdateSize() {
             mip_d += (-mip_d) & (thickness - 1);
             [[fallthrough]];
         case AmdGpu::ArrayMode::Array2DTiledThin1: {
-            ASSERT(!props.is_block);
-            std::tie(mip_info.pitch, mip_info.height, mip_info.size) = ImageSizeMacroTiled(
-                mip_w, mip_h, thickness, num_bits, num_samples, tile_mode, mip, alt_tile);
+            ASSERT(!info.props.is_block);
+            std::tie(mip_info.pitch, mip_info.height, mip_info.size) =
+                ImageSizeMacroTiled(mip_w, mip_h, thickness, info.num_bits, info.num_samples,
+                                    info.tile_mode, mip, info.alt_tile);
             break;
         }
         default: {
-            UNREACHABLE_MSG("Unknown array mode {}", magic_enum::enum_name(array_mode));
+            UNREACHABLE_MSG("Unknown array mode {}", magic_enum::enum_name(info.array_mode));
         }
         }
-        if (props.is_block) {
+        if (info.props.is_block) {
             mip_info.pitch = std::max(mip_info.pitch * 4, 32u);
             mip_info.height = std::max(mip_info.height * 4, 32u);
         }
         mip_info.size *= mip_d * resources.layers;
-        mip_info.offset = guest_size;
-        guest_size += mip_info.size;
+        mip_info.offset = total_size;
+        total_size += mip_info.size;
     }
+    return total_size;
+}
+
+void ImageInfo::UpdateSize() {
+    guest_resources = resources;
+    guest_size = CalculateSize(*this, resources, mips_layout);
+    guest_mips_layout = mips_layout;
+}
+
+void ImageInfo::ExpandResources(const SubresourceExtent& expanded_resources) {
+    ASSERT(expanded_resources.Contains(resources));
+    resources = expanded_resources;
+    const u32 resource_size = CalculateSize(*this, resources, mips_layout);
+    ASSERT(resources.Contains(guest_resources));
+    ASSERT(guest_size <= resource_size);
 }
 
 s32 ImageInfo::MipOf(const ImageInfo& info) const {
@@ -222,7 +245,7 @@ s32 ImageInfo::MipOf(const ImageInfo& info) const {
     }
 
     // Currently we expect only one level to be copied.
-    if (resources.levels != 1) {
+    if (guest_resources.levels != 1) {
         return -1;
     }
 
@@ -231,11 +254,11 @@ s32 ImageInfo::MipOf(const ImageInfo& info) const {
 
     // Find mip
     auto mip = -1;
-    for (auto m = 0; m < info.resources.levels; ++m) {
-        const auto& [mip_size, mip_pitch, mip_height, mip_ofs] = info.mips_layout[m];
+    for (u32 m = 0; m < info.guest_resources.levels; ++m) {
+        const auto& [mip_size, mip_pitch, mip_height, mip_ofs] = info.guest_mips_layout[m];
         const VAddr mip_base = info.guest_address + mip_ofs;
         const VAddr mip_end = mip_base + mip_size;
-        const u32 slice_size = mip_size / info.resources.layers;
+        const u32 slice_size = mip_size / info.guest_resources.layers;
         if (guest_address >= mip_base && guest_address < mip_end &&
             (guest_address - mip_base) % slice_size == 0 &&
             (pitch >> this_dim) == (mip_pitch >> info_dim)) {
@@ -260,7 +283,7 @@ s32 ImageInfo::MipOf(const ImageInfo& info) const {
     const auto mip_d = std::max(info.size.depth >> mip, 1u);
     if (info.type == AmdGpu::ImageType::Color3D && type == AmdGpu::ImageType::Color2D) {
         // In case of 2D array to 3D copy, make sure we have proper number of layers.
-        if (resources.layers != mip_d) {
+        if (guest_resources.layers != mip_d) {
             return -1;
         }
     } else {
@@ -286,7 +309,7 @@ s32 ImageInfo::SliceOf(const ImageInfo& info, s32 mip) const {
     const auto info_dim = info.props.is_block ? 2 : 0;
     const auto mip_w = std::max(info.size.width >> (mip + info_dim), 1u);
     const auto mip_h = std::max(info.size.height >> (mip + info_dim), 1u);
-    const auto mip_p = std::max(info.mips_layout[mip].pitch >> info_dim, 1u);
+    const auto mip_p = std::max(info.guest_mips_layout[mip].pitch >> info_dim, 1u);
 
     const auto this_dim = props.is_block ? 2 : 0;
     const auto this_w = std::max(size.width >> this_dim, 1u);
@@ -297,13 +320,14 @@ s32 ImageInfo::SliceOf(const ImageInfo& info, s32 mip) const {
     }
 
     // Check for size alignment.
-    const u32 slice_size = info.mips_layout[mip].size / info.resources.layers;
+    const u32 slice_size = info.guest_mips_layout[mip].size / info.guest_resources.layers;
     if (guest_size % slice_size != 0) {
         return -1;
     }
 
     // Ensure that address is aligned too.
-    const auto addr_diff = guest_address - (info.guest_address + info.mips_layout[mip].offset);
+    const auto addr_diff =
+        guest_address - (info.guest_address + info.guest_mips_layout[mip].offset);
     if ((addr_diff % guest_size) != 0) {
         return -1;
     }

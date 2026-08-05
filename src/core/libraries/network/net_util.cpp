@@ -38,6 +38,7 @@ typedef int net_socket;
 #include <string.h>
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "core/emulator_settings.h"
 #include "core/libraries/error_codes.h"
 #include "net.h"
 #include "net_error.h"
@@ -348,6 +349,11 @@ u32 NetUtilInternal::GetNatType() const {
 
 bool NetUtilInternal::RetrieveIp() {
     std::scoped_lock lock{m_mutex};
+
+    if (!EmulatorSettings.IsConnectedToNetwork()) {
+        ip = "127.0.0.1";
+        return true;
+    }
 
     auto sockfd = socket(AF_INET, SOCK_STREAM, 0);
     if (sockfd == -1) {

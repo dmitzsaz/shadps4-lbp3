@@ -4,11 +4,13 @@
 #include <ranges>
 
 #include "common/hash.h"
+#include "common/guest_time_stall.h"
 #include "common/io_file.h"
 #include "common/path_util.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
+#include "shader_recompiler/frontend/copy_shader.h"
 #include "shader_recompiler/info.h"
 #include "shader_recompiler/recompiler.h"
 #include "shader_recompiler/runtime_info.h"
@@ -182,6 +184,41 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(Stage stage, LogicalS
         const auto params_vc = AmdGpu::GetParams(regs.vs_program);
         gs_info.vs_copy = params_vc.code;
         gs_info.vs_copy_hash = params_vc.hash;
+
+        // Scenario G can program MAX_VERT_OUT and VERT_ITEMSIZE with allocation values that are
+        // larger/smaller than the actual sparse GSVS layout consumed by the copy shader. The
+        // recompiler uses the copy shader to eliminate ring accesses, but its SPIR-V entry point
+        // still takes OutputVertices from this RuntimeInfo. Correct both values here so the native
+        // geometry-stage interface and the eliminated ring-offset mapping describe the same
+        // layout.
+        const auto copy_data = Shader::ParseCopyShader(gs_info.vs_copy);
+        if (copy_data.output_vertices && copy_data.output_vertices < gs_info.output_vertices &&
+            gs_info.mode == AmdGpu::GsScenario::ScenarioG) {
+            LOG_TRACE(Render_Vulkan, "Correcting GS MAX_VERT_OUT {} to copy-shader vertex count {}",
+                      gs_info.output_vertices, copy_data.output_vertices);
+            gs_info.output_vertices = copy_data.output_vertices;
+        }
+        if (!copy_data.attr_map.empty() && copy_data.output_vertices) {
+            // Copy-shader offsets advance by 64 bytes per GSVS component per output vertex.
+            // Use the final occupied slot rather than num_comps: sparse exports still consume
+            // their holes in the component-major ring layout.
+            const u32 component_stride = copy_data.output_vertices * 64u;
+            const u32 last_component_offset = copy_data.attr_map.rbegin()->first;
+            if (last_component_offset % component_stride == 0) {
+                const u32 component_span = last_component_offset / component_stride + 1u;
+                if (component_span > gs_info.out_vertex_data_size) {
+                    LOG_TRACE(Render_Vulkan,
+                              "Correcting GS VERT_ITEMSIZE {} to copy-shader component span {} "
+                              "({} populated components)",
+                              gs_info.out_vertex_data_size, component_span, copy_data.num_comps);
+                    gs_info.out_vertex_data_size = component_span;
+                }
+            } else {
+                LOG_WARNING(Render_Vulkan,
+                            "Copy-shader final offset {} is not aligned to component stride {}",
+                            last_component_offset, component_stride);
+            }
+        }
         DumpShader(gs_info.vs_copy, gs_info.vs_copy_hash, Shader::Stage::Vertex, 0, "copy.bin");
         break;
     }
@@ -306,12 +343,16 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         .needs_clip_distance_emulation = instance.GetDriverID() == vk::DriverId::eNvidiaProprietary,
         .supports_shader_stencil_export = instance_.IsShaderStencilExportSupported(),
     };
-    WarmUp();
-
     auto [cache_result, cache] = instance.GetDevice().createPipelineCacheUnique({});
     ASSERT_MSG(cache_result == vk::Result::eSuccess, "Failed to create pipeline cache: {}",
                vk::to_string(cache_result));
     pipeline_cache = std::move(cache);
+
+    // Preloaded pipelines must populate the same Vulkan cache used for first-use pipelines.
+    // WarmUp constructs actual host pipelines, so running it before creating this cache passes
+    // VK_NULL_HANDLE to all of them and throws away potential driver-side reuse for later state
+    // variants.
+    WarmUp();
 }
 
 PipelineCache::~PipelineCache() = default;
@@ -322,6 +363,7 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline() {
     }
     const auto [it, is_new] = graphics_pipelines.try_emplace(graphics_key);
     if (is_new) {
+        const Common::GuestTimeStallScope guest_time_stall;
         const auto pipeline_hash = std::hash<GraphicsPipelineKey>{}(graphics_key);
         LOG_INFO(Render_Vulkan, "Compiling graphics pipeline {:#x}", pipeline_hash);
 
@@ -352,6 +394,7 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
     }
     const auto [it, is_new] = compute_pipelines.try_emplace(compute_key);
     if (is_new) {
+        const Common::GuestTimeStallScope guest_time_stall;
         const auto pipeline_hash = std::hash<ComputePipelineKey>{}(compute_key);
         LOG_INFO(Render_Vulkan, "Compiling compute pipeline {:#x}", pipeline_hash);
 
@@ -603,6 +646,7 @@ bool PipelineCache::RefreshComputeKey() {
 vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::RuntimeInfo& runtime_info,
                                               const std::span<const u32>& code, size_t perm_idx,
                                               Shader::Backend::Bindings& binding) {
+    const Common::GuestTimeStallScope guest_time_stall;
     LOG_INFO(Render_Vulkan, "Compiling {} shader {:#x} {}", info.stage, info.pgm_hash,
              perm_idx != 0 ? "(permutation)" : "");
     DumpShader(code, info.pgm_hash, info.stage, perm_idx, "bin");

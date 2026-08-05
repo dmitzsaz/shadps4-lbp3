@@ -31,6 +31,7 @@ using BufferId = Common::SlotId;
 class TextureCache;
 class MemoryTracker;
 class PageManager;
+struct Image;
 
 class BufferCache {
 public:
@@ -104,10 +105,13 @@ public:
     }
 
     /// Invalidates any buffer in the logical page range.
-    void InvalidateMemory(VAddr device_addr, u64 size);
+    void InvalidateMemory(VAddr device_addr, u64 size, bool download = true);
 
     /// Flushes any GPU modified buffer in the logical page range back to CPU memory.
     void ReadMemory(VAddr device_addr, u64 size, bool is_write = false);
+
+    /// Flushes GPU-modified data outside an image on its partially covered edge pages.
+    void ReadEdgeImagePages(const Image& image);
 
     /// Binds host vertex buffers for the current draw.
     void BindVertexBuffers(const Vulkan::GraphicsPipeline& pipeline,
@@ -126,10 +130,14 @@ public:
     /// Obtains a buffer for the specified region.
     [[nodiscard]] std::pair<Buffer*, u32> ObtainBuffer(VAddr gpu_addr, u32 size, bool is_written,
                                                        bool is_texel_buffer = false,
-                                                       BufferId buffer_id = {});
+                                                       BufferId buffer_id = {},
+                                                       bool invalidate_texel_sync = true);
 
     /// Attempts to obtain a buffer without modifying the cache contents.
     [[nodiscard]] std::pair<Buffer*, u32> ObtainBufferForImage(VAddr gpu_addr, u32 size);
+
+    /// Preserves the guest-tiled contents of a GPU-modified image in the buffer cache.
+    [[nodiscard]] bool PreserveImage(Image& image);
 
     /// Return true when a region is registered on the cache
     [[nodiscard]] bool IsRegionRegistered(VAddr addr, size_t size);
@@ -192,6 +200,8 @@ private:
                             size_t total_size_bytes);
 
     bool SynchronizeBufferFromImage(Buffer& buffer, VAddr device_addr, u32 size);
+
+    bool SynchronizeBufferFromImage(Buffer& buffer, Image& image);
 
     void WriteDataBuffer(Buffer& buffer, VAddr address, const void* value, u32 num_bytes);
 

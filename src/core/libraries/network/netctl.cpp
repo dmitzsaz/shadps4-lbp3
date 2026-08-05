@@ -96,7 +96,11 @@ int PS4_SYSV_ABI sceNetCtlUnregisterCallbackV6() {
 }
 
 int PS4_SYSV_ABI sceNetCtlCheckCallback() {
-    LOG_DEBUG(Lib_NetCtl, "(STUBBED) called");
+    // NetCtl callbacks report state transitions, not the current state on every poll.
+    // Emulator network configuration is immutable while a title is running, so there is no
+    // pending transition to dispatch here. Replaying DISCONNECTED/IPOBTAINED every time caused
+    // titles to interpret each sceNetCtlCheckCallback call as a fresh connection change.
+    LOG_DEBUG(Lib_NetCtl, "called; no pending state transition");
     return ORBIS_OK;
 }
 
@@ -340,11 +344,14 @@ int PS4_SYSV_ABI sceNetCtlGetScanInfoForSsidScanIpcInt() {
 }
 
 int PS4_SYSV_ABI sceNetCtlGetState(int* state) {
-    const auto connected = EmulatorSettings.IsConnectedToNetwork();
-    LOG_DEBUG(Lib_NetCtl, "connected = {}", connected);
-    const auto current_state =
-        connected ? ORBIS_NET_CTL_STATE_IPOBTAINED : ORBIS_NET_CTL_STATE_DISCONNECTED;
-    *state = current_state;
+    const auto external_network = EmulatorSettings.IsConnectedToNetwork();
+    LOG_DEBUG(Lib_NetCtl, "external_network = {}, virtual IPv4 link is ready",
+              external_network);
+
+    // The guest always has an isolated virtual IPv4 link for local sockets. The external
+    // network setting controls hostname resolution and host-network access, not whether that
+    // virtual interface exists.
+    *state = ORBIS_NET_CTL_STATE_IPOBTAINED;
     return ORBIS_OK;
 }
 
@@ -382,6 +389,8 @@ int PS4_SYSV_ABI sceNetCtlRegisterCallback(OrbisNetCtlCallback func, void* arg, 
     if (!func || !cid) {
         return ORBIS_NET_CTL_ERROR_INVALID_ADDR;
     }
+    LOG_INFO(Lib_NetCtl, "called, callback = {}, arg = {}",
+             reinterpret_cast<const void*>(func), arg);
     s32 result = netctl.RegisterCallback(func, arg);
     if (result < 0) {
         return result;
@@ -426,9 +435,9 @@ int PS4_SYSV_ABI sceNetCtlTerm() {
     return ORBIS_OK;
 }
 
-int PS4_SYSV_ABI sceNetCtlUnregisterCallback() {
-    LOG_ERROR(Lib_NetCtl, "(STUBBED) called");
-    return ORBIS_OK;
+int PS4_SYSV_ABI sceNetCtlUnregisterCallback(int cid) {
+    LOG_DEBUG(Lib_NetCtl, "cid = {}", cid);
+    return netctl.UnregisterCallback(cid);
 }
 
 int PS4_SYSV_ABI sceNetCtlUnregisterCallbackForLibIpcInt() {

@@ -181,7 +181,7 @@ void Rasterizer::EliminateFastClear() {
 
     ScopeMarkerBegin(fmt::format("EliminateFastClear:MRT={:#x}:M={:#x}", col_buf.Address(),
                                  col_buf.CmaskAddress()));
-    image.Clear(clear_value, desc.view_info.range);
+    image.Clear(clear_value, desc.view_info.range, true);
     ScopeMarkerEnd();
 }
 
@@ -530,7 +530,7 @@ bool Rasterizer::IsComputeImageCopy(const Pipeline* pipeline) {
             buffer_cache.GetUtilityBuffer(VideoCore::MemoryUsage::DeviceLocal);
         dst_image.CopyImageWithBuffer(src_image, copy_buffer.Handle(), 0);
     }
-    dst_image.flags |= VideoCore::ImageFlagBits::GpuModified;
+    dst_image.MarkGpuModified();
     dst_image.flags &= ~VideoCore::ImageFlagBits::Dirty;
     return true;
 }
@@ -590,7 +590,7 @@ bool Rasterizer::IsComputeImageClear(const Pipeline* pipeline) {
         .extent = image1.info.resources,
     };
     image1.Clear(clear, range);
-    image1.flags |= VideoCore::ImageFlagBits::GpuModified;
+    image1.MarkGpuModified();
     image1.flags &= ~VideoCore::ImageFlagBits::Dirty;
     return true;
 }
@@ -718,6 +718,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             if (auto depth_image_id = texture_cache.GetAssociatedDepth(*image)) {
                 // If this image has an associated depth image, it's a stencil attachment.
                 // Redirect the access to the actual depth-stencil buffer.
+                desc.view_info.is_stencil = true;
                 image_id = depth_image_id;
                 image = &texture_cache.GetImage(image_id);
             }

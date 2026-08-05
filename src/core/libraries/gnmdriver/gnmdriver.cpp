@@ -73,12 +73,40 @@ static s32 sdk_version{0};
 
 static u32 asc_next_offs_dw[Liverpool::NumComputeRings];
 
+struct DeferredAscSubmission {
+    u32 gnm_vqid;
+    std::span<const u32> acb;
+};
+
+// A compute doorbell is asynchronous on the hardware.  Blocking its guest caller behind the
+// per-frame graphics submission lock serializes otherwise independent queues and can stall the
+// producer that is still filling a WAIT_REG_MEM-driven command stream.  Preserve the graphics
+// boundary by deferring the queue insertion, but never block the guest thread that rang the
+// doorbell.
+static std::vector<DeferredAscSubmission> deferred_asc_submissions;
+
+static void SubmitAscOrDeferUntilGpuIdle(u32 gnm_vqid, std::span<const u32> acb) {
+    std::unique_lock lock{m_submission};
+    if (submission_lock != 0) {
+        deferred_asc_submissions.push_back({gnm_vqid, acb});
+        return;
+    }
+    lock.unlock();
+    liverpool->SubmitAsc(gnm_vqid, acb);
+}
+
 // This address is initialized in sceGnmGetTheTessellationFactorRingBufferBaseAddress
 static VAddr tessellation_factors_ring_addr = -1;
 static constexpr u32 tessellation_offchip_buffer_size = 0x800000u;
 
 static void ResetSubmissionLock(Platform::InterruptId irq) {
     std::unique_lock lock{m_submission};
+    // Queue deferred ASC work before graphics submitters are released.  This preserves the same
+    // frame boundary as the old blocking DingDong path without holding a guest thread hostage.
+    for (const auto& submission : deferred_asc_submissions) {
+        liverpool->SubmitAsc(submission.gnm_vqid, submission.acb);
+    }
+    deferred_asc_submissions.clear();
     submission_lock = 0;
     cv_lock.notify_all();
 }
@@ -297,8 +325,6 @@ void PS4_SYSV_ABI sceGnmDingDong(u32 gnm_vqid, u32 next_offs_dw) {
         return;
     }
 
-    WaitGpuIdle();
-
     if (DebugState.ShouldPauseInSubmit()) {
         DebugState.PauseGuestThreads();
     }
@@ -315,8 +341,9 @@ void PS4_SYSV_ABI sceGnmDingDong(u32 gnm_vqid, u32 next_offs_dw) {
     if (next_offs_dw < offs_dw && next_offs_dw != 0) {
         // For cases if a submission is split at the end of the ring buffer, we need to submit it in
         // two parts to handle the wrap
-        liverpool->SubmitAsc(gnm_vqid, {reinterpret_cast<const u32*>(asc_queue.map_addr) + offs_dw,
-                                        asc_queue.ring_size_dw - offs_dw});
+        SubmitAscOrDeferUntilGpuIdle(
+            gnm_vqid, {reinterpret_cast<const u32*>(asc_queue.map_addr) + offs_dw,
+                       asc_queue.ring_size_dw - offs_dw});
         offs_dw = 0;
     }
 
@@ -358,7 +385,7 @@ void PS4_SYSV_ABI sceGnmDingDong(u32 gnm_vqid, u32 next_offs_dw) {
             .base_addr = base_addr,
         });
     }
-    liverpool->SubmitAsc(gnm_vqid, acb_span);
+    SubmitAscOrDeferUntilGpuIdle(gnm_vqid, acb_span);
 }
 
 void PS4_SYSV_ABI sceGnmDingDongForWorkload(u32 gnm_vqid, u32 next_offs_dw, u64 workload_id) {

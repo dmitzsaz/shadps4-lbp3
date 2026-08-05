@@ -104,6 +104,12 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
     SetObjectName(device, *pipeline_layout, "Compute PipelineLayout {}", debug_str);
 
     const vk::ComputePipelineCreateInfo compute_pipeline_ci = {
+        // A cache miss already blocks the guest render thread on shader translation. Ask the
+        // driver for a fast first-use pipeline as well; persisted SPIR-V/key data is preloaded
+        // without this flag on the next run and therefore receives the fully optimized path.
+        .flags = preloading
+                     ? vk::PipelineCreateFlags{}
+                     : vk::PipelineCreateFlags{vk::PipelineCreateFlagBits::eDisableOptimization},
         .stage = shader_ci,
         .layout = *pipeline_layout,
     };

@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <cstddef>
 #include <optional>
 #include "common/assert.h"
@@ -99,6 +100,19 @@ void CommandPool::Allocate(std::size_t begin, std::size_t end) {
 vk::CommandBuffer CommandPool::Commit() {
     const std::size_t index = CommitResource();
     return cmd_buffers[index];
+}
+
+std::size_t CommandPool::ManageOverflow() {
+    if (instance.GetDriverID() != vk::DriverId::eMesaKosmickrisp || ticks.empty()) {
+        return ResourcePool::ManageOverflow();
+    }
+
+    // MTL4CommandAllocator retains a large high-water backing for every live
+    // Vulkan command buffer. Keep the initial four-buffer pool bounded and
+    // wait for its oldest submission instead of multiplying that backing.
+    const auto oldest = std::ranges::min_element(ticks);
+    master_semaphore->Wait(*oldest);
+    return std::distance(ticks.begin(), oldest);
 }
 
 DescriptorHeap::DescriptorHeap(const Instance& instance, MasterSemaphore* master_semaphore_,

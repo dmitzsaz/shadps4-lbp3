@@ -42,9 +42,12 @@ static const GUID WSAID_WSARECVMSG = {
 #include <unistd.h>
 typedef int net_socket;
 #endif
+#include <condition_variable>
+#include <deque>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <vector>
 #include "net.h"
 
 namespace Libraries::Kernel {
@@ -82,6 +85,9 @@ struct Socket {
     virtual int GetPeerName(OrbisNetSockaddr* addr, u32* namelen) = 0;
     virtual int fstat(Libraries::Kernel::OrbisKernelStat* stat) = 0;
     virtual std::optional<net_socket> Native() = 0;
+    virtual u32 GetPendingEvents(u32) {
+        return 0;
+    }
     std::mutex m_mutex;
     std::mutex receive_mutex;
     int socket_type;
@@ -125,29 +131,71 @@ struct PosixSocket : public Socket {
     }
 };
 
-struct P2PSocket : public Socket {
-    explicit P2PSocket(int domain, int type, int protocol) : Socket(domain, type, protocol) {}
+struct P2PSocket : public Socket, public std::enable_shared_from_this<P2PSocket> {
+    PosixSocket inner;
+    explicit P2PSocket(int domain, int type, int protocol)
+        : Socket(domain, type, protocol), inner(domain, SOCK_DGRAM, protocol) {}
+    ~P2PSocket() override;
     bool IsValid() const override {
-        return true;
+        return inner.IsValid();
     }
     int Close() override;
-    int SetSocketOptions(int level, int optname, const void* optval, u32 optlen) override;
-    int GetSocketOptions(int level, int optname, void* optval, u32* optlen) override;
+    int SetSocketOptions(int level, int optname, const void* optval, u32 optlen) override {
+        return inner.SetSocketOptions(level, optname, optval, optlen);
+    }
+    int GetSocketOptions(int level, int optname, void* optval, u32* optlen) override {
+        return inner.GetSocketOptions(level, optname, optval, optlen);
+    }
     int Bind(const OrbisNetSockaddr* addr, u32 addrlen) override;
-    int Listen(int backlog) override;
-    int SendMessage(const OrbisNetMsghdr* msg, int flags) override;
+    int Listen(int backlog) override {
+        return inner.Listen(backlog);
+    }
+    int SendMessage(const OrbisNetMsghdr* msg, int flags) override {
+        return inner.SendMessage(msg, flags);
+    }
     int SendPacket(const void* msg, u32 len, int flags, const OrbisNetSockaddr* to,
                    u32 tolen) override;
-    int ReceiveMessage(OrbisNetMsghdr* msg, int flags) override;
-    int ReceivePacket(void* buf, u32 len, int flags, OrbisNetSockaddr* from, u32* fromlen) override;
-    SocketPtr Accept(OrbisNetSockaddr* addr, u32* addrlen) override;
-    int Connect(const OrbisNetSockaddr* addr, u32 namelen) override;
-    int GetSocketAddress(OrbisNetSockaddr* name, u32* namelen) override;
-    int GetPeerName(OrbisNetSockaddr* addr, u32* namelen) override;
-    int fstat(Libraries::Kernel::OrbisKernelStat* stat) override;
-    std::optional<net_socket> Native() override {
-        return {};
+    SocketPtr Accept(OrbisNetSockaddr* addr, u32* addrlen) override {
+        return inner.Accept(addr, addrlen);
     }
+    int ReceiveMessage(OrbisNetMsghdr* msg, int flags) override {
+        return inner.ReceiveMessage(msg, flags);
+    }
+    int ReceivePacket(void* buf, u32 len, int flags, OrbisNetSockaddr* from,
+                      u32* fromlen) override;
+    int Connect(const OrbisNetSockaddr* addr, u32 namelen) override {
+        return inner.Connect(addr, namelen);
+    }
+    int GetSocketAddress(OrbisNetSockaddr* name, u32* namelen) override;
+    int GetPeerName(OrbisNetSockaddr* addr, u32* namelen) override {
+        return inner.GetPeerName(addr, namelen);
+    }
+    int fstat(Libraries::Kernel::OrbisKernelStat* stat) override {
+        return inner.fstat(stat);
+    }
+    std::optional<net_socket> Native() override {
+        if (socket_type == ORBIS_NET_SOCK_DGRAM_P2P) {
+            return std::nullopt;
+        }
+        return inner.Native();
+    }
+    u32 GetPendingEvents(u32 requested_events) override;
+
+private:
+    struct LocalDatagram {
+        std::vector<u8> data;
+        OrbisNetSockaddrIn source{};
+    };
+
+    void Unregister();
+
+    static constexpr size_t MaxQueuedDatagrams = 256;
+    OrbisNetSockaddrIn bound_addr{};
+    bool is_bound = false;
+    bool is_closed = false;
+    std::mutex local_receive_mutex;
+    std::condition_variable local_receive_cv;
+    std::deque<LocalDatagram> local_receive_queue;
 };
 
 struct UnixSocket : public Socket {

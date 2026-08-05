@@ -29,6 +29,20 @@ s32 NetCtlInternal::RegisterCallback(OrbisNetCtlCallback func, void* arg) {
     return next_id;
 }
 
+s32 NetCtlInternal::UnregisterCallback(s32 cid) {
+    std::scoped_lock lock{m_mutex};
+
+    if (cid < 0 || cid >= static_cast<s32>(callbacks.size())) {
+        return ORBIS_NET_CTL_ERROR_INVALID_ID;
+    }
+    if (callbacks[cid].func == nullptr) {
+        return ORBIS_NET_CTL_ERROR_ID_NOT_FOUND;
+    }
+
+    callbacks[cid] = {};
+    return 0;
+}
+
 s32 NetCtlInternal::RegisterNpToolkitCallback(OrbisNetCtlCallbackForNpToolkit func, void* arg) {
     std::scoped_lock lock{m_mutex};
 

@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <array>
 #include <ranges>
 #include "common/assert.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
@@ -84,9 +85,7 @@ static vk::FormatFeatureFlags2 FormatFeatureFlags(const vk::ImageUsageFlags usag
 }
 
 UniqueImage::~UniqueImage() {
-    if (image) {
-        vmaDestroyImage(allocator, image, allocation);
-    }
+    Destroy();
 }
 
 void UniqueImage::Destroy() {
@@ -113,6 +112,32 @@ void UniqueImage::Create(const vk::ImageCreateInfo& image_ci) {
     VkImage unsafe_image{};
     VkResult result = vmaCreateImage(allocator, &image_ci_unsafe, &alloc_info, &unsafe_image,
                                      &allocation, nullptr);
+    if (result != VK_SUCCESS) {
+        LOG_CRITICAL(
+            Render_Vulkan,
+            "IMAGE_ALLOC_FAILURE result={} type={} format={} extent={}x{}x{} mips={} layers={} "
+            "samples={} tiling={} usage={} flags={}",
+            vk::to_string(vk::Result{result}), vk::to_string(image_ci.imageType),
+            vk::to_string(image_ci.format), image_ci.extent.width, image_ci.extent.height,
+            image_ci.extent.depth, image_ci.mipLevels, image_ci.arrayLayers,
+            vk::to_string(image_ci.samples), vk::to_string(image_ci.tiling),
+            vk::to_string(image_ci.usage), vk::to_string(image_ci.flags));
+        std::array<VmaBudget, VK_MAX_MEMORY_HEAPS> heap_budgets{};
+        vmaGetHeapBudgets(allocator, heap_budgets.data());
+        for (u32 heap = 0; heap < heap_budgets.size(); ++heap) {
+            const auto& budget = heap_budgets[heap];
+            if (budget.usage == 0 && budget.budget == 0 && budget.statistics.blockBytes == 0 &&
+                budget.statistics.allocationBytes == 0) {
+                continue;
+            }
+            LOG_CRITICAL(Render_Vulkan,
+                         "IMAGE_ALLOC_HEAP heap={} usage={} budget={} blocks={} allocations={} "
+                         "blockBytes={} allocationBytes={}",
+                         heap, budget.usage, budget.budget, budget.statistics.blockCount,
+                         budget.statistics.allocationCount, budget.statistics.blockBytes,
+                         budget.statistics.allocationBytes);
+        }
+    }
     ASSERT_MSG(result == VK_SUCCESS, "Failed allocating image with error {}",
                vk::to_string(vk::Result{result}));
     image = vk::Image{unsafe_image};
@@ -221,6 +246,13 @@ ImageView& Image::FindView(const ImageViewInfo& view_info, bool ensure_guest_sam
 Image::Barriers Image::GetBarriers(vk::ImageLayout dst_layout, vk::AccessFlags2 dst_mask,
                                    vk::PipelineStageFlags2 dst_stage,
                                    std::optional<SubresourceRange> subres_range) {
+    if (info.props.is_volume && subres_range) {
+        // Compatible 2D views address 3D depth slices as array layers, but Vulkan image memory
+        // barriers for the underlying 3D image must use its single array layer. Synchronization
+        // is therefore conservatively widened to the corresponding whole-volume mip range.
+        subres_range->base.layer = 0;
+        subres_range->extent.layers = 1;
+    }
     auto& last_state = backing->state;
     auto& subresource_states = backing->subresource_states;
 
@@ -354,6 +386,7 @@ void Image::Transit(vk::ImageLayout dst_layout, vk::AccessFlags2 dst_mask,
 
 void Image::Upload(std::span<const vk::BufferImageCopy> upload_copies, vk::Buffer buffer,
                    u64 offset) {
+    InvalidateTexelBufferSync();
     SetBackingSamples(info.num_samples, false);
     scheduler->EndRendering();
 
@@ -462,26 +495,30 @@ static std::pair<u32, u32> SanitizeCopyLayers(const ImageInfo& src_info, const I
     // If the image type is equal, layer count must match. Take the minimum of both.
     if (vk_src_type == vk_dst_type) {
         if (src_layers != dst_layers) {
-            LOG_WARNING(Render_Vulkan,
-                        "Coercing copy source layers {} and destination layers {} to minimum.",
-                        src_layers, dst_layers);
+            // Image expansion intentionally copies only the shared layers. Destination-only
+            // layers are populated by RefreshImage or by the render pass that requested them.
+            LOG_TRACE(Render_Vulkan,
+                      "Copying common image layers from source {} and destination {}.", src_layers,
+                      dst_layers);
             src_layers = dst_layers = std::min(src_layers, dst_layers);
         }
     } else {
-        // For 2D <-> 3D copies, 2D layer count must equal 3D depth.
+        // For 2D <-> 3D copies, Vulkan requires the array layer count to match the copied depth.
+        // A guest descriptor may expose only a prefix of the volume, so copy the common prefix;
+        // never increase the array side beyond the host image's actual layer count.
         if (vk_src_type == vk::ImageType::e2D && vk_dst_type == vk::ImageType::e3D &&
             src_layers != depth) {
-            LOG_WARNING(Render_Vulkan,
-                        "Coercing copy 2D source layers {} to 3D destination depth {}", src_layers,
-                        depth);
-            src_layers = depth;
+            LOG_TRACE(Render_Vulkan,
+                      "Copying common 2D source layers/3D destination depth: {}/{}", src_layers,
+                      depth);
+            src_layers = std::min(src_layers, depth);
         }
         if (vk_src_type == vk::ImageType::e3D && vk_dst_type == vk::ImageType::e2D &&
             dst_layers != depth) {
-            LOG_WARNING(Render_Vulkan,
-                        "Coercing copy 2D destination layers {} to 3D source depth {}", dst_layers,
-                        depth);
-            dst_layers = depth;
+            LOG_TRACE(Render_Vulkan,
+                      "Copying common 3D source depth/2D destination layers: {}/{}", depth,
+                      dst_layers);
+            dst_layers = std::min(dst_layers, depth);
         }
     }
 
@@ -489,6 +526,7 @@ static std::pair<u32, u32> SanitizeCopyLayers(const ImageInfo& src_info, const I
 }
 
 void Image::CopyImage(Image& src_image) {
+    InvalidateTexelBufferSync();
     const auto& src_info = src_image.info;
 
     const u32 num_mips = std::min(src_info.resources.levels, info.resources.levels);
@@ -590,6 +628,7 @@ void Image::CopyImage(Image& src_image) {
             vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eTransferRead, {});
 }
 void Image::CopyImageWithBuffer(Image& src_image, vk::Buffer buffer, u64 offset) {
+    InvalidateTexelBufferSync();
     const auto& src_info = src_image.info;
     const u32 num_mips = std::min(src_info.resources.levels, info.resources.levels);
     const u32 num_layers = std::min(src_info.resources.layers, info.resources.layers);
@@ -670,6 +709,7 @@ void Image::CopyImageWithBuffer(Image& src_image, vk::Buffer buffer, u64 offset)
 }
 
 void Image::CopyMip(Image& src_image, u32 mip, u32 slice) {
+    InvalidateTexelBufferSync();
     const auto& src_info = src_image.info;
 
     const auto dst_dim = info.props.is_block ? 2 : 0;
@@ -716,6 +756,7 @@ void Image::CopyMip(Image& src_image, u32 mip, u32 slice) {
 
 void Image::Resolve(Image& src_image, const VideoCore::SubresourceRange& mrt0_range,
                     const VideoCore::SubresourceRange& mrt1_range) {
+    InvalidateTexelBufferSync();
     SetBackingSamples(1, false);
     scheduler->EndRendering();
 
@@ -768,11 +809,59 @@ void Image::Resolve(Image& src_image, const VideoCore::SubresourceRange& mrt0_ra
                                                 vk::ImageLayout::eTransferDstOptimal, region);
     }
 
-    flags |= VideoCore::ImageFlagBits::GpuModified;
+    MarkGpuModified();
     flags &= ~VideoCore::ImageFlagBits::Dirty;
 }
 
-void Image::Clear(const vk::ClearValue& clear_value, const VideoCore::SubresourceRange& range) {
+void Image::Clear(const vk::ClearValue& clear_value, const VideoCore::SubresourceRange& range,
+                  bool as_2d_slices) {
+    InvalidateTexelBufferSync();
+    if (info.props.is_volume && as_2d_slices) {
+        // vkCmdClearColorImage addresses a 3D allocation as one array layer and cannot select
+        // individual depth slices. Clear compatible 2D slice views with attachment loadOp=CLEAR,
+        // matching the guest color-buffer range without widening it to the whole volume.
+        scheduler->EndRendering();
+        Transit(vk::ImageLayout::eColorAttachmentOptimal,
+                vk::AccessFlagBits2::eColorAttachmentWrite, {});
+
+        for (u32 level = range.base.level;
+             level < range.base.level + range.extent.levels; ++level) {
+            const u32 mip_width = std::max(info.size.width >> level, 1u);
+            const u32 mip_height = std::max(info.size.height >> level, 1u);
+            const u32 mip_depth = std::max(info.size.depth >> level, 1u);
+            const u32 base_slice = std::min(range.base.layer, mip_depth - 1);
+            const u32 slice_count =
+                std::min(range.extent.layers, mip_depth - base_slice);
+            if (slice_count == 0) {
+                continue;
+            }
+
+            ImageViewInfo slice_view{};
+            slice_view.format = info.pixel_format;
+            slice_view.type = slice_count > 1 ? AmdGpu::ImageType::Color2DArray
+                                              : AmdGpu::ImageType::Color2D;
+            slice_view.range.base.level = level;
+            slice_view.range.base.layer = base_slice;
+            slice_view.range.extent.levels = 1;
+            slice_view.range.extent.layers = slice_count;
+            auto& view = FindView(slice_view, false);
+
+            Vulkan::RenderState state{};
+            state.width = static_cast<u16>(mip_width);
+            state.height = static_cast<u16>(mip_height);
+            state.num_layers = static_cast<u16>(slice_count);
+            state.num_color_attachments = 1;
+            auto& attachment = state.color_attachments[0];
+            attachment.image_view = *view.image_view;
+            attachment.image_layout = backing->state.layout;
+            attachment.clear_value = clear_value.color.uint32;
+            attachment.is_clear = true;
+            scheduler->BeginRendering(state);
+            scheduler->EndRendering();
+        }
+
+        return;
+    }
     const vk::ImageSubresourceRange vk_range = {
         .aspectMask = vk::ImageAspectFlagBits::eColor,
         .baseMipLevel = range.base.level,

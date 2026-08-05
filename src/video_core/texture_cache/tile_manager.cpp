@@ -8,26 +8,67 @@
 #include "video_core/texture_cache/image.h"
 #include "video_core/texture_cache/image_info.h"
 #include "video_core/texture_cache/image_view.h"
+#include "video_core/texture_cache/tile.h"
 #include "video_core/texture_cache/tile_manager.h"
 
 #include "video_core/host_shaders/tiling_comp.h"
 
+#include <algorithm>
 #include <magic_enum/magic_enum.hpp>
 #include <vk_mem_alloc.h>
 
 namespace VideoCore {
 
+static u64 ScratchBufferSize(const Vulkan::Instance& instance) {
+    // Keep enough queued tile/detile traffic to avoid forcing a full GPU wait whenever a busy
+    // frame crosses a small fixed ring. Scale conservatively on lower-memory devices.
+    return std::clamp(instance.GetTotalMemoryBudget() / 32, 256_MB, 512_MB);
+}
+
 struct TilingInfo {
     u32 bank_swizzle;
-    u32 num_slices;
+    u32 macro_mip_mask;
     u32 num_mips;
     std::array<ImageInfo::MipInfo, 16> mips;
 };
 
+static u32 GetMacroMipMask(const ImageInfo& info, u32 num_mips) {
+    if (!AmdGpu::IsMacroTiled(info.array_mode)) {
+        return 0;
+    }
+
+    const auto [pitch_align, height_align] = GetMacroTileExtents(
+        info.tile_mode, info.num_bits, info.num_samples, info.alt_tile);
+    ASSERT(pitch_align != 0 && height_align != 0);
+
+    u32 mask = 0;
+    for (u32 mip = 0; mip < num_mips; ++mip) {
+        u32 mip_width = std::max(info.pitch >> mip, 1u);
+        u32 mip_height = std::max(info.size.height >> mip, 1u);
+        if (info.props.is_block) {
+            mip_width = std::max((mip_width + 3) / 4, 1u);
+            mip_height = std::max((mip_height + 3) / 4, 1u);
+        }
+        if (info.props.is_pow2) {
+            mip_width = std::bit_ceil(mip_width);
+            mip_height = std::bit_ceil(mip_height);
+        }
+
+        // ImageSizeMacroTiled stores mip 0 as macro-tiled and downgrades later mips
+        // smaller than one macro tile to the equivalent 1D micro-tiled layout.
+        if (mip == 0 || (mip_width >= pitch_align && mip_height >= height_align)) {
+            mask |= 1u << mip;
+        }
+    }
+    return mask;
+}
+
 TileManager::TileManager(const Vulkan::Instance& instance, Vulkan::Scheduler& scheduler,
                          StreamBuffer& stream_buffer_)
-    : instance{instance}, scheduler{scheduler}, stream_buffer{stream_buffer_} {
+    : instance{instance}, scheduler{scheduler}, stream_buffer{stream_buffer_},
+      scratch_buffer{instance, scheduler, MemoryUsage::DeviceLocal, ScratchBufferSize(instance)} {
     const auto device = instance.GetDevice();
+    Vulkan::SetObjectName(device, scratch_buffer.Handle(), "Tile scratch ring");
     const std::array<vk::DescriptorSetLayoutBinding, 3> bindings = {{
         {
             .binding = 0,
@@ -76,6 +117,13 @@ TileManager::TileManager(const Vulkan::Instance& instance, Vulkan::Scheduler& sc
 TileManager::~TileManager() = default;
 
 TileManager::ScratchBuffer TileManager::GetScratchBuffer(u32 size) {
+    if (const auto offset = scratch_buffer.Reserve(size, instance.StorageMinAlignment())) {
+        scratch_buffer.Commit(false);
+        return {scratch_buffer.Handle(), static_cast<u32>(*offset), VK_NULL_HANDLE};
+    }
+
+    // Oversized transfers are uncommon. Keep the old one-shot allocation as a correctness
+    // fallback when a single guest image cannot fit in the bounded scratch ring.
     constexpr auto usage =
         vk::BufferUsageFlagBits::eUniformBuffer | vk::BufferUsageFlagBits::eStorageBuffer |
         vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eTransferDst;
@@ -95,7 +143,7 @@ TileManager::ScratchBuffer TileManager::GetScratchBuffer(u32 size) {
     const auto result = vmaCreateBuffer(instance.GetAllocator(), &buffer_ci_unsafe, &alloc_info,
                                         &buffer, &allocation, nullptr);
     ASSERT(result == VK_SUCCESS);
-    return {buffer, allocation};
+    return {buffer, 0, allocation};
 }
 
 vk::Pipeline TileManager::GetTilingPipeline(const ImageInfo& info, bool is_tiler) {
@@ -169,11 +217,11 @@ TileManager::Result TileManager::DetileImage(vk::Buffer in_buffer, u32 in_offset
 
     TilingInfo params{};
     params.bank_swizzle = info.bank_swizzle;
-    params.num_slices = info.props.is_volume ? info.size.depth : info.resources.layers;
-    params.num_mips = info.resources.levels;
+    params.num_mips = info.guest_resources.levels;
+    params.macro_mip_mask = GetMacroMipMask(info, params.num_mips);
     for (u32 mip = 0; mip < params.num_mips; ++mip) {
         auto& mip_info = params.mips[mip];
-        mip_info = info.mips_layout[mip];
+        mip_info = info.guest_mips_layout[mip];
         if (info.props.is_block) {
             mip_info.pitch = std::max((mip_info.pitch + 3) / 4, 1U);
             mip_info.height = std::max((mip_info.height + 3) / 4, 1U);
@@ -186,10 +234,13 @@ TileManager::Result TileManager::DetileImage(vk::Buffer in_buffer, u32 in_offset
         .range = sizeof(params),
     };
 
-    const auto [out_buffer, out_allocation] = GetScratchBuffer(info.guest_size);
-    scheduler.DeferOperation([this, out_buffer, out_allocation]() {
-        vmaDestroyBuffer(instance.GetAllocator(), out_buffer, out_allocation);
-    });
+    const auto scratch = GetScratchBuffer(info.guest_size);
+    if (scratch.allocation != VK_NULL_HANDLE) {
+        scheduler.DeferOperation([this, buffer = scratch.buffer,
+                                  allocation = scratch.allocation]() {
+            vmaDestroyBuffer(instance.GetAllocator(), buffer, allocation);
+        });
+    }
 
     scheduler.EndRendering();
 
@@ -203,8 +254,8 @@ TileManager::Result TileManager::DetileImage(vk::Buffer in_buffer, u32 in_offset
     };
 
     const vk::DescriptorBufferInfo linear_buffer_info{
-        .buffer = out_buffer,
-        .offset = 0,
+        .buffer = scratch.buffer,
+        .offset = scratch.offset,
         .range = info.guest_size,
     };
 
@@ -238,7 +289,7 @@ TileManager::Result TileManager::DetileImage(vk::Buffer in_buffer, u32 in_offset
 
     const auto dim_x = (info.guest_size / (info.num_bits / 8)) / 64;
     cmdbuf.dispatch(dim_x, 1, 1);
-    return {out_buffer, 0};
+    return {scratch.buffer, scratch.offset};
 }
 
 void TileManager::TileImage(Image& in_image, std::span<vk::BufferImageCopy> buffer_copies,
@@ -254,11 +305,11 @@ void TileManager::TileImage(Image& in_image, std::span<vk::BufferImageCopy> buff
 
     TilingInfo params{};
     params.bank_swizzle = info.bank_swizzle;
-    params.num_slices = info.props.is_volume ? info.size.depth : info.resources.layers;
     params.num_mips = static_cast<u32>(buffer_copies.size());
+    params.macro_mip_mask = GetMacroMipMask(info, params.num_mips);
     for (u32 mip = 0; mip < params.num_mips; ++mip) {
         auto& mip_info = params.mips[mip];
-        mip_info = info.mips_layout[mip];
+        mip_info = info.guest_mips_layout[mip];
         if (info.props.is_block) {
             mip_info.pitch = std::max((mip_info.pitch + 3) / 4, 1U);
             mip_info.height = std::max((mip_info.height + 3) / 4, 1U);
@@ -271,13 +322,19 @@ void TileManager::TileImage(Image& in_image, std::span<vk::BufferImageCopy> buff
         .range = sizeof(params),
     };
 
-    const auto [temp_buffer, temp_allocation] = GetScratchBuffer(info.guest_size);
-    scheduler.DeferOperation([this, temp_buffer, temp_allocation]() {
-        vmaDestroyBuffer(instance.GetAllocator(), temp_buffer, temp_allocation);
-    });
+    const auto scratch = GetScratchBuffer(info.guest_size);
+    if (scratch.allocation != VK_NULL_HANDLE) {
+        scheduler.DeferOperation([this, buffer = scratch.buffer,
+                                  allocation = scratch.allocation]() {
+            vmaDestroyBuffer(instance.GetAllocator(), buffer, allocation);
+        });
+    }
 
     const auto cmdbuf = scheduler.CommandBuffer();
-    in_image.Download(buffer_copies, temp_buffer, 0, copy_size);
+    for (auto& copy : buffer_copies) {
+        copy.bufferOffset += scratch.offset;
+    }
+    in_image.Download(buffer_copies, scratch.buffer, scratch.offset, copy_size);
 
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, GetTilingPipeline(info, true));
 
@@ -288,8 +345,8 @@ void TileManager::TileImage(Image& in_image, std::span<vk::BufferImageCopy> buff
     };
 
     const vk::DescriptorBufferInfo linear_buffer_info{
-        .buffer = temp_buffer,
-        .offset = 0,
+        .buffer = scratch.buffer,
+        .offset = scratch.offset,
         .range = info.guest_size,
     };
 

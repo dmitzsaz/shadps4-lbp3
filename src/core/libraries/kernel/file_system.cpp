@@ -871,6 +871,7 @@ s32 PS4_SYSV_ABI sceKernelFtruncate(s32 fd, s64 length) {
 }
 
 s32 PS4_SYSV_ABI posix_rename(const char* from, const char* to) {
+    try {
     auto* mnt = Common::Singleton<Core::FileSys::MntPoints>::Instance();
     bool ro = false;
     const auto src_path = mnt->GetHostPath(from, &ro);
@@ -913,9 +914,15 @@ s32 PS4_SYSV_ABI posix_rename(const char* from, const char* to) {
         }
     }
 
-    // On Windows, fs::rename will error if the file has been opened before.
+    // On Windows, fs::rename will error if the file has been opened before, so retain the
+    // copy-and-remove fallback there. POSIX hosts must use the native atomic rename: recursively
+    // walking a directory is observably different and can race internal save-data backups.
+#ifdef _WIN32
     fs::copy(src_path, dst_path,
              fs::copy_options::overwrite_existing | fs::copy_options::recursive);
+#else
+    fs::rename(src_path, dst_path);
+#endif
     auto* h = Common::Singleton<Core::FileSys::HandleTable>::Instance();
     auto file = h->GetFile(src_path);
     if (file) {
@@ -928,6 +935,13 @@ s32 PS4_SYSV_ABI posix_rename(const char* from, const char* to) {
     }
 
     return ORBIS_OK;
+    } catch (const fs::filesystem_error& err) {
+        // POSIX APIs report filesystem failures to the guest; an implementation detail must not
+        // unwind through guest code and terminate the whole emulator.
+        SetPosixErrno(err.code().value());
+        LOG_ERROR(Kernel_Fs, "Failed to rename {} to {}: {}", from, to, err.what());
+        return -1;
+    }
 }
 
 s32 PS4_SYSV_ABI sceKernelRename(const char* from, const char* to) {

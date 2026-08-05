@@ -57,6 +57,7 @@ struct ImageInfo {
 
     bool IsCompatible(const ImageInfo& info) const;
     void UpdateSize();
+    void ExpandResources(const SubresourceExtent& expanded_resources);
 
     struct {
         VAddr cmask_addr;
@@ -68,7 +69,12 @@ struct ImageInfo {
     ImageProperties props{};
     vk::Format pixel_format = vk::Format::eUndefined;
     AmdGpu::ImageType type;
+    // Vulkan allocation/view capacity. This may be expanded to contain multiple compatible guest
+    // descriptors which alias the same address.
     SubresourceExtent resources;
+    // Subresources actually described by the guest layout below. Unlike `resources`, this must
+    // never be synthesized as the cross-product of two independent aliasing descriptors.
+    SubresourceExtent guest_resources;
     Extent3D size{1, 1, 1};
     u32 num_bits{};
     u32 num_samples = 1;
@@ -81,7 +87,8 @@ struct ImageInfo {
         u32 height;
         u32 offset;
     };
-    std::array<MipInfo, 16> mips_layout;
+    std::array<MipInfo, 16> mips_layout{};
+    std::array<MipInfo, 16> guest_mips_layout{};
     VAddr guest_address{};
     u32 guest_size{};
     u8 bank_swizzle{};

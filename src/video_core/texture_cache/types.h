@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <algorithm>
+
 #include "common/slot_vector.h"
 #include "common/types.h"
 
@@ -63,8 +65,25 @@ struct SubresourceExtent {
     u32 levels = 1;
     u32 layers = 1;
 
+    /// Returns true when this extent can contain every subresource in `other`.
+    constexpr bool Contains(const SubresourceExtent& other) const noexcept {
+        return levels >= other.levels && layers >= other.layers;
+    }
+
+    /// Returns the smallest extent that can contain both inputs.
+    constexpr SubresourceExtent ExpandedWith(const SubresourceExtent& other) const noexcept {
+        return {
+            .levels = std::max(levels, other.levels),
+            .layers = std::max(layers, other.layers),
+        };
+    }
+
     auto operator<=>(const SubresourceExtent&) const = default;
 };
+
+static_assert(!SubresourceExtent{1, 64}.Contains(SubresourceExtent{2, 2}));
+static_assert(SubresourceExtent{1, 64}.ExpandedWith(SubresourceExtent{2, 2}) ==
+              SubresourceExtent{2, 64});
 
 struct SubresourceRange {
     SubresourceBase base;

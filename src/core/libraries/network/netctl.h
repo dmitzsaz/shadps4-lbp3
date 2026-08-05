@@ -134,7 +134,7 @@ int PS4_SYSV_ABI sceNetCtlScanIpcInt();
 int PS4_SYSV_ABI sceNetCtlSetErrorNotificationEnabledIpcInt();
 int PS4_SYSV_ABI sceNetCtlSetStunWithPaddingFlagIpcInt();
 int PS4_SYSV_ABI sceNetCtlTerm();
-int PS4_SYSV_ABI sceNetCtlUnregisterCallback();
+int PS4_SYSV_ABI sceNetCtlUnregisterCallback(int cid);
 int PS4_SYSV_ABI sceNetCtlUnregisterCallbackForLibIpcInt();
 int PS4_SYSV_ABI sceNetCtlUnregisterCallbackIpcInt();
 int PS4_SYSV_ABI sceNetCtlUnregisterCallbackV6IpcInt();

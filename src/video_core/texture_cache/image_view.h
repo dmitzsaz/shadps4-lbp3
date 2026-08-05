@@ -35,6 +35,10 @@ struct ImageViewInfo {
     SubresourceRange range;
     vk::ComponentMapping mapping{};
     u32 min_lod = 0;
+    // A separate guest stencil surface can be backed by the stencil aspect of an associated
+    // depth-stencil image. Keep that intent explicit: the guest texture descriptor may use a
+    // packed color format which is not a legal native view format for the combined host image.
+    bool is_stencil = false;
     bool is_storage = false;
 
     auto operator<=>(const ImageViewInfo&) const = default;

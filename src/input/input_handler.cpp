@@ -919,7 +919,11 @@ InputEvent BindingConnection::ProcessBinding() {
     // and the analog inputs are always the last one due to how they are sorted,
     // so this signifies whether or not the input is analog
     InputEvent event = InputEvent(binding.keys[0]);
-    if (pressed_keys.empty()) {
+    // A toggled binding is intentionally active without a currently pressed
+    // physical key. Do not return before removing toggled keys from the
+    // binding, otherwise key_toggle only works while some unrelated key is
+    // held down.
+    if (pressed_keys.empty() && toggled_keys.empty()) {
         return event;
     }
     if (event.input.type != InputType::Axis) {

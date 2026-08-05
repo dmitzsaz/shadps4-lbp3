@@ -90,6 +90,9 @@ public:
     /// Marks an image as dirty if it exists at the provided address.
     void InvalidateMemoryFromGPU(VAddr address, size_t max_size);
 
+    /// Invalidates cached image-to-formatted-buffer synchronization for overlapping images.
+    void InvalidateTexelBufferSync(VAddr address, size_t size);
+
     /// Evicts any images that overlap the unmapped range.
     void UnmapMemory(VAddr cpu_addr, size_t size);
 
@@ -177,34 +180,27 @@ public:
     /// Returns true if a slice of the specified metadata surface has been cleared.
     bool IsMetaCleared(VAddr address, u32 slice) const {
         const auto& it = surface_metas.find(address);
-        if (it != surface_metas.end()) {
-            return it.value().clear_mask & (1u << slice);
-        }
-        return false;
+        return it != surface_metas.end() && it.value().IsCleared(slice);
     }
 
     /// Clears all slices of the specified metadata surface.
     bool ClearMeta(VAddr address) {
         auto it = surface_metas.find(address);
-        if (it != surface_metas.end()) {
-            it.value().clear_mask = u32(-1);
-            return true;
+        if (it == surface_metas.end()) {
+            return false;
         }
-        return false;
+        it.value().ClearAll();
+        return true;
     }
 
     /// Updates the state of a slice of the specified metadata surface.
     bool TouchMeta(VAddr address, u32 slice, bool is_clear) {
         auto it = surface_metas.find(address);
-        if (it != surface_metas.end()) {
-            if (is_clear) {
-                it.value().clear_mask |= 1u << slice;
-            } else {
-                it.value().clear_mask &= ~(1u << slice);
-            }
-            return true;
+        if (it == surface_metas.end()) {
+            return false;
         }
-        return false;
+        it.value().SetCleared(slice, is_clear);
+        return true;
     }
 
     /// Runs the garbage collector.
@@ -269,13 +265,22 @@ private:
     }
 
     /// Copies image memory back to CPU.
-    void DownloadImageMemory(ImageId image_id, bool sync = false);
+    void DownloadImageMemory(ImageId image_id, bool sync = false, bool gc_retirement = false);
 
     /// Thread function for copying downloaded images out to CPU memory.
     void DownloadedImagesThread(const std::stop_token& token);
 
     /// Create an image from the given parameters
     [[nodiscard]] ImageId InsertImage(const ImageInfo& info, VAddr cpu_addr);
+
+    /// Creates the missing 2D-array/3D interpretation without retiring its coherent peer.
+    [[nodiscard]] ImageId CreateDimensionalAlias(const ImageInfo& info, ImageId source_id);
+
+    /// Copies the newest resident dimensional interpretation into a stale exact match.
+    void SynchronizeDimensionalAlias(ImageId image_id);
+
+    /// Marks other resident dimensional interpretations stale before this image is GPU-written.
+    void MarkDimensionalAliasesStale(ImageId authoritative_id);
 
     /// Register image in the page table
     void RegisterImage(ImageId image);
@@ -299,9 +304,11 @@ private:
     void DeleteImage(ImageId image_id);
 
     /// Touch the image in the LRU cache.
-    void TouchImage(const Image& image);
+    void TouchImage(Image& image);
 
     void FreeImage(ImageId image_id) {
+        // Any non-GC destruction path cancels a queued retirement callback before unregistering.
+        slot_images[image_id].flags &= ~ImageFlagBits::GcPending;
         UntrackImage(image_id);
         UnregisterImage(image_id);
         DeleteImage(image_id);
@@ -326,6 +333,7 @@ private:
     u64 trigger_gc_memory = 0;
     u64 pressure_gc_memory = 0;
     u64 critical_gc_memory = 0;
+    u64 pending_gc_download_bytes = 0;
     u64 total_used_samplers = 0;
     u64 trigger_gc_samplers = 0;
     u64 pressure_gc_samplers = 0;
@@ -344,8 +352,39 @@ private:
             FMask,
             HTile,
         };
+
+        explicit MetaDataInfo(Type type_, s32 initial_clear_mask = -1)
+            : type{type_}, all_slices_clear{initial_clear_mask == -1} {
+            if (!all_slices_clear) {
+                const u32 mask = static_cast<u32>(initial_clear_mask);
+                for (u32 slice = 0; slice < 32; ++slice) {
+                    if ((mask & (u32{1} << slice)) != 0) {
+                        clear_overrides.emplace(slice);
+                    }
+                }
+            }
+        }
+
+        bool IsCleared(u32 slice) const {
+            return all_slices_clear != clear_overrides.contains(slice);
+        }
+
+        void ClearAll() {
+            all_slices_clear = true;
+            clear_overrides.clear();
+        }
+
+        void SetCleared(u32 slice, bool is_clear) {
+            if (is_clear == all_slices_clear) {
+                clear_overrides.erase(slice);
+            } else {
+                clear_overrides.emplace(slice);
+            }
+        }
+
         Type type;
-        s32 clear_mask = -1;
+        bool all_slices_clear;
+        std::unordered_set<u32> clear_overrides;
     };
     tsl::robin_map<VAddr, MetaDataInfo> surface_metas;
 };

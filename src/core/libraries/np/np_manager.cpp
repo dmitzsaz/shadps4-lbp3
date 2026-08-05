@@ -275,7 +275,7 @@ s32 PS4_SYSV_ABI sceNpCheckPlus(s32 req_id, const OrbisNpCheckPlusParameter* par
         return CompleteRequest(*req, ORBIS_NP_ERROR_SIGNED_OUT);
     }
     LOG_DEBUG(Lib_NpManager, "req_id = {:#x}, features = {:#x}", req_id, param->features);
-    // Grant PS+ — shadNet has no subscription gating.
+    // Grant PS+: shadNet has no subscription gating.
     result->authorized = true;
     return CompleteRequest(*req, ORBIS_OK);
 }
@@ -591,6 +591,8 @@ s32 PS4_SYSV_ABI sceNpGetAccountIdA(Libraries::UserService::OrbisUserServiceUser
     return ORBIS_OK;
 }
 
+
+
 s32 PS4_SYSV_ABI sceNpGetNpId(Libraries::UserService::OrbisUserServiceUserId user_id,
                               OrbisNpId* np_id) {
     LOG_DEBUG(Lib_NpManager, "user_id {}", user_id);
@@ -604,10 +606,11 @@ s32 PS4_SYSV_ABI sceNpGetNpId(Libraries::UserService::OrbisUserServiceUserId use
     }
     if (!g_shadnet_enabled || !Libraries::Np::NpHandler::GetInstance().IsPsnSignedIn(user_id)) {
         LOG_WARNING(Lib_NpManager,
-                    "sceNpGetNpId: SIGNED_OUT (user_id={} shadnet_enabled={} signed_in={})",
+                    "sceNpGetNpId: no network NP account (user_id={} shadnet_enabled={} "
+                    "signed_in={})",
                     user_id, g_shadnet_enabled,
                     Libraries::Np::NpHandler::GetInstance().IsPsnSignedIn(user_id));
-        return ORBIS_NP_ERROR_SIGNED_OUT;
+        return ORBIS_NP_ERROR_USER_NOT_FOUND;
     }
     *np_id = Libraries::Np::NpHandler::GetInstance().GetNpId(user_id);
     LOG_INFO(Lib_NpManager, "sceNpGetNpId: user_id={} handle.data='{}' (strnlen={})", user_id,
@@ -838,7 +841,10 @@ void NotifyNpStateFromUserServiceEvent(Libraries::UserService::OrbisUserServiceE
             // Handler connects the user and fires SignedIn via the bridge on success.
             Libraries::Np::NpHandler::GetInstance().OnUserLoggedIn(user_id);
         } else {
-            QueueNpStateEvent(user_id, OrbisNpState::SignedOut);
+            // A local console login does not transition an already-offline NP user.
+            LOG_INFO(Lib_NpManager,
+                     "Suppressing redundant SignedOut event for offline local login, user_id={}",
+                     user_id);
         }
         break;
     case Libraries::UserService::OrbisUserServiceEventType::Logout:
@@ -846,7 +852,10 @@ void NotifyNpStateFromUserServiceEvent(Libraries::UserService::OrbisUserServiceE
             // Handler disconnects the user and fires SignedOut via the bridge.
             Libraries::Np::NpHandler::GetInstance().OnUserLoggedOut(user_id);
         } else {
-            QueueNpStateEvent(user_id, OrbisNpState::SignedOut);
+            // The NP user was never signed in, so local logout is not an NP state edge.
+            LOG_INFO(Lib_NpManager,
+                     "Suppressing redundant SignedOut event for offline local logout, user_id={}",
+                     user_id);
         }
         break;
     default:
@@ -935,6 +944,11 @@ static void DispatchPendingNpStateCallbacks() {
 
     for (auto& event : pending_events) {
         if (legacy_callback.func != nullptr) {
+            LOG_INFO(Lib_NpManager,
+                     "Dispatching state {} to legacy callback = {}, userdata = {}",
+                     static_cast<s32>(event.state),
+                     reinterpret_cast<const void*>(legacy_callback.func),
+                     legacy_callback.userdata);
             legacy_callback.func(event.user_id, event.state,
                                  event.has_np_id ? &event.np_id : nullptr,
                                  legacy_callback.userdata);
@@ -983,14 +997,17 @@ s32 PS4_SYSV_ABI sceNpRegisterStateCallback(OrbisNpStateCallback callback, void*
         return ORBIS_NP_ERROR_INVALID_ARGUMENT;
     }
 
-    std::scoped_lock lk{g_np_state_callbacks_mutex};
-    if (LegacyNpStateCb.func != nullptr) {
-        return ORBIS_NP_ERROR_CALLBACK_ALREADY_REGISTERED;
+    {
+        std::scoped_lock lk{g_np_state_callbacks_mutex};
+        if (LegacyNpStateCb.func != nullptr) {
+            return ORBIS_NP_ERROR_CALLBACK_ALREADY_REGISTERED;
+        }
+
+        LOG_INFO(Lib_NpManager, "called, userdata = {}", userdata);
+        LegacyNpStateCb.func = callback;
+        LegacyNpStateCb.userdata = userdata;
     }
 
-    LOG_INFO(Lib_NpManager, "called, userdata = {}", userdata);
-    LegacyNpStateCb.func = callback;
-    LegacyNpStateCb.userdata = userdata;
     return ORBIS_OK;
 }
 
@@ -1202,6 +1219,37 @@ void DeregisterNpCallback(std::string key) {
     g_np_callbacks.erase(key);
 }
 
+// The bandwidth-test service is unavailable while shadNet is disabled, but callers still
+// expect its asynchronous state machine to reach a terminal state. A zero-returning common
+// stub starts a test with handle 0 and then leaves the status output untouched forever.
+static s32 PS4_SYSV_ABI sceNpBandwidthTestInitStart(const void* param) {
+    if (param == nullptr) {
+        return ORBIS_NP_ERROR_INVALID_ARGUMENT;
+    }
+    LOG_DEBUG(Lib_NpManager, "completing bandwidth test offline");
+    return 1;
+}
+
+static s32 PS4_SYSV_ABI sceNpBandwidthTestGetStatus(s32 test_id, s32* status) {
+    if (test_id < 0 || status == nullptr) {
+        return ORBIS_NP_ERROR_INVALID_ARGUMENT;
+    }
+    // LBP3 treats status 2 as complete and then calls Shutdown to collect the result.
+    constexpr s32 ORBIS_NP_BANDWIDTH_TEST_STATUS_FINISHED = 2;
+    *status = ORBIS_NP_BANDWIDTH_TEST_STATUS_FINISHED;
+    return ORBIS_OK;
+}
+
+static s32 PS4_SYSV_ABI sceNpBandwidthTestShutdown(s32 test_id, double* result) {
+    if (test_id < 0 || result == nullptr) {
+        return ORBIS_NP_ERROR_INVALID_ARGUMENT;
+    }
+    // The result is two doubles (download/upload bandwidth). Offline completion has no samples.
+    result[0] = 0.0;
+    result[1] = 0.0;
+    return ORBIS_OK;
+}
+
 void RegisterLib(Core::Loader::SymbolsResolver* sym) {
     ASSERT_MSG(Libraries::Kernel::sceKernelGetCompiledSdkVersion(&g_firmware_version) == ORBIS_OK,
                "Failed to get compiled SDK version.");
@@ -1294,6 +1342,13 @@ void RegisterLib(Core::Loader::SymbolsResolver* sym) {
                  sceNpRegisterStateCallbackForToolkit);
     LIB_FUNCTION("YIvqqvJyjEc", "libSceNpManagerForToolkit", 1, "libSceNpManager",
                  sceNpUnregisterStateCallbackForToolkit);
+
+    LIB_FUNCTION("BYIZGKm6bO4", "libSceNpUtility", 1, "libSceNpUtility",
+                 sceNpBandwidthTestGetStatus);
+    LIB_FUNCTION("jktww3yJXnc", "libSceNpUtility", 1, "libSceNpUtility",
+                 sceNpBandwidthTestInitStart);
+    LIB_FUNCTION("pLr1fEQS1z8", "libSceNpUtility", 1, "libSceNpUtility",
+                 sceNpBandwidthTestShutdown);
 
     LIB_FUNCTION("2rsFmlGWleQ", "libSceNpManagerCompat", 1, "libSceNpManager",
                  sceNpCheckNpAvailability);

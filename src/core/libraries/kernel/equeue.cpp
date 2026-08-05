@@ -6,6 +6,7 @@
 
 #include "common/assert.h"
 #include "common/debug.h"
+#include "common/guest_time_stall.h"
 #include "common/logging/log.h"
 #include "common/singleton.h"
 #include "core/file_sys/fs.h"
@@ -197,9 +198,28 @@ int EqueueInternal::WaitForEvents(OrbisKernelEvent* ev, int num, const OrbisKern
         std::unique_lock lock{m_mutex};
         m_cond.wait(lock, predicate);
     } else {
-        // Wait up until the timeout value
+        // Host shader and pipeline compilation has no guest-hardware equivalent. If it overlaps
+        // this wait, move the deadline by exactly the overlapping host-only duration so titles do
+        // not mistake a cold pipeline cache for a hung emulated device.
+        auto stall = Common::GetGuestTimeStallTracker().GetSnapshot();
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::microseconds(micros);
         std::unique_lock lock{m_mutex};
-        m_cond.wait_for(lock, std::chrono::microseconds(micros), predicate);
+        while (!predicate()) {
+            const auto current_stall = Common::GetGuestTimeStallTracker().GetSnapshot();
+            deadline += current_stall.elapsed - stall.elapsed;
+            stall = current_stall;
+
+            const auto now = std::chrono::steady_clock::now();
+            if (now >= deadline) {
+                // Cover the narrow race where a stall starts between sampling it and checking the
+                // deadline. The next iteration accounts for the actual elapsed duration.
+                if (!stall.active) {
+                    break;
+                }
+                deadline = now + std::chrono::milliseconds(1);
+            }
+            m_cond.wait_until(lock, deadline);
+        }
     }
 
     return count;

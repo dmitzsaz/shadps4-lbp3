@@ -657,10 +657,8 @@ int PS4_SYSV_ABI sceNetEpollControl(OrbisNetId epollid, OrbisNetEpollFlag op, Or
         case Core::FileSys::FileType::Socket: {
             auto native_handle = file->socket->Native();
             if (!native_handle) {
-                // P2P socket, cannot be added to epoll
-                LOG_ERROR(Lib_Net, "P2P socket cannot be added to epoll (unimplemented)");
-                *sceNetErrnoLoc() = ORBIS_NET_EBADF;
-                return ORBIS_NET_ERROR_EBADF;
+                epoll->events.emplace_back(id, *event);
+                break;
             }
 
 #ifndef __FreeBSD__
@@ -707,10 +705,8 @@ int PS4_SYSV_ABI sceNetEpollControl(OrbisNetId epollid, OrbisNetEpollFlag op, Or
         case Core::FileSys::FileType::Socket: {
             auto native_handle = file->socket->Native();
             if (!native_handle) {
-                // P2P socket, cannot be modified in epoll
-                LOG_ERROR(Lib_Net, "P2P socket cannot be modified in epoll (unimplemented)");
-                *sceNetErrnoLoc() = ORBIS_NET_EBADF;
-                return ORBIS_NET_ERROR_EBADF;
+                *it = {id, *event};
+                break;
             }
 
 #ifndef __FreeBSD__
@@ -751,10 +747,8 @@ int PS4_SYSV_ABI sceNetEpollControl(OrbisNetId epollid, OrbisNetEpollFlag op, Or
         case Core::FileSys::FileType::Socket: {
             auto native_handle = file->socket->Native();
             if (!native_handle) {
-                // P2P socket, cannot be removed from epoll
-                LOG_ERROR(Lib_Net, "P2P socket cannot be removed from epoll (unimplemented)");
-                *sceNetErrnoLoc() = ORBIS_NET_EBADF;
-                return ORBIS_NET_ERROR_EBADF;
+                epoll->events.erase(it);
+                break;
             }
 #ifndef __FreeBSD__
             ASSERT(epoll_ctl(epoll->epoll_fd, EPOLL_CTL_DEL, *native_handle, nullptr) == 0);
@@ -828,18 +822,28 @@ int PS4_SYSV_ABI sceNetEpollWait(OrbisNetId epollid, OrbisNetEpollEvent* events,
               epoll->name, maxevents, timeout);
 
     int sockets_waited_on = (epoll->events.size() - epoll->async_resolutions.size()) > 0;
+    const bool emulated_socket_ready = std::ranges::any_of(epoll->events, [](const auto& entry) {
+        auto socket_file = FDTable::Instance()->GetFile(entry.first);
+        if (!socket_file || socket_file->type != Core::FileSys::FileType::Socket) {
+            return false;
+        }
+        const auto socket = socket_file->socket;
+        return socket && !socket->Native() &&
+               socket->GetPendingEvents(entry.second.events) != 0;
+    });
+    const int wait_timeout = emulated_socket_ready ? 0 : timeout;
 
     std::vector<epoll_event> native_events{static_cast<size_t>(maxevents)};
     int result = ORBIS_OK;
     if (sockets_waited_on) {
 #ifdef __linux__
-        const timespec epoll_timeout{.tv_sec = timeout / 1000000,
-                                     .tv_nsec = (timeout % 1000000) * 1000};
+        const timespec epoll_timeout{.tv_sec = wait_timeout / 1000000,
+                                     .tv_nsec = (wait_timeout % 1000000) * 1000};
         result = epoll_pwait2(epoll->epoll_fd, native_events.data(), maxevents,
-                              timeout < 0 ? nullptr : &epoll_timeout, nullptr);
+                              wait_timeout < 0 ? nullptr : &epoll_timeout, nullptr);
 #else
         result = epoll_wait(epoll->epoll_fd, native_events.data(), maxevents,
-                            timeout < 0 ? timeout : timeout / 1000);
+                            wait_timeout < 0 ? wait_timeout : wait_timeout / 1000);
 #endif
     }
 
@@ -881,6 +885,34 @@ int PS4_SYSV_ABI sceNetEpollWait(OrbisNetId epollid, OrbisNetEpollEvent* events,
     }
 
     if (result >= 0) {
+        for (const auto& [id, registered_event] : epoll->events) {
+            if (i == maxevents) {
+                break;
+            }
+            auto socket_file = FDTable::Instance()->GetFile(id);
+            if (!socket_file || socket_file->type != Core::FileSys::FileType::Socket) {
+                continue;
+            }
+            const auto socket = socket_file->socket;
+            if (!socket || socket->Native()) {
+                continue;
+            }
+
+            const u32 pending_events = socket->GetPendingEvents(registered_event.events);
+            if (pending_events == 0) {
+                continue;
+            }
+            events[i] = {
+                .events = pending_events,
+                .ident = static_cast<u64>(id),
+                .data = registered_event.data,
+            };
+            LOG_DEBUG(Lib_Net,
+                      "emulated event[{}] = ( .events = {:#x}, .ident = {}, .data = {:#x} )", i,
+                      events[i].events, events[i].ident, events[i].data.data_u64);
+            ++i;
+        }
+
         while (!epoll->async_resolutions.empty()) {
             if (i == maxevents) {
                 break;

@@ -106,7 +106,13 @@ ImageView::ImageView(const Vulkan::Instance& instance, const ImageViewInfo& info
     // When sampling D32/D16 texture from shader, the T# specifies R32/R16 format so adjust it.
     vk::Format format = info.format;
     vk::ImageAspectFlags aspect = image.aspect_mask;
-    if (image.aspect_mask & vk::ImageAspectFlagBits::eDepth &&
+    if (info.is_stencil && image.aspect_mask & vk::ImageAspectFlagBits::eStencil) {
+        // PS4 stores stencil separately from depth. Texture-cache association combines both into
+        // one Vulkan depth-stencil image, so sample its stencil aspect instead of attempting an
+        // incompatible color-format view (which Metal correctly rejects).
+        format = image.info.pixel_format;
+        aspect = vk::ImageAspectFlagBits::eStencil;
+    } else if (image.aspect_mask & vk::ImageAspectFlagBits::eDepth &&
         Vulkan::LiverpoolToVK::IsFormatDepthCompatible(format)) {
         format = image.info.pixel_format;
         aspect = vk::ImageAspectFlagBits::eDepth;

@@ -107,8 +107,21 @@ void Liverpool::Process(std::stop_token stoken) {
 
         curr_qid = -1;
 
+        const auto graphics_queue_empty = [this] {
+            auto& queue = mapped_queues[GfxQueueId];
+            std::scoped_lock lock{queue.m_access};
+            return queue.submits.empty();
+        };
+
         while (num_submits || num_commands) {
             ProcessCommands();
+
+            // SubmitDone marks a graphics-frame boundary, not completion of every independent
+            // asynchronous-compute queue. Flush/present as soon as the graphics FIFO drains;
+            // queued ASC work remains ordered in its own FIFO and continues on the next pass.
+            if (submit_done && graphics_queue_empty()) {
+                break;
+            }
 
             curr_qid = (curr_qid + 1) % num_mapped_queues;
 

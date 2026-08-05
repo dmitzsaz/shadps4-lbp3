@@ -16,11 +16,14 @@
 #include "core/module.h"
 #include "core/tls.h"
 
+#include <cstring>
+
 namespace Core {
 
 using EntryFunc = PS4_SYSV_ABI int (*)(size_t args, const void* argp, void* param);
 
 static constexpr u64 ModuleLoadBase = 0x800000000;
+static constexpr u64 HardwareEbootLoadBase = 0x400000;
 
 static u64 GetAlignedSize(const elf_program_header& phdr) {
     return (phdr.p_align != 0 ? (phdr.p_memsz + (phdr.p_align - 1)) & ~(phdr.p_align - 1)
@@ -113,9 +116,30 @@ void Module::LoadModuleToMemory(u32& max_tls_index) {
 
     // Reserve memory area for module
     void** out_addr = reinterpret_cast<void**>(&base_virtual_addr);
+    const bool use_hardware_eboot_base =
+        name == "eboot.bin" &&
+        memory->GetAddressSpace().SystemManagedVirtualBase() == HardwareEbootLoadBase;
+    const VAddr requested_load_base =
+        use_hardware_eboot_base ? HardwareEbootLoadBase : ModuleLoadBase;
     s32 result =
-        memory->MapMemory(out_addr, ModuleLoadBase, aligned_base_size + TrampolineSize,
+        memory->MapMemory(out_addr, requested_load_base, aligned_base_size + TrampolineSize,
                           MemoryProt::NoAccess, MemoryMapFlags::NoFlags, VMAType::Reserved, name);
+    if (use_hardware_eboot_base &&
+        (result != ORBIS_OK || base_virtual_addr != HardwareEbootLoadBase)) {
+        if (result == ORBIS_OK) {
+            const s32 unmap_result =
+                memory->UnmapMemory(base_virtual_addr, aligned_base_size + TrampolineSize);
+            ASSERT_MSG(unmap_result == ORBIS_OK,
+                       "Failed to release unavailable hardware eboot mapping for {}", name);
+        }
+        base_virtual_addr = 0;
+        result = memory->MapMemory(out_addr, ModuleLoadBase, aligned_base_size + TrampolineSize,
+                                   MemoryProt::NoAccess, MemoryMapFlags::NoFlags,
+                                   VMAType::Reserved, name);
+        LOG_WARNING(Core_Linker,
+                    "Unable to map {} at hardware address {:#x}; falling back to {:#x}", name,
+                    HardwareEbootLoadBase, base_virtual_addr);
+    }
     ASSERT_MSG(result == ORBIS_OK, "Failed to reserve memory for module {}", name);
     LOG_INFO(Core_Linker, "Loading module {} to {}", name, fmt::ptr(*out_addr));
 

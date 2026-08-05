@@ -1,3 +1,10 @@
+> [!NOTE]
+> **Owner's note:** this fork was made entirely by OpenAI Codex, and I genuinely don't give a fuck that it was made by AI. The only goal was to play LittleBigPlanet 3. Tested on Windows and macOS.
+>
+> Anyone who is against AI coding can keep living in their stereotypes. See [Linus Torvalds on the Linux kernel mailing list](https://lore.kernel.org/linux-media/CAHk-%3Dwi4zC%2BZe8e%2Bp3tMv8TtG_80KzsZ1syL9anBtmEh5Z40vg%40mail.gmail.com/).
+>
+> This repository is not intended as a general improvement to shadPS4. Its sole target was LittleBigPlanet 3. Out of respect for the upstream developers, I do not plan to open a pull request against their main branch. I would not be surprised if this fork reduces compatibility with other games; broad compatibility was outside the scope of the work.
+
 <!--
 SPDX-FileCopyrightText: 2026 shadPS4 Emulator Project
 SPDX-License-Identifier: GPL-2.0-or-later

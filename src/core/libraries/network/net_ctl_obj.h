@@ -27,6 +27,7 @@ public:
     ~NetCtlInternal();
 
     s32 RegisterCallback(OrbisNetCtlCallback func, void* arg);
+    s32 UnregisterCallback(s32 cid);
     s32 RegisterNpToolkitCallback(OrbisNetCtlCallbackForNpToolkit func, void* arg);
     void CheckCallback();
     void CheckNpToolkitCallback();

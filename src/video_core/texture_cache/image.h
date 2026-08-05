@@ -32,6 +32,9 @@ enum ImageFlagBits : u32 {
     GpuDirty = 1 << 2, ///< Contents have been modified from the GPU (valid data in buffer cache)
     Dirty = MaybeCpuDirty | CpuDirty | GpuDirty,
     GpuModified = 1 << 3, ///< Contents have been modified from the GPU
+    GcPending = 1 << 4,   ///< An asynchronous GC readback is pending for this image
+    DimensionalAliasStale =
+        1 << 5, ///< A coherent 2D-array/3D peer contains newer GPU-written contents
     Registered = 1 << 6,  ///< True when the image is registered
     Picked = 1 << 7,      ///< Temporary flag to mark the image as picked
 };
@@ -107,7 +110,30 @@ struct Image {
     }
 
     bool SafeToDownload() const {
-        return True(flags & ImageFlagBits::GpuModified) && False(flags & (ImageFlagBits::Dirty));
+        return True(flags & ImageFlagBits::GpuModified) &&
+               False(flags & (ImageFlagBits::Dirty | ImageFlagBits::DimensionalAliasStale));
+    }
+
+    void InvalidateTexelBufferSync() noexcept {
+        texel_buffer_sync = nullptr;
+        texel_buffer_sync_offset = 0;
+        texel_buffer_sync_size = 0;
+    }
+
+    bool IsTexelBufferSynced(vk::Buffer buffer, u64 offset, u32 size) const noexcept {
+        return texel_buffer_sync == buffer && texel_buffer_sync_offset == offset &&
+               texel_buffer_sync_size >= size;
+    }
+
+    void MarkTexelBufferSynced(vk::Buffer buffer, u64 offset, u32 size) noexcept {
+        texel_buffer_sync = buffer;
+        texel_buffer_sync_offset = offset;
+        texel_buffer_sync_size = size;
+    }
+
+    void MarkGpuModified() noexcept {
+        flags |= ImageFlagBits::GpuModified;
+        InvalidateTexelBufferSync();
     }
 
     void AssociateDepth(ImageId depth_image_id, u64 depth_image_uid) {
@@ -138,7 +164,8 @@ struct Image {
 
     void Resolve(Image& src_image, const VideoCore::SubresourceRange& mrt0_range,
                  const VideoCore::SubresourceRange& mrt1_range);
-    void Clear(const vk::ClearValue& clear_value, const VideoCore::SubresourceRange& range);
+    void Clear(const vk::ClearValue& clear_value, const VideoCore::SubresourceRange& range,
+               bool as_2d_slices = false);
 
     void SetBackingSamples(u32 num_samples, bool copy_backing = true);
 
@@ -179,6 +206,9 @@ public:
     u64 lru_id{};
     u64 tick_accessed_last{};
     u64 hash{};
+    vk::Buffer texel_buffer_sync{};
+    u64 texel_buffer_sync_offset{};
+    u32 texel_buffer_sync_size{};
 
     struct {
         u32 texture : 1;

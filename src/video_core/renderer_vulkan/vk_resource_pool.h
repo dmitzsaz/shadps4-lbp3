@@ -35,12 +35,11 @@ public:
 protected:
     std::size_t CommitResource();
 
+    /// Handles a full pool when no tracked resource is reusable yet.
+    virtual std::size_t ManageOverflow();
+
     /// Called when a chunk of resources have to be allocated.
     virtual void Allocate(std::size_t begin, std::size_t end) = 0;
-
-private:
-    /// Manages pool overflow allocating new resources.
-    std::size_t ManageOverflow();
 
 protected:
     MasterSemaphore* master_semaphore{nullptr};
@@ -59,6 +58,8 @@ public:
     vk::CommandBuffer Commit();
 
 private:
+    std::size_t ManageOverflow() override;
+
     const Instance& instance;
     vk::UniqueCommandPool cmd_pool;
     std::vector<vk::CommandBuffer> cmd_buffers;
