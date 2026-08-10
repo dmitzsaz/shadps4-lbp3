@@ -279,8 +279,13 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) 
         if (it != it_pgm.value()->modules.end()) {
             // If the permutation is already preloaded, make sure it has the same permutation index
             const auto idx = std::distance(it_pgm.value()->modules.begin(), it);
-            ASSERT_MSG(perm_idx == idx, "Permutation {} is already inserted at {}! ({}_{:x})",
-                       perm_idx, idx, program->info.stage, program->info.pgm_hash);
+            if (perm_idx != idx) {
+                LOG_WARNING(Render,
+                            "Skipping inconsistent cached permutation {} already inserted at {} "
+                            "({}_{:x})",
+                            perm_idx, idx, program->info.stage, program->info.pgm_hash);
+                return false;
+            }
             module = it->module;
         } else {
             module = CompileSPV(spv, instance.GetDevice());

@@ -2,10 +2,12 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <array>
 #include <codecvt>
 #include <fstream>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <nlohmann/json.hpp>
 #include <pugixml.hpp>
 #include "common/elf_info.h"
@@ -128,6 +130,63 @@ std::string convertValueToHex(const std::string type, const std::string valueStr
 
 void ApplyPendingPatches();
 
+static void ApplyBuiltInLbp3PerformancePatches() {
+    if (g_game_serial != "CUSA00063") {
+        return;
+    }
+
+    const auto* param_sfo = Common::Singleton<PSF>::Instance();
+    const auto app_version = param_sfo->GetString("APP_VER").value_or("Unknown version");
+    if (app_version != "01.26") {
+        LOG_WARNING(Loader,
+                    "LBP3 built-in performance patches require app version 01.26; found {}",
+                    app_version);
+        return;
+    }
+
+    static constexpr std::string_view PickupSignature =
+        "48 8d 1d 92 3a c5 00 80 3b 00 0f 84 c6 01 00 00";
+    static constexpr std::string_view MlaaSignature =
+        "48 8d 05 eb ac c3 00 80 38 00 0f 84 22 0b 00 00";
+
+    // Require both exact v1.26 code signatures before changing anything. A different executable
+    // is left untouched.
+    if (PatternScan(std::string{PickupSignature}) == 0 ||
+        PatternScan(std::string{MlaaSignature}) == 0) {
+        LOG_ERROR(Loader,
+                  "LBP3 built-in performance patches skipped: v1.26 signatures did not match");
+        return;
+    }
+
+    const std::array patches = {
+        patchInfo{
+            .gameSerial = "CUSA00063",
+            .modNameStr = "LBP3 built-in disable pickup resource blob",
+            .offsetStr = std::string{PickupSignature},
+            .valueStr = "e9c701000090",
+            .isOffset = false,
+            .littleEndian = false,
+            .patchMask = PatchMask::Mask,
+            .maskOffset = 10,
+        },
+        patchInfo{
+            .gameSerial = "CUSA00063",
+            .modNameStr = "LBP3 built-in disable MLAA",
+            .offsetStr = std::string{MlaaSignature},
+            .valueStr = "e9230b000090",
+            .isOffset = false,
+            .littleEndian = false,
+            .patchMask = PatchMask::Mask,
+            .maskOffset = 10,
+        },
+    };
+
+    LOG_INFO(Loader, "Applying built-in LBP3 v1.26 performance profile");
+    for (const auto& patch : patches) {
+        PatchMemory(patch);
+    }
+}
+
 void ApplyPatchesFromXML(std::filesystem::path path) {
     pugi::xml_document doc;
     pugi::xml_parse_result result = doc.load_file(path.c_str());
@@ -216,6 +275,8 @@ void ApplyPatchesFromXML(std::filesystem::path path) {
 }
 
 void OnGameLoaded() {
+    ApplyBuiltInLbp3PerformancePatches();
+
     std::filesystem::path patch_dir = Common::FS::GetUserPath(Common::FS::PathType::PatchesDir);
     if (!patch_file.empty()) {
 
@@ -284,7 +345,12 @@ void PatchMemory(const patchInfo& patch) {
     }
 
     if (patch.patchMask == PatchMask::Mask) {
-        cheatAddress = reinterpret_cast<void*>(PatternScan(patch.offsetStr) + patch.maskOffset);
+        const uintptr_t match = PatternScan(patch.offsetStr);
+        if (match == 0) {
+            LOG_WARNING(Loader, "Patch mask not found: {}", patch.modNameStr);
+            return;
+        }
+        cheatAddress = reinterpret_cast<void*>(match + patch.maskOffset);
     }
 
     if (patch.patchMask == PatchMask::Mask_Jump32) {
@@ -414,6 +480,10 @@ uintptr_t PatternScan(const std::string& signature) {
 
     const int32_t* sigPtr = patternBytes.data();
     const size_t sigSize = patternBytes.size();
+
+    if (sigSize == 0 || g_eboot_image_size < sigSize) {
+        return 0;
+    }
 
     uint32_t foundResults = 0;
     for (uint32_t i = 0; i < g_eboot_image_size - sigSize; ++i) {

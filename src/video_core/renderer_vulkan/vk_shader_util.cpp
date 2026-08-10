@@ -7,6 +7,8 @@
 #include <glslang/SPIRV/GlslangToSpv.h>
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "common/scope_exit.h"
+#include "core/debug_state.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 
 namespace Vulkan {
@@ -161,6 +163,10 @@ bool InitializeCompiler() {
 
 vk::ShaderModule Compile(std::string_view code, vk::ShaderStageFlagBits stage, vk::Device device,
                          std::vector<std::string> defines) {
+    DebugState.BeginShaderCompile(DebugStateType::ShaderCompileKind::HostShader);
+    SCOPE_EXIT {
+        DebugState.EndShaderCompile();
+    };
     if (!InitializeCompiler()) {
         return {};
     }

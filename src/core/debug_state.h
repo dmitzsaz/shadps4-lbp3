@@ -45,6 +45,20 @@ enum class QueueType {
     acb = 2,
 };
 
+enum class ShaderCompileKind : u32 {
+    GuestShader,
+    GraphicsPipeline,
+    ComputePipeline,
+    HostShader,
+};
+
+struct ShaderCompileStatus {
+    ShaderCompileKind kind{};
+    u64 serial{};
+    u32 active_count{};
+    bool visible{};
+};
+
 struct QueueDump {
     QueueType type;
     u32 submit_num;
@@ -145,6 +159,11 @@ class DebugStateImpl {
     std::atomic_int32_t flip_frame_count = 0;
     std::atomic_int32_t gnm_frame_count = 0;
 
+    std::atomic_uint32_t shader_compile_active{};
+    std::atomic_uint64_t shader_compile_serial{};
+    std::atomic_uint32_t shader_compile_kind{};
+    std::atomic_int32_t shader_compile_visible_until_frame{-1};
+
     s32 gnm_frame_dump_request_count = -1;
     std::unordered_map<size_t, FrameDump*> waiting_reg_dumps;
     std::unordered_map<size_t, std::string> waiting_reg_dumps_dbg;
@@ -185,6 +204,36 @@ public:
 
     bool IsGuestThreadsPaused() const {
         return is_guest_threads_paused;
+    }
+
+    void BeginShaderCompile(ShaderCompileKind kind) noexcept {
+        shader_compile_kind.store(static_cast<u32>(kind), std::memory_order_relaxed);
+        shader_compile_serial.fetch_add(1, std::memory_order_relaxed);
+        shader_compile_active.fetch_add(1, std::memory_order_release);
+    }
+
+    void EndShaderCompile() noexcept {
+        const u32 previous = shader_compile_active.fetch_sub(1, std::memory_order_acq_rel);
+        if (previous == 0) {
+            shader_compile_active.store(0, std::memory_order_release);
+        }
+        // Compilation can block the render thread, so keep DONE visible after rendering resumes.
+        shader_compile_visible_until_frame.store(
+            flip_frame_count.load(std::memory_order_relaxed) + 60, std::memory_order_release);
+    }
+
+    [[nodiscard]] ShaderCompileStatus GetShaderCompileStatus() const noexcept {
+        const u32 active = shader_compile_active.load(std::memory_order_acquire);
+        const s32 current_frame = flip_frame_count.load(std::memory_order_relaxed);
+        const s32 visible_until =
+            shader_compile_visible_until_frame.load(std::memory_order_acquire);
+        return {
+            .kind = static_cast<ShaderCompileKind>(
+                shader_compile_kind.load(std::memory_order_relaxed)),
+            .serial = shader_compile_serial.load(std::memory_order_relaxed),
+            .active_count = active,
+            .visible = active != 0 || (visible_until >= 0 && current_frame <= visible_until),
+        };
     }
 
     void IncFlipFrameNum() {

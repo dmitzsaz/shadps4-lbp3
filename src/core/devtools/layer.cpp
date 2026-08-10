@@ -282,6 +282,31 @@ void L::DrawSimple() {
     }
     Text("%d FPS (%.1f ms)", static_cast<int>(std::round(frameRate)), 1000.0f / frameRate);
     PopStyleColor();
+
+    const auto compile = DebugState.GetShaderCompileStatus();
+    if (compile.visible) {
+        const char* kind = "VK SHADER";
+        switch (compile.kind) {
+        case DebugStateType::ShaderCompileKind::GraphicsPipeline:
+            kind = "VK GRAPHICS PIPELINE";
+            break;
+        case DebugStateType::ShaderCompileKind::ComputePipeline:
+            kind = "VK COMPUTE PIPELINE";
+            break;
+        case DebugStateType::ShaderCompileKind::HostShader:
+            kind = "VK HOST SHADER";
+            break;
+        case DebugStateType::ShaderCompileKind::GuestShader:
+            break;
+        }
+        const ImVec4 color = compile.active_count != 0 ? ImVec4(1.0f, 0.2f, 0.1f, 1.0f)
+                                                       : ImVec4(1.0f, 0.8f, 0.1f, 1.0f);
+        PushStyleColor(ImGuiCol_Text, color);
+        Text("%s COMPILE #%llu%s", kind, static_cast<unsigned long long>(compile.serial),
+             compile.active_count != 0 ? "" : " DONE");
+        PopStyleColor();
+    }
+
 }
 
 static void LoadSettings(const char* line) {

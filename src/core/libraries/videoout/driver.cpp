@@ -3,6 +3,7 @@
 
 #include "common/assert.h"
 #include "common/debug.h"
+#include "common/elf_info.h"
 #include "common/thread.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
@@ -17,6 +18,10 @@ extern std::unique_ptr<Vulkan::Presenter> presenter;
 extern std::unique_ptr<AmdGpu::Liverpool> liverpool;
 
 namespace Libraries::VideoOut {
+
+[[nodiscard]] static bool IsLbp3Title() noexcept {
+    return Common::ElfInfo::Instance().GameSerial() == "CUSA00063";
+}
 
 constexpr static bool Is32BppPixelFormat(PixelFormat format) {
     switch (format) {
@@ -45,6 +50,9 @@ VideoOutDriver::VideoOutDriver(u32 width, u32 height) {
     main_port.resolution.full_height = height;
     main_port.resolution.pane_width = width;
     main_port.resolution.pane_height = height;
+    if (IsLbp3Title()) {
+        LOG_INFO(Lib_VideoOut, "LBP3 built-in 30 Hz presentation cap enabled");
+    }
     present_thread = std::jthread([&](std::stop_token token) { PresentThread(token); });
 }
 
@@ -275,6 +283,7 @@ void VideoOutDriver::Flip(const Request& req) {
     }
     // save to prev buf index
     port->prev_index = req.index;
+
 }
 
 void VideoOutDriver::DrawBlankFrame() {
@@ -337,8 +346,11 @@ void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_
 }
 
 void VideoOutDriver::PresentThread(std::stop_token token) {
-    const std::chrono::nanoseconds vblank_period(1000000000 /
-                                                 EmulatorSettings.GetVblankFrequency());
+    const u32 vblank_frequency = EmulatorSettings.GetVblankFrequency();
+    const std::chrono::nanoseconds vblank_period(1000000000 / vblank_frequency);
+    const bool cap_lbp3_to_30 = IsLbp3Title();
+    constexpr auto lbp3_frame_period = std::chrono::nanoseconds(1000000000 / 30);
+    auto next_lbp3_flip = std::chrono::steady_clock::now();
 
     Common::SetCurrentThreadName("shadPS4:PresentThread");
     Common::SetCurrentThreadRealtime(vblank_period);
@@ -364,9 +376,24 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
             continue;
         }
 
-        // Check if it's time to take a request.
+        // Keep LBP3 at its authored 30 FPS without changing guest time. Preserve the 30 Hz phase
+        // across the present thread's discrete wakeups so a 72 Hz display alternates 2/3 ticks
+        // instead of collapsing to 24 FPS.
         auto& vblank_status = main_port.vblank_status;
-        if (vblank_status.count % (main_port.flip_rate + 1) == 0) {
+        bool consume_flip = false;
+        if (cap_lbp3_to_30) {
+            const auto now = std::chrono::steady_clock::now();
+            if (now >= next_lbp3_flip) {
+                next_lbp3_flip += lbp3_frame_period;
+                if (now - next_lbp3_flip > lbp3_frame_period) {
+                    next_lbp3_flip = now + lbp3_frame_period;
+                }
+                consume_flip = true;
+            }
+        } else {
+            consume_flip = vblank_status.count % (main_port.flip_rate + 1) == 0;
+        }
+        if (consume_flip) {
             const auto request = receive_request();
             if (!request) {
                 if (timer.GetTotalWait().count() < 0) { // Dont draw too fast

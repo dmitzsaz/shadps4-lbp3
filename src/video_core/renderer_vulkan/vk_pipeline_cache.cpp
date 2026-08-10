@@ -7,6 +7,7 @@
 #include "common/guest_time_stall.h"
 #include "common/io_file.h"
 #include "common/path_util.h"
+#include "common/scope_exit.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
@@ -363,6 +364,10 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline() {
     }
     const auto [it, is_new] = graphics_pipelines.try_emplace(graphics_key);
     if (is_new) {
+        DebugState.BeginShaderCompile(DebugStateType::ShaderCompileKind::GraphicsPipeline);
+        SCOPE_EXIT {
+            DebugState.EndShaderCompile();
+        };
         const Common::GuestTimeStallScope guest_time_stall;
         const auto pipeline_hash = std::hash<GraphicsPipelineKey>{}(graphics_key);
         LOG_INFO(Render_Vulkan, "Compiling graphics pipeline {:#x}", pipeline_hash);
@@ -394,6 +399,10 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
     }
     const auto [it, is_new] = compute_pipelines.try_emplace(compute_key);
     if (is_new) {
+        DebugState.BeginShaderCompile(DebugStateType::ShaderCompileKind::ComputePipeline);
+        SCOPE_EXIT {
+            DebugState.EndShaderCompile();
+        };
         const Common::GuestTimeStallScope guest_time_stall;
         const auto pipeline_hash = std::hash<ComputePipelineKey>{}(compute_key);
         LOG_INFO(Render_Vulkan, "Compiling compute pipeline {:#x}", pipeline_hash);
@@ -646,6 +655,10 @@ bool PipelineCache::RefreshComputeKey() {
 vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::RuntimeInfo& runtime_info,
                                               const std::span<const u32>& code, size_t perm_idx,
                                               Shader::Backend::Bindings& binding) {
+    DebugState.BeginShaderCompile(DebugStateType::ShaderCompileKind::GuestShader);
+    SCOPE_EXIT {
+        DebugState.EndShaderCompile();
+    };
     const Common::GuestTimeStallScope guest_time_stall;
     LOG_INFO(Render_Vulkan, "Compiling {} shader {:#x} {}", info.stage, info.pgm_hash,
              perm_idx != 0 ? "(permutation)" : "");
