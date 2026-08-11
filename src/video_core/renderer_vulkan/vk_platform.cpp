@@ -13,10 +13,13 @@
 #define VK_USE_PLATFORM_XLIB_KHR
 #endif
 
+#include <cctype>
+#include <cstdlib>
 #include <vector>
 #include <fmt/ranges.h>
 
 #include "common/assert.h"
+#include "common/elf_info.h"
 #include "common/logging/log.h"
 #include "common/path_util.h"
 #include "core/emulator_settings.h"
@@ -25,12 +28,114 @@
 
 #ifdef __APPLE__
 #include <mach-o/dyld.h>
+#include <sys/sysctl.h>
 #endif
 
 namespace Vulkan {
 
 static const char* const VALIDATION_LAYER_NAME = "VK_LAYER_KHRONOS_validation";
 static const char* const CRASH_DIAGNOSTIC_LAYER_NAME = "VK_LAYER_LUNARG_crash_diagnostic";
+
+#if defined(__APPLE__)
+static std::string GetSysctlString(const char* name) {
+    size_t size{};
+    if (sysctlbyname(name, nullptr, &size, nullptr, 0) != 0 || size == 0) {
+        return "unknown";
+    }
+    std::string value(size, '\0');
+    if (sysctlbyname(name, value.data(), &size, nullptr, 0) != 0) {
+        return "unknown";
+    }
+    while (!value.empty() && value.back() == '\0') {
+        value.pop_back();
+    }
+    for (char& ch : value) {
+        if (!std::isalnum(static_cast<unsigned char>(ch)) && ch != '-' && ch != '_') {
+            ch = '_';
+        }
+    }
+    return value;
+}
+
+static u32 MergeNativeSeed(const std::filesystem::path& seed_path,
+                           const std::filesystem::path& runtime_path) {
+    std::error_code error;
+    if (!std::filesystem::is_directory(seed_path, error)) {
+        return 0;
+    }
+    std::filesystem::create_directories(runtime_path, error);
+    error.clear();
+
+    u32 imported{};
+    for (std::filesystem::recursive_directory_iterator it{seed_path, error}, end; it != end;
+         it.increment(error)) {
+        if (error) {
+            break;
+        }
+        const auto relative = std::filesystem::relative(it->path(), seed_path, error);
+        if (error) {
+            error.clear();
+            continue;
+        }
+        const auto destination = runtime_path / relative;
+        if (it->is_directory(error)) {
+            std::filesystem::create_directories(destination, error);
+            error.clear();
+            continue;
+        }
+        if (!it->is_regular_file(error)) {
+            error.clear();
+            continue;
+        }
+        std::filesystem::create_directories(destination.parent_path(), error);
+        error.clear();
+        if (std::filesystem::copy_file(it->path(), destination,
+                                       std::filesystem::copy_options::skip_existing, error)) {
+            ++imported;
+        }
+        error.clear();
+    }
+    return imported;
+}
+
+static void ConfigureAppleShaderCache(const std::filesystem::path& executable_dir) {
+    const auto& game_info = Common::ElfInfo::Instance();
+    if (game_info.GameSerial() != "CUSA00063") {
+        return;
+    }
+
+    const auto bundled_seed_root = executable_dir.parent_path() / "Resources" / "shader-cache-seed";
+    setenv("SHADPS4_SHADER_SEED_ROOT", bundled_seed_root.c_str(), false);
+
+    const auto native_namespace =
+        fmt::format("{}-{}", GetSysctlString("hw.model"), GetSysctlString("kern.osrelease"));
+    const auto title_root = Common::FS::GetUserPath(Common::FS::PathType::CacheDir) /
+                            std::string{game_info.GameSerial()};
+    const auto local_seed = title_root / "seed" / "native" / "mesa" / "v1" / native_namespace;
+    const auto runtime = title_root / "runtime" / "native" / "mesa" / "v1" / native_namespace;
+
+    std::error_code error;
+    std::filesystem::create_directories(local_seed, error);
+    error.clear();
+    std::filesystem::create_directories(runtime, error);
+    error.clear();
+
+    u32 imported{};
+    if (const char* seed_root = std::getenv("SHADPS4_SHADER_SEED_ROOT")) {
+        imported +=
+            MergeNativeSeed(std::filesystem::path{seed_root} / std::string{game_info.GameSerial()} /
+                                "native" / "mesa" / "v1" / native_namespace,
+                            runtime);
+    }
+    imported += MergeNativeSeed(local_seed, runtime);
+
+    setenv("MESA_SHADER_CACHE_DISABLE", "false", true);
+    setenv("MESA_SHADER_CACHE_DIR", runtime.c_str(), true);
+    setenv("MESA_SHADER_CACHE_MAX_SIZE", "4G", false);
+    LOG_INFO(Render_Vulkan, "LBP3 native Mesa/Metal cache {} ({} seed files imported)",
+             runtime.string(), imported);
+}
+#endif
 
 static VKAPI_ATTR VkBool32 VKAPI_CALL DebugUtilsCallback(
     vk::DebugUtilsMessageSeverityFlagBitsEXT severity, vk::DebugUtilsMessageTypeFlagsEXT type,
@@ -267,6 +372,7 @@ vk::UniqueInstance CreateInstance(Frontend::WindowSystemType window_type, bool e
         _NSGetExecutablePath(path, &length);
         return std::filesystem::path(path).parent_path();
     }();
+    ConfigureAppleShaderCache(icd_path);
     setenv("VK_DRIVER_FILES", icd_path.c_str(), true);
 #endif
 

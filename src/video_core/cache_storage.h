@@ -28,6 +28,7 @@ public:
 
     void Open();
     void Close();
+    void ConfigureLbp3Profile(std::string profile_namespace_);
     [[nodiscard]] bool IsOpened() const {
         return opened;
     }
@@ -44,6 +45,9 @@ public:
 private:
     std::jthread io_worker{};
     std::filesystem::path cache_path{};
+    std::filesystem::path seed_cache_path{};
+    std::string profile_namespace{};
+    bool lbp3_layout{};
     bool opened{};
 };
 

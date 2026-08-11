@@ -138,8 +138,7 @@ static void ApplyBuiltInLbp3PerformancePatches() {
     const auto* param_sfo = Common::Singleton<PSF>::Instance();
     const auto app_version = param_sfo->GetString("APP_VER").value_or("Unknown version");
     if (app_version != "01.26") {
-        LOG_WARNING(Loader,
-                    "LBP3 built-in performance patches require app version 01.26; found {}",
+        LOG_WARNING(Loader, "LBP3 built-in performance patches require app version 01.26; found {}",
                     app_version);
         return;
     }
@@ -148,11 +147,30 @@ static void ApplyBuiltInLbp3PerformancePatches() {
         "48 8d 1d 92 3a c5 00 80 3b 00 0f 84 c6 01 00 00";
     static constexpr std::string_view MlaaSignature =
         "48 8d 05 eb ac c3 00 80 38 00 0f 84 22 0b 00 00";
+    static constexpr std::string_view DynamicAoGeometrySignature =
+        "55 48 89 e5 41 57 41 56 41 55 41 54 53 48 81 ec 78 02 00 00 41 89 fe 48 8b 05 "
+        "b2 71 c9 00";
+    static constexpr std::string_view SpriteLightsSignature =
+        "55 48 89 e5 41 57 41 56 41 55 41 54 53 48 81 ec b8 03 00 00 48 89 fb 48 89 9d "
+        "98 fc ff ff";
+    static constexpr std::string_view ToneMapSpriteLightsSignature =
+        "55 48 89 e5 41 57 41 56 41 55 41 54 53 48 81 ec 68 01 00 00 48 8b 05 d5 2a c9 "
+        "00";
+    static constexpr std::string_view DynamicAoPreBlurSignature =
+        "55 48 89 e5 41 57 41 56 53 48 81 ec 08 01 00 00 4c 8b 35 69 24 c9 00";
+    static constexpr std::string_view DepthOfFieldSignature =
+        "55 48 89 e5 41 57 41 56 41 55 41 54 53 48 81 ec b8 03 00 00 41 89 fc 48 8b 1d "
+        "72 e6 c8 00";
 
-    // Require both exact v1.26 code signatures before changing anything. A different executable
-    // is left untouched.
+    // Require every exact v1.26 code signature before changing anything. A different executable
+    // is left untouched rather than receiving a partial graphics profile.
     if (PatternScan(std::string{PickupSignature}) == 0 ||
-        PatternScan(std::string{MlaaSignature}) == 0) {
+        PatternScan(std::string{MlaaSignature}) == 0 ||
+        PatternScan(std::string{DynamicAoGeometrySignature}) == 0 ||
+        PatternScan(std::string{SpriteLightsSignature}) == 0 ||
+        PatternScan(std::string{ToneMapSpriteLightsSignature}) == 0 ||
+        PatternScan(std::string{DynamicAoPreBlurSignature}) == 0 ||
+        PatternScan(std::string{DepthOfFieldSignature}) == 0) {
         LOG_ERROR(Loader,
                   "LBP3 built-in performance patches skipped: v1.26 signatures did not match");
         return;
@@ -178,6 +196,56 @@ static void ApplyBuiltInLbp3PerformancePatches() {
             .littleEndian = false,
             .patchMask = PatchMask::Mask,
             .maskOffset = 10,
+        },
+        patchInfo{
+            .gameSerial = "CUSA00063",
+            .modNameStr = "LBP3 built-in disable dynamic AO geometry",
+            .offsetStr = std::string{DynamicAoGeometrySignature},
+            .valueStr = "c3",
+            .isOffset = false,
+            .littleEndian = false,
+            .patchMask = PatchMask::Mask,
+            .maskOffset = 0,
+        },
+        patchInfo{
+            .gameSerial = "CUSA00063",
+            .modNameStr = "LBP3 built-in disable sprite lights",
+            .offsetStr = std::string{SpriteLightsSignature},
+            .valueStr = "c3",
+            .isOffset = false,
+            .littleEndian = false,
+            .patchMask = PatchMask::Mask,
+            .maskOffset = 0,
+        },
+        patchInfo{
+            .gameSerial = "CUSA00063",
+            .modNameStr = "LBP3 built-in disable sprite-light tone map",
+            .offsetStr = std::string{ToneMapSpriteLightsSignature},
+            .valueStr = "c3",
+            .isOffset = false,
+            .littleEndian = false,
+            .patchMask = PatchMask::Mask,
+            .maskOffset = 0,
+        },
+        patchInfo{
+            .gameSerial = "CUSA00063",
+            .modNameStr = "LBP3 built-in disable dynamic AO pre-blur",
+            .offsetStr = std::string{DynamicAoPreBlurSignature},
+            .valueStr = "c3",
+            .isOffset = false,
+            .littleEndian = false,
+            .patchMask = PatchMask::Mask,
+            .maskOffset = 0,
+        },
+        patchInfo{
+            .gameSerial = "CUSA00063",
+            .modNameStr = "LBP3 built-in disable depth of field",
+            .offsetStr = std::string{DepthOfFieldSignature},
+            .valueStr = "c3",
+            .isOffset = false,
+            .littleEndian = false,
+            .patchMask = PatchMask::Mask,
+            .maskOffset = 0,
         },
     };
 

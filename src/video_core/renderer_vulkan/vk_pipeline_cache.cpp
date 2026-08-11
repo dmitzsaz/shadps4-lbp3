@@ -3,8 +3,8 @@
 
 #include <ranges>
 
-#include "common/hash.h"
 #include "common/guest_time_stall.h"
+#include "common/hash.h"
 #include "common/io_file.h"
 #include "common/path_util.h"
 #include "common/scope_exit.h"
@@ -356,7 +356,12 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
     WarmUp();
 }
 
-PipelineCache::~PipelineCache() = default;
+PipelineCache::~PipelineCache() {
+    // Flush every queued shader/pipeline record while the cache object is still alive. Relying on
+    // process-global destruction can stop the IO worker before the last gameplay discoveries reach
+    // disk, which makes the next run compile those shaders again.
+    Sync();
+}
 
 const GraphicsPipeline* PipelineCache::GetGraphicsPipeline() {
     if (!RefreshGraphicsKey()) {

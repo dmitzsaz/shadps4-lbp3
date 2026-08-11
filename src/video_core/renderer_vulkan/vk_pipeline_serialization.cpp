@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "common/elf_info.h"
 #include "common/serdes.h"
 #include "core/emulator_settings.h"
 #include "shader_recompiler/frontend/fetch_shader.h"
@@ -300,8 +301,30 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) 
 }
 
 void PipelineCache::WarmUp() {
-    if (!EmulatorSettings.IsPipelineCacheEnabled()) {
+    const auto& game_info = Common::ElfInfo::Instance();
+    const bool force_lbp3_cache = game_info.GameSerial() == "CUSA00063";
+    if (!EmulatorSettings.IsPipelineCacheEnabled() && !force_lbp3_cache) {
         return;
+    }
+
+    if (force_lbp3_cache) {
+        // Shader::Profile captures the host capabilities and driver workarounds that affect emitted
+        // SPIR-V. Keep exact profiles in separate buckets so an M4/M5/Kosmic corpus never poisons a
+        // Windows/NVIDIA run (or vice versa), while still using the same title-root layout.
+        constexpr u64 FnvOffset = 14695981039346656037ULL;
+        constexpr u64 FnvPrime = 1099511628211ULL;
+        u64 profile_hash = FnvOffset;
+        const auto* profile_bytes = reinterpret_cast<const u8*>(&profile);
+        for (size_t index = 0; index < sizeof(profile); ++index) {
+            profile_hash ^= profile_bytes[index];
+            profile_hash *= FnvPrime;
+        }
+
+        Storage::DataBase::Instance().ConfigureLbp3Profile(
+            fmt::format("app-{}-schema-{}-{}-{}-profile-{:016x}", game_info.AppVer(),
+                        Serialization::ShaderBinaryVersion, Serialization::ShaderMetaVersion,
+                        Serialization::PipelineKeyVersion, profile_hash));
+        LOG_INFO(Render, "LBP3 persistent shader cache forced on");
     }
 
     Storage::DataBase::Instance().Open();
