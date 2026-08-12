@@ -15,6 +15,23 @@
 
 namespace Libraries::Net {
 
+PosixSocket::PosixSocket(int domain, int type, int protocol)
+    : Socket(domain, type, protocol), sock(::socket(domain, type, protocol)), socket_type(type) {
+#ifdef __APPLE__
+    // Darwin reserves SOCK_RAW ICMP sockets for privileged processes.  It also provides
+    // unprivileged ICMP datagram ("ping") sockets with the same send/receive semantics needed by
+    // PS4 reachability probes.  Preserve the guest-visible RAW type while using that native
+    // transport only when opening the raw socket was denied for lack of privileges.
+    if (sock == -1 && domain == ORBIS_NET_AF_INET && type == ORBIS_NET_SOCK_RAW &&
+        protocol == ORBIS_NET_IPPROTO_ICMP && (errno == EPERM || errno == EACCES)) {
+        sock = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP);
+        if (sock != -1) {
+            LOG_INFO(Lib_Net, "Using Darwin ICMP datagram socket for guest raw reachability probe");
+        }
+    }
+#endif
+}
+
 #ifdef _WIN32
 #define ERROR_CASE(errname)                                                                        \
     case (WSA##errname):                                                                           \

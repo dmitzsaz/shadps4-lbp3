@@ -6,6 +6,7 @@
 #include "video_core/renderer_vulkan/vk_master_semaphore.h"
 
 #include "common/assert.h"
+#include "core/performance_telemetry.h"
 
 namespace Vulkan {
 
@@ -54,6 +55,9 @@ void MasterSemaphore::Wait(u64 tick) {
     if (IsFree(tick)) {
         return;
     }
+
+    Core::PerfTelemetry::Increment(Core::PerfTelemetry::Counter::GpuWaits);
+    Core::PerfTelemetry::ScopedTimer telemetry_timer{Core::PerfTelemetry::TimeMetric::GpuWait};
 
     // If none of the above is hit, fallback to a regular wait
     const vk::SemaphoreWaitInfo wait_info = {

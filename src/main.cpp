@@ -19,6 +19,8 @@
 #include "core/emulator_state.h"
 #include "core/file_sys/fs.h"
 #include "core/ipc/ipc.h"
+#include "core/lbp3_online.h"
+#include "core/performance_telemetry.h"
 #include "core/user_settings.h"
 #include "emulator.h"
 #include "imgui/big_picture/big_picture.h"
@@ -62,6 +64,8 @@ int main(int argc, char* argv[]) {
     bool configClean = false;
     bool configGlobal = false;
     bool bigPicture = false;
+    bool perfTelemetry = false;
+    bool lbp3Online = false;
 
     std::optional<std::filesystem::path> addGameFolder;
     std::optional<std::filesystem::path> setAddonFolder;
@@ -87,6 +91,10 @@ int main(int argc, char* argv[]) {
     app.add_flag("--config-clean", configClean);
     app.add_flag("--config-global", configGlobal);
     app.add_flag("--log-append", Common::Log::g_should_append);
+    app.add_flag("--perf-telemetry", perfTelemetry,
+                 "Record detailed per-frame performance telemetry CSV files");
+    app.add_flag("--lbp3-online", lbp3Online,
+                 "Enable the local LBP3 helper backend and P2P transport");
 
     app.add_option("--add-game-folder", addGameFolder)->check(CLI::ExistingDirectory);
     app.add_option("--set-addon-folder", setAddonFolder)->check(CLI::ExistingDirectory);
@@ -116,11 +124,18 @@ int main(int argc, char* argv[]) {
         return app.exit(e);
     }
 
+    Core::PerfTelemetry::SetStartRequested(perfTelemetry);
+
     if (waitPid)
         Core::Debugger::WaitForPid(*waitPid);
 
     // Initialize main log with default config
     Common::Log::Setup("shadps4.log");
+
+    Core::Lbp3Online::SetEnabled(lbp3Online);
+    if (lbp3Online) {
+        LOG_INFO(Debug, "LBP3 online helper mode requested");
+    }
 
     LOG_INFO(Debug, "Run: {}", std::span(argv, argc));
 

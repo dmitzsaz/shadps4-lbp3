@@ -37,7 +37,9 @@
 #include "core/libraries/np/np_trophy.h"
 #include "core/libraries/save_data/save_backup.h"
 #include "core/linker.h"
+#include "core/lbp3_online.h"
 #include "core/memory.h"
+#include "core/performance_telemetry.h"
 #include "core/user_settings.h"
 #include "emulator.h"
 #include "video_core/cache_storage.h"
@@ -562,6 +564,14 @@ void Emulator::Restart(std::filesystem::path eboot_path,
 
     if (waitForDebuggerBeforeRun) {
         args.push_back("--wait-for-debugger");
+    }
+
+    if (PerfTelemetry::IsStartRequested()) {
+        args.push_back("--perf-telemetry");
+    }
+
+    if (Lbp3Online::IsEnabled()) {
+        args.push_back("--lbp3-online");
     }
 
     if (guest_args.size() > 0) {

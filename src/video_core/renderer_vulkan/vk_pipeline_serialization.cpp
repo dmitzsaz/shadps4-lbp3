@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "common/elf_info.h"
+#include "common/io_file.h"
+#include "common/path_util.h"
 #include "common/serdes.h"
 #include "core/emulator_settings.h"
 #include "shader_recompiler/frontend/fetch_shader.h"
@@ -11,6 +13,8 @@
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 
+#include <type_traits>
+
 namespace Serialization {
 /* You should increment versions below once corresponding serialization scheme is changed. */
 static constexpr u32 ShaderBinaryVersion = 2u;
@@ -19,6 +23,159 @@ static constexpr u32 PipelineKeyVersion = 2u;
 } // namespace Serialization
 
 namespace Vulkan {
+
+namespace {
+
+constexpr u64 FnvOffset = 14695981039346656037ULL;
+constexpr u64 FnvPrime = 1099511628211ULL;
+
+template <typename T>
+void HashProfileValue(u64& hash, T value) {
+    if constexpr (std::is_same_v<T, bool>) {
+        hash ^= static_cast<u8>(value ? 1 : 0);
+        hash *= FnvPrime;
+    } else {
+        using Unsigned = std::make_unsigned_t<T>;
+        auto bits = static_cast<Unsigned>(value);
+        for (size_t index = 0; index < sizeof(bits); ++index) {
+            hash ^= static_cast<u8>(bits & 0xff);
+            hash *= FnvPrime;
+            bits >>= 8;
+        }
+    }
+}
+
+u64 StableProfileHash(const Shader::Profile& profile) {
+    u64 hash = FnvOffset;
+#define HASH_PROFILE_FIELD(field) HashProfileValue(hash, profile.field)
+    HASH_PROFILE_FIELD(max_ubo_size);
+    HASH_PROFILE_FIELD(max_viewport_width);
+    HASH_PROFILE_FIELD(max_viewport_height);
+    HASH_PROFILE_FIELD(max_shared_memory_size);
+    HASH_PROFILE_FIELD(supported_spirv);
+    HASH_PROFILE_FIELD(subgroup_size);
+    HASH_PROFILE_FIELD(support_int8);
+    HASH_PROFILE_FIELD(support_int16);
+    HASH_PROFILE_FIELD(support_int64);
+    HASH_PROFILE_FIELD(support_float16);
+    HASH_PROFILE_FIELD(support_float64);
+    HASH_PROFILE_FIELD(supports_denorm_behavior_independence);
+    HASH_PROFILE_FIELD(supports_rounding_mode_independence);
+    HASH_PROFILE_FIELD(support_fp16_denorm_preserve);
+    HASH_PROFILE_FIELD(support_fp16_denorm_flush);
+    HASH_PROFILE_FIELD(support_fp16_round_to_zero);
+    HASH_PROFILE_FIELD(support_fp32_denorm_preserve);
+    HASH_PROFILE_FIELD(support_fp32_denorm_flush);
+    HASH_PROFILE_FIELD(support_fp32_round_to_zero);
+    HASH_PROFILE_FIELD(support_fp64_denorm_preserve);
+    HASH_PROFILE_FIELD(support_fp64_denorm_flush);
+    HASH_PROFILE_FIELD(support_fp64_round_to_zero);
+    HASH_PROFILE_FIELD(support_fp16_signed_zero_inf_nan_preserve);
+    HASH_PROFILE_FIELD(support_fp32_signed_zero_inf_nan_preserve);
+    HASH_PROFILE_FIELD(support_fp64_signed_zero_inf_nan_preserve);
+    HASH_PROFILE_FIELD(supports_image_load_store_lod);
+    HASH_PROFILE_FIELD(supports_native_cube_calc);
+    HASH_PROFILE_FIELD(supports_trinary_minmax);
+    HASH_PROFILE_FIELD(supports_buffer_fp32_atomic_min_max);
+    HASH_PROFILE_FIELD(supports_image_fp32_atomic_min_max);
+    HASH_PROFILE_FIELD(supports_buffer_int64_atomics);
+    HASH_PROFILE_FIELD(supports_shared_int64_atomics);
+    HASH_PROFILE_FIELD(supports_workgroup_explicit_memory_layout);
+    HASH_PROFILE_FIELD(supports_amd_shader_explicit_vertex_parameter);
+    HASH_PROFILE_FIELD(supports_fragment_shader_barycentric);
+    HASH_PROFILE_FIELD(has_broken_spirv_clamp);
+    HASH_PROFILE_FIELD(lower_left_origin_mode);
+    HASH_PROFILE_FIELD(needs_manual_interpolation);
+    HASH_PROFILE_FIELD(needs_lds_barriers);
+    HASH_PROFILE_FIELD(needs_buffer_offsets);
+    HASH_PROFILE_FIELD(needs_unorm_fixup);
+    HASH_PROFILE_FIELD(needs_clip_distance_emulation);
+    HASH_PROFILE_FIELD(supports_shader_stencil_export);
+#undef HASH_PROFILE_FIELD
+    return hash;
+}
+
+bool IsCompatibleProfileFile(const std::filesystem::path& path,
+                             const Shader::Profile& profile) {
+    Common::FS::IOFile file{path, Common::FS::FileAccessMode::Read};
+    if (!file.IsOpen() || file.GetSize() != sizeof(Shader::Profile)) {
+        return false;
+    }
+
+    Shader::Profile cached_profile{};
+    return file.Read(cached_profile) == 1 && cached_profile == profile;
+}
+
+u32 MergeCompatibleProfileDirectories(const std::filesystem::path& root,
+                                      std::string_view profile_prefix,
+                                      std::string_view canonical_namespace,
+                                      const Shader::Profile& profile) {
+    namespace fs = std::filesystem;
+
+    std::error_code error;
+    if (!fs::is_directory(root, error)) {
+        return 0;
+    }
+
+    const auto canonical_path = root / canonical_namespace;
+    fs::create_directories(canonical_path, error);
+    error.clear();
+
+    u32 imported{};
+    for (fs::directory_iterator directory{root, error}, end; directory != end;
+         directory.increment(error)) {
+        if (error) {
+            error.clear();
+            continue;
+        }
+        if (!directory->is_directory(error)) {
+            error.clear();
+            continue;
+        }
+
+        const auto source_name = directory->path().filename().string();
+        if (source_name == canonical_namespace || !source_name.starts_with(profile_prefix) ||
+            !IsCompatibleProfileFile(directory->path() / "profile.bin", profile)) {
+            continue;
+        }
+
+        for (fs::directory_iterator file{directory->path(), error}, file_end; file != file_end;
+             file.increment(error)) {
+            if (error) {
+                error.clear();
+                continue;
+            }
+            if (!file->is_regular_file(error) || file->path().extension() == ".tmp") {
+                error.clear();
+                continue;
+            }
+
+            const auto destination = canonical_path / file->path().filename();
+            if (fs::copy_file(file->path(), destination, fs::copy_options::skip_existing, error)) {
+                ++imported;
+            }
+            error.clear();
+        }
+    }
+    return imported;
+}
+
+void MigrateCompatibleLbp3Profiles(std::string_view profile_prefix,
+                                   std::string_view canonical_namespace,
+                                   const Shader::Profile& profile) {
+    const auto title_root = Common::FS::GetUserPath(Common::FS::PathType::CacheDir) / "CUSA00063";
+    u32 imported{};
+    for (const auto* side : {"runtime", "seed"}) {
+        imported += MergeCompatibleProfileDirectories(
+            title_root / side / "spirv" / "v1", profile_prefix, canonical_namespace, profile);
+    }
+    if (imported != 0) {
+        LOG_INFO(Render, "Merged {} compatible LBP3 shader-cache files into stable profile {}",
+                 imported, canonical_namespace);
+    }
+}
+
+} // namespace
 
 void RegisterPipelineData(const ComputePipelineKey& key,
                           ComputePipeline::SerializationSupport& sdata) {
@@ -311,19 +468,14 @@ void PipelineCache::WarmUp() {
         // Shader::Profile captures the host capabilities and driver workarounds that affect emitted
         // SPIR-V. Keep exact profiles in separate buckets so an M4/M5/Kosmic corpus never poisons a
         // Windows/NVIDIA run (or vice versa), while still using the same title-root layout.
-        constexpr u64 FnvOffset = 14695981039346656037ULL;
-        constexpr u64 FnvPrime = 1099511628211ULL;
-        u64 profile_hash = FnvOffset;
-        const auto* profile_bytes = reinterpret_cast<const u8*>(&profile);
-        for (size_t index = 0; index < sizeof(profile); ++index) {
-            profile_hash ^= profile_bytes[index];
-            profile_hash *= FnvPrime;
-        }
-
-        Storage::DataBase::Instance().ConfigureLbp3Profile(
-            fmt::format("app-{}-schema-{}-{}-{}-profile-{:016x}", game_info.AppVer(),
+        const auto profile_prefix =
+            fmt::format("app-{}-schema-{}-{}-{}-profile-", game_info.AppVer(),
                         Serialization::ShaderBinaryVersion, Serialization::ShaderMetaVersion,
-                        Serialization::PipelineKeyVersion, profile_hash));
+                        Serialization::PipelineKeyVersion);
+        const auto profile_namespace =
+            fmt::format("{}{:016x}", profile_prefix, StableProfileHash(profile));
+        MigrateCompatibleLbp3Profiles(profile_prefix, profile_namespace, profile);
+        Storage::DataBase::Instance().ConfigureLbp3Profile(profile_namespace);
         LOG_INFO(Render, "LBP3 persistent shader cache forced on");
     }
 

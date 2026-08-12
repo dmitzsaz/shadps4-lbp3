@@ -11,11 +11,13 @@
 #include <magic_enum/magic_enum.hpp>
 #include "common/elf_info.h"
 #include "core/emulator_settings.h"
+#include "core/lbp3_online.h"
 #include "core/libraries/kernel/process.h"
 #include "core/libraries/kernel/time.h"
 #include "core/libraries/network/http.h"
 #include "core/libraries/np/np_error.h"
 #include "core/libraries/np/np_handler.h"
+#include "core/libraries/np/np_manager.h"
 #include "np_web_api_internal.h"
 
 namespace Libraries::Np::NpWebApi {
@@ -768,8 +770,15 @@ s32 sendRequest(s64 requestId, s32 partIndex, const void* pData, u64 dataSize, s
 
     unlockContext(context);
 
-    // Stubbing sceNpManagerIntGetSigninState call with a config check.
-    if (!EmulatorSettings.IsShadNetEnabled()) {
+    // WebAPI authorization follows the NP state of this user, not whether the
+    // optional shadNet transport is enabled globally. In LBP3 local-online mode
+    // sceNpGetState also represents the connected localhost helper identity.
+    NpManager::OrbisNpState np_state = NpManager::OrbisNpState::Unknown;
+    const s32 np_state_result = NpManager::sceNpGetState(user_context->userId, &np_state);
+    if (np_state_result < ORBIS_OK || np_state != NpManager::OrbisNpState::SignedIn) {
+        LOG_WARNING(Lib_NpWebApi,
+                    "WebAPI request rejected: userId={} NP result={:#x} state={}",
+                    user_context->userId, np_state_result, static_cast<u32>(np_state));
         releaseRequest(request);
         releaseUserContext(user_context);
         releaseContext(context);
@@ -777,7 +786,9 @@ s32 sendRequest(s64 requestId, s32 partIndex, const void* pData, u64 dataSize, s
     }
 
     if (request->http_request_id == 0) {
-        std::string base_url = EmulatorSettings.GetShadNetWebApiServer();
+        const std::string base_url = Core::Lbp3Online::IsSupportedTitle()
+                                         ? "http://127.0.0.1:18063"
+                                         : EmulatorSettings.GetShadNetWebApiServer();
         // sceHttpCreateConnectionWithURL expects a template id, not the raw libhttp
         // context id that NpWebApi was initialized with. Create a template from the
         // context first, then open the connection against it.

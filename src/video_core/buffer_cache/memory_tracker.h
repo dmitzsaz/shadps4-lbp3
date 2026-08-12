@@ -21,6 +21,11 @@ public:
     static constexpr size_t MAX_CPU_PAGE_BITS = 40;
     static constexpr size_t NUM_HIGH_PAGES = 1ULL << (MAX_CPU_PAGE_BITS - TRACKER_HIGHER_PAGE_BITS);
     static constexpr size_t MANAGER_POOL_SIZE = 32;
+    // LBP3 cycles transient GPU-written buffers before an exact page can reach
+    // the public PR #3404 threshold of 16. Two real readbacks are enough evidence
+    // to stage that page at the next guest fence; preemptive staging itself is
+    // still enabled only for the title-specific KosmicKrisp path.
+    static constexpr u16 PREEMPTIVE_READBACK_THRESHOLD = 2;
 
 public:
     explicit MemoryTracker(PageManager& tracker_) : tracker{&tracker_} {}
@@ -62,6 +67,48 @@ public:
                                 manager->template ChangeRegionState<Type::GPU, false>(
                                     manager->GetCpuAddr() + offset, size);
                             });
+    }
+
+    /// Records the exact pages of an actual synchronous GPU-to-CPU download.
+    void RecordGpuReadback(VAddr cpu_addr, u64 size, VAddr buffer_addr, u64 buffer_size) noexcept {
+        const VAddr readback_begin = std::max(cpu_addr, buffer_addr);
+        const VAddr buffer_end = buffer_addr + buffer_size;
+        const VAddr readback_end = std::min<VAddr>(buffer_end, cpu_addr + size);
+        if (readback_begin >= readback_end) {
+            return;
+        }
+        IteratePages<false>(readback_begin, readback_end - readback_begin,
+                            [](RegionManager* manager, u64 offset, size_t range_size) {
+                                std::scoped_lock lk{manager->lock};
+                                const size_t start_page = offset / TRACKER_BYTES_PER_PAGE;
+                                const size_t end_page =
+                                    Common::DivCeil(offset + range_size, TRACKER_BYTES_PER_PAGE);
+                                manager->RecordGpuReadback(start_page, end_page);
+                            });
+    }
+
+    /// Calls func for every 4K page whose repeated readbacks justify prefetching it.
+    void ForEachPreemptiveReadbackPage(VAddr cpu_addr, u64 size, auto&& func) {
+        IteratePages<false>(
+            cpu_addr, size, [&func](RegionManager* manager, u64 offset, size_t range_size) {
+                std::vector<VAddr> hot_pages;
+                {
+                    std::scoped_lock lk{manager->lock};
+                    const size_t start_page = offset / TRACKER_BYTES_PER_PAGE;
+                    const size_t end_page =
+                        Common::DivCeil(offset + range_size, TRACKER_BYTES_PER_PAGE);
+                    hot_pages.reserve(end_page - start_page);
+                    for (size_t page = start_page; page < end_page; ++page) {
+                        if (manager->NumGpuReadbacks(page) >= PREEMPTIVE_READBACK_THRESHOLD) {
+                            hot_pages.push_back(manager->GetCpuAddr() +
+                                                page * TRACKER_BYTES_PER_PAGE);
+                        }
+                    }
+                }
+                for (const VAddr page_addr : hot_pages) {
+                    func(page_addr);
+                }
+            });
     }
 
     /// Removes all protection from a page and ensures GPU data has been flushed if requested

@@ -12,6 +12,7 @@
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
 #include "core/emulator_state.h"
+#include "core/performance_telemetry.h"
 #include "imgui/imgui_std.h"
 #include "imgui_internal.h"
 #include "options.h"
@@ -304,6 +305,13 @@ void L::DrawSimple() {
         PushStyleColor(ImGuiCol_Text, color);
         Text("%s COMPILE #%llu%s", kind, static_cast<unsigned long long>(compile.serial),
              compile.active_count != 0 ? "" : " DONE");
+        PopStyleColor();
+    }
+
+    if (::Core::PerfTelemetry::IsEnabled()) {
+        PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.25f, 0.25f, 1.0f));
+        Text("PERF REC  frame %llu",
+             static_cast<unsigned long long>(::Core::PerfTelemetry::GetRecordedFrameCount()));
         PopStyleColor();
     }
 

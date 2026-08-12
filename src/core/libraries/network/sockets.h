@@ -47,6 +47,7 @@ typedef int net_socket;
 #include <map>
 #include <memory>
 #include <mutex>
+#include <string_view>
 #include <vector>
 #include "net.h"
 
@@ -105,10 +106,7 @@ struct PosixSocket : public Socket {
     int sockopt_ip_maxttl = 0;
     int sockopt_tcp_mss_to_advertise = 0;
     int socket_type;
-    explicit PosixSocket(int domain, int type, int protocol)
-        : Socket(domain, type, protocol), sock(socket(domain, type, protocol)) {
-        socket_type = type;
-    }
+    explicit PosixSocket(int domain, int type, int protocol);
     explicit PosixSocket(net_socket sock) : Socket(0, 0, 0), sock(sock) {}
     bool IsValid() const override;
     int Close() override;
@@ -235,6 +233,7 @@ int P2PSignalingSendTo(const void* data, u32 len, u32 dest_addr, u16 dest_port);
 int P2PSignalingRecvFrom(void* buf, u32 len, u32* from_addr, u16* from_port);
 int P2PControlSendTo(const void* data, u32 len, u32 dest_addr, u16 dest_port);
 int P2PControlRecvFrom(void* buf, u32 len, u32* from_addr, u16* from_port);
+bool P2PResolvePeer(std::string_view online_id, u32* out_addr, u16* out_port);
 int P2PMatching2SendTo(const void* data, u32 len, u32 dest_addr, u16 dest_port);
 int P2PMatching2RecvFrom(void* buf, u32 len, u32* from_addr, u16* from_port);
 

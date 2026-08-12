@@ -4,8 +4,10 @@
 #include <mutex>
 #include "common/logging/log.h"
 #include "core/emulator_settings.h"
+#include "core/lbp3_online.h"
 #include "core/libraries/error_codes.h"
 #include "core/libraries/libs.h"
+#include "core/libraries/network/lbp3_online_bridge.h"
 #include "core/libraries/np/np_auth.h"
 #include "core/libraries/np/np_error.h"
 #include "core/libraries/system/userservice.h"
@@ -32,6 +34,11 @@ struct NpAuthRequest {
 
 static std::vector<NpAuthRequest> g_auth_requests;
 
+static bool IsLbp3HelperAuthAvailable() {
+    return Core::Lbp3Online::IsSupportedTitle() &&
+           Libraries::Net::Lbp3OnlineBridge::EnsureConnected();
+}
+
 s32 CreateNpAuthRequest(bool async) {
     if (g_active_auth_requests == ORBIS_NP_AUTH_REQUEST_LIMIT) {
         return ORBIS_NP_AUTH_ERROR_REQUEST_MAX;
@@ -46,6 +53,7 @@ s32 CreateNpAuthRequest(bool async) {
             // There is no request at this index, set the index to ready then break.
             g_auth_requests[req_index].state = NpAuthRequestState::Ready;
             g_auth_requests[req_index].async = async;
+            g_auth_requests[req_index].result = ORBIS_OK;
             break;
         }
         req_index++;
@@ -108,8 +116,9 @@ s32 GetAuthorizationCode(s32 req_id, const OrbisNpAuthGetAuthorizationCodeParame
         return ORBIS_NP_AUTH_ERROR_ABORTED;
     }
 
+    const bool lbp3_helper_auth = !g_shadnet_enabled && IsLbp3HelperAuthAvailable();
     request.state = NpAuthRequestState::Complete;
-    if (!g_shadnet_enabled) {
+    if (!g_shadnet_enabled && !lbp3_helper_auth) {
         request.result = ORBIS_NP_ERROR_SIGNED_OUT;
         // If the request is processed in some form, and it's an async request, then it returns OK.
         if (request.async) {
@@ -118,7 +127,16 @@ s32 GetAuthorizationCode(s32 req_id, const OrbisNpAuthGetAuthorizationCodeParame
         return ORBIS_NP_ERROR_SIGNED_OUT;
     }
 
-    LOG_ERROR(Lib_NpAuth, "(STUBBED) called, req_id = {:#x}, async = {}", req_id, request.async);
+    request.result = ORBIS_OK;
+    if (lbp3_helper_auth) {
+        LOG_CRITICAL(Lib_NpAuth,
+                     "LBP3 A22 NpAuth issued helper authorization code: req_id={:#x}, "
+                     "user_id={}, async={}",
+                     req_id, param->user_id, request.async);
+    } else {
+        LOG_ERROR(Lib_NpAuth, "(STUBBED) called, req_id = {:#x}, async = {}", req_id,
+                  request.async);
+    }
 
     // Not sure what values are expected here, so zeroing these for now.
     std::memset(auth_code, 0, sizeof(OrbisNpAuthorizationCode));
@@ -141,7 +159,7 @@ sceNpAuthGetAuthorizationCode(s32 req_id, const OrbisNpAuthGetAuthorizationCodeP
     if (param->online_id == nullptr || param->client_id == nullptr || param->scope == nullptr) {
         return ORBIS_NP_AUTH_ERROR_INVALID_ARGUMENT;
     }
-    if (!g_shadnet_enabled) {
+    if (!g_shadnet_enabled && !IsLbp3HelperAuthAvailable()) {
         // Calls sceNpManagerIntGetUserIdByOnlineId to get a user id, returning any errors.
         // This call will not succeed while signed out because games cannot retrieve an online id.
         return ORBIS_NP_ERROR_USER_NOT_FOUND;
@@ -206,8 +224,9 @@ s32 GetIdToken(s32 req_id, const OrbisNpAuthGetIdTokenParameterA* param, s32 fla
         return ORBIS_NP_AUTH_ERROR_ABORTED;
     }
 
+    const bool lbp3_helper_auth = !g_shadnet_enabled && IsLbp3HelperAuthAvailable();
     request.state = NpAuthRequestState::Complete;
-    if (!g_shadnet_enabled) {
+    if (!g_shadnet_enabled && !lbp3_helper_auth) {
         request.result = ORBIS_NP_ERROR_SIGNED_OUT;
         // If the request is processed in some form, and it's an async request, then it returns OK.
         if (request.async) {
@@ -216,7 +235,15 @@ s32 GetIdToken(s32 req_id, const OrbisNpAuthGetIdTokenParameterA* param, s32 fla
         return ORBIS_NP_ERROR_SIGNED_OUT;
     }
 
-    LOG_ERROR(Lib_NpAuth, "(STUBBED) called, req_id = {:#x}, async = {}", req_id, request.async);
+    request.result = ORBIS_OK;
+    if (lbp3_helper_auth) {
+        LOG_CRITICAL(Lib_NpAuth,
+                     "LBP3 A22 NpAuth issued helper ID token: req_id={:#x}, user_id={}, async={}",
+                     req_id, param->user_id, request.async);
+    } else {
+        LOG_ERROR(Lib_NpAuth, "(STUBBED) called, req_id = {:#x}, async = {}", req_id,
+                  request.async);
+    }
 
     // Not sure what values are expected here, so zeroing this for now.
     std::memset(token, 0, sizeof(OrbisNpIdToken));
@@ -236,7 +263,7 @@ s32 PS4_SYSV_ABI sceNpAuthGetIdToken(s32 req_id, const OrbisNpAuthGetIdTokenPara
         param->client_secret == nullptr || param->scope == nullptr) {
         return ORBIS_NP_AUTH_ERROR_INVALID_ARGUMENT;
     }
-    if (!g_shadnet_enabled) {
+    if (!g_shadnet_enabled && !IsLbp3HelperAuthAvailable()) {
         // Calls sceNpManagerIntGetUserIdByOnlineId to get a user id, returning any errors.
         // This call will not succeed while signed out because games cannot retrieve an online id.
         return ORBIS_NP_ERROR_USER_NOT_FOUND;

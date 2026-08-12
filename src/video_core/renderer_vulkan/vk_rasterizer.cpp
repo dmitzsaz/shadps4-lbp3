@@ -4,6 +4,7 @@
 #include "common/debug.h"
 #include "core/emulator_settings.h"
 #include "core/memory.h"
+#include "core/performance_telemetry.h"
 #include "shader_recompiler/runtime_info.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
@@ -187,6 +188,8 @@ void Rasterizer::EliminateFastClear() {
 
 void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     RENDERER_TRACE;
+    Core::PerfTelemetry::Increment(Core::PerfTelemetry::Counter::DrawCalls);
+    Core::PerfTelemetry::ScopedTimer telemetry_timer{Core::PerfTelemetry::TimeMetric::DrawCpu};
 
     scheduler.PopPendingOperations();
 
@@ -229,6 +232,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
         cmdbuf.draw(regs.num_indices, regs.num_instances.NumInstances(), vertex_offset,
                     instance_offset);
     }
+    Core::PerfTelemetry::Increment(Core::PerfTelemetry::Counter::DrawsEmitted);
 
     ResetBindings();
 }
@@ -236,6 +240,9 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
 void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u32 stride,
                               u32 max_count, VAddr count_address) {
     RENDERER_TRACE;
+    Core::PerfTelemetry::Increment(Core::PerfTelemetry::Counter::DrawCalls);
+    Core::PerfTelemetry::Increment(Core::PerfTelemetry::Counter::IndirectDrawCalls);
+    Core::PerfTelemetry::ScopedTimer telemetry_timer{Core::PerfTelemetry::TimeMetric::DrawCpu};
 
     scheduler.PopPendingOperations();
 
@@ -308,13 +315,15 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
             cmdbuf.drawIndirect(buffer->Handle(), base, max_count, stride);
         }
     }
+    Core::PerfTelemetry::Increment(Core::PerfTelemetry::Counter::DrawsEmitted, max_count);
 
     ResetBindings();
 }
 
 void Rasterizer::DispatchDirect() {
     RENDERER_TRACE;
-
+    Core::PerfTelemetry::Increment(Core::PerfTelemetry::Counter::DispatchCalls);
+    Core::PerfTelemetry::ScopedTimer telemetry_timer{Core::PerfTelemetry::TimeMetric::DispatchCpu};
     scheduler.PopPendingOperations();
 
     const auto& cs_program = liverpool->GetCsRegs();
@@ -338,13 +347,15 @@ void Rasterizer::DispatchDirect() {
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->Handle());
     cmdbuf.dispatch(cs_program.dim_x, cs_program.dim_y, cs_program.dim_z);
+    Core::PerfTelemetry::Increment(Core::PerfTelemetry::Counter::DispatchesEmitted);
 
     ResetBindings();
 }
 
 void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
     RENDERER_TRACE;
-
+    Core::PerfTelemetry::Increment(Core::PerfTelemetry::Counter::DispatchCalls);
+    Core::PerfTelemetry::ScopedTimer telemetry_timer{Core::PerfTelemetry::TimeMetric::DispatchCpu};
     scheduler.PopPendingOperations();
 
     const auto& cs_program = liverpool->GetCsRegs();
@@ -370,15 +381,28 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->Handle());
     cmdbuf.dispatchIndirect(buffer->Handle(), base);
+    Core::PerfTelemetry::Increment(Core::PerfTelemetry::Counter::DispatchesEmitted);
 
     ResetBindings();
 }
 
 u64 Rasterizer::Flush() {
+    Core::PerfTelemetry::ScopedTimer telemetry_timer{
+        Core::PerfTelemetry::TimeMetric::RasterFlushCpu};
     const u64 current_tick = scheduler.CurrentTick();
     SubmitInfo info{};
     scheduler.Flush(info);
     return current_tick;
+}
+
+void Rasterizer::PrepareGuestFence() {
+    buffer_cache.CommitPendingGpuRanges();
+    if (buffer_cache.PreparePreemptiveDownloads()) {
+        // The emulated fence label is written immediately below in Liverpool.
+        // Submit the staged copies first so a CPU page fault can wait on their
+        // single shared timeline tick instead of creating one submit per page.
+        scheduler.Flush();
+    }
 }
 
 void Rasterizer::Finish() {
@@ -386,6 +410,7 @@ void Rasterizer::Finish() {
 }
 
 void Rasterizer::OnSubmit() {
+    Core::PerfTelemetry::ScopedTimer telemetry_timer{Core::PerfTelemetry::TimeMetric::OnSubmitCpu};
     if (fault_process_pending) {
         fault_process_pending = false;
         buffer_cache.ProcessFaultBuffer();
@@ -396,6 +421,8 @@ void Rasterizer::OnSubmit() {
 }
 
 bool Rasterizer::BindResources(const Pipeline* pipeline) {
+    Core::PerfTelemetry::ScopedTimer telemetry_timer{
+        Core::PerfTelemetry::TimeMetric::ResourceBindCpu};
     if (IsComputeImageCopy(pipeline) || IsComputeMetaClear(pipeline) ||
         IsComputeImageClear(pipeline)) {
         return false;
@@ -433,6 +460,8 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
         fault_process_pending = true;
     }
 
+    Core::PerfTelemetry::Increment(Core::PerfTelemetry::Counter::DescriptorWrites,
+                                   set_writes.size());
     return true;
 }
 
@@ -1046,6 +1075,9 @@ bool Rasterizer::InvalidateMemory(VAddr addr, u64 size) {
         // Not GPU mapped memory, can skip invalidation logic entirely.
         return false;
     }
+    Core::PerfTelemetry::Increment(Core::PerfTelemetry::Counter::GuestWriteFaults);
+    Core::PerfTelemetry::ScopedTimer telemetry_timer{
+        Core::PerfTelemetry::TimeMetric::FaultService};
     buffer_cache.InvalidateMemory(addr, size);
     texture_cache.InvalidateMemory(addr, size);
     return true;
@@ -1056,6 +1088,9 @@ bool Rasterizer::ReadMemory(VAddr addr, u64 size) {
         // Not GPU mapped memory, can skip invalidation logic entirely.
         return false;
     }
+    Core::PerfTelemetry::Increment(Core::PerfTelemetry::Counter::GuestReadFaults);
+    Core::PerfTelemetry::ScopedTimer telemetry_timer{
+        Core::PerfTelemetry::TimeMetric::FaultService};
     buffer_cache.ReadMemory(addr, size);
     return true;
 }

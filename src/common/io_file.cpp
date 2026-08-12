@@ -407,15 +407,24 @@ s64 IOFile::Tell() const {
 }
 
 u64 GetDirectorySize(const std::filesystem::path& path) {
-    if (!fs::exists(path)) {
+    std::error_code ec;
+    if (!fs::exists(path, ec) || ec) {
         return 0;
     }
 
     u64 total = 0;
-    for (const auto& entry : fs::recursive_directory_iterator(path)) {
-        if (fs::is_regular_file(entry.path())) {
-            total += fs::file_size(entry.path());
+    fs::recursive_directory_iterator it{path, fs::directory_options::skip_permission_denied, ec};
+    const fs::recursive_directory_iterator end{};
+    while (!ec && it != end) {
+        const auto entry_path = it->path();
+        std::error_code entry_ec;
+        if (fs::is_regular_file(entry_path, entry_ec) && !entry_ec) {
+            const auto size = fs::file_size(entry_path, entry_ec);
+            if (!entry_ec) {
+                total += size;
+            }
         }
+        it.increment(ec);
     }
     return total;
 }

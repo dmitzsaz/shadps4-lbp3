@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <limits>
 #include "common/div_ceil.h"
 #include "common/logging/log.h"
 #include "core/emulator_settings.h"
@@ -46,6 +47,18 @@ public:
 
     VAddr GetCpuAddr() const {
         return cpu_addr;
+    }
+
+    void RecordGpuReadback(size_t start_page, size_t end_page) {
+        for (size_t page = start_page; page < end_page; ++page) {
+            if (flush_counts[page] != std::numeric_limits<u16>::max()) {
+                ++flush_counts[page];
+            }
+        }
+    }
+
+    [[nodiscard]] u16 NumGpuReadbacks(size_t page) const {
+        return flush_counts[page];
     }
 
     static constexpr size_t SanitizeAddress(size_t address) {
@@ -190,6 +203,7 @@ private:
     RegionBits gpu;
     RegionBits writeable;
     RegionBits readable;
+    RegionFlushCounts flush_counts{};
 };
 
 } // namespace VideoCore

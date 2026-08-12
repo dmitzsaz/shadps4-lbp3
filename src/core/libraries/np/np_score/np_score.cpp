@@ -13,6 +13,7 @@
 #include "core/libraries/libs.h"
 #include "core/libraries/np/np_error.h"
 #include "core/libraries/np/np_handler.h"
+#include "core/libraries/np/np_manager.h"
 #include "core/libraries/np/np_score/np_score.h"
 #include "core/libraries/np/np_score/np_score_ctx.h"
 
@@ -76,8 +77,13 @@ s32 PS4_SYSV_ABI sceNpScoreCreateNpTitleCtx(OrbisNpServiceLabel serviceLabel,
         LOG_ERROR(Lib_NpScore, "Too many title contexts already exist ({})", g_title_ctxs.size());
         return ORBIS_NP_COMMUNITY_ERROR_TOO_MANY_OBJECTS;
     }
-    const s32 userId =
-        Libraries::Np::NpHandler::GetInstance().GetUserIdByOnlineId(selfNpId->handle);
+    s32 userId = -1;
+    if (Libraries::Np::NpManager::sceNpGetUserIdByOnlineId(&selfNpId->handle, &userId) !=
+        ORBIS_OK) {
+        // Preserve the pre-existing behavior for non-helper identities: title-context
+        // validation is deferred to the score request rather than failing creation here.
+        userId = Libraries::Np::NpHandler::GetInstance().GetUserIdByOnlineId(selfNpId->handle);
+    }
     const OrbisNpScoreTitleCtxId id = g_next_ctx_id++;
     g_title_ctxs[id] = ScoreTitleCtx{.serviceLabel = serviceLabel, .userId = userId};
     LOG_INFO(Lib_NpScore, "CreateNpTitleCtx id={} serviceLabel={} userId={}", id, serviceLabel,
@@ -88,7 +94,9 @@ s32 PS4_SYSV_ABI sceNpScoreCreateNpTitleCtx(OrbisNpServiceLabel serviceLabel,
 s32 PS4_SYSV_ABI sceNpScoreCreateNpTitleCtxA(OrbisNpServiceLabel npServiceLabel,
                                              UserService::OrbisUserServiceUserId selfId) {
 
-    if (!Libraries::Np::NpHandler::GetInstance().IsPsnSignedIn(selfId)) {
+    Libraries::Np::NpManager::OrbisNpState np_state{};
+    if (Libraries::Np::NpManager::sceNpGetState(selfId, &np_state) != ORBIS_OK ||
+        np_state != Libraries::Np::NpManager::OrbisNpState::SignedIn) {
         LOG_ERROR(Lib_NpScore, "userId {} is not signed in to NP", selfId);
         return ORBIS_NP_ERROR_SIGNED_OUT;
     }

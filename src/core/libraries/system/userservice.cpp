@@ -10,6 +10,7 @@
 #include "common/singleton.h"
 #include "core/emulator_settings.h"
 #include "core/libraries/libs.h"
+#include "core/libraries/network/lbp3_online_bridge.h"
 #include "core/libraries/np/np_handler.h"
 #include "core/libraries/np/np_manager.h"
 #include "core/libraries/system/userservice.h"
@@ -1119,6 +1120,13 @@ s32 PS4_SYSV_ABI sceUserServiceGetUserName(int user_id, char* user_name, std::si
         const std::size_t handle_len = strnlen(np_id.handle.data, sizeof(np_id.handle.data));
         if (handle_len > 0) {
             name.assign(np_id.handle.data, handle_len);
+        }
+    }
+    if (Net::Lbp3OnlineBridge::IsSupportedTitle() && Net::Lbp3OnlineBridge::EnsureConnected()) {
+        const std::string helper_name = Net::Lbp3OnlineBridge::OnlineId();
+        if (!helper_name.empty()) {
+            name = helper_name;
+            LOG_DEBUG(Lib_UserService, "LBP3 helper user name='{}'", name);
         }
     }
 

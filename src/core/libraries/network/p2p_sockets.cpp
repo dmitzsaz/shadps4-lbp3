@@ -8,6 +8,7 @@
 #include <common/logging/log.h>
 #include <common/singleton.h>
 #include "core/libraries/kernel/kernel.h"
+#include "lbp3_online_bridge.h"
 #include "net.h"
 #include "net_error.h"
 #include "net_util.h"
@@ -43,10 +44,13 @@ bool IsLoopbackAddress(u32 address) {
 } // namespace
 
 u16 GetP2PConfiguredPort() {
-    return 0;
+    return Lbp3OnlineBridge::IsSupportedTitle() ? Lbp3OnlineBridge::ConfiguredPort() : 0;
 }
 
 u32 GetP2PAdvertisedAddr() {
+    if (Lbp3OnlineBridge::IsSupportedTitle() && Lbp3OnlineBridge::EnsureConnected()) {
+        return Lbp3OnlineBridge::AdvertisedAddr();
+    }
     auto* netinfo = Common::Singleton<NetUtil::NetUtilInternal>::Instance();
     if (netinfo->RetrieveIp()) {
         const u32 address = inet_addr(netinfo->GetIp().c_str());
@@ -58,27 +62,65 @@ u32 GetP2PAdvertisedAddr() {
 }
 
 bool EnsureP2PTransport() {
-    return true;
+    return !Lbp3OnlineBridge::IsSupportedTitle() || Lbp3OnlineBridge::EnsureConnected();
 }
 
 bool P2PTransportIsReady() {
-    return true;
+    return !Lbp3OnlineBridge::IsSupportedTitle() || Lbp3OnlineBridge::IsConnected();
 }
 
 int P2PSignalingSendTo(const void* data, u32 len, u32 dest_addr, u16 dest_port) {
-    return -1;
+    const Lbp3OnlineBridge::Endpoint source{
+        .addr = GetP2PAdvertisedAddr(),
+        .port = GetP2PConfiguredPort(),
+    };
+    const Lbp3OnlineBridge::Endpoint destination{.addr = dest_addr, .port = dest_port};
+    return Lbp3OnlineBridge::Send(Lbp3OnlineBridge::Channel::Signaling, data, len, source,
+                                  destination);
 }
 
 int P2PSignalingRecvFrom(void* buf, u32 len, u32* from_addr, u16* from_port) {
-    return -1;
+    Lbp3OnlineBridge::Endpoint source{};
+    const int received =
+        Lbp3OnlineBridge::Receive(Lbp3OnlineBridge::Channel::Signaling, buf, len, nullptr, &source);
+    if (received >= 0) {
+        if (from_addr != nullptr) {
+            *from_addr = source.addr;
+        }
+        if (from_port != nullptr) {
+            *from_port = source.port != 0 ? source.port : source.vport;
+        }
+    }
+    return received;
 }
 
 int P2PControlSendTo(const void* data, u32 len, u32 dest_addr, u16 dest_port) {
-    return -1;
+    const Lbp3OnlineBridge::Endpoint source{
+        .addr = GetP2PAdvertisedAddr(),
+        .port = GetP2PConfiguredPort(),
+    };
+    const Lbp3OnlineBridge::Endpoint destination{.addr = dest_addr, .port = dest_port};
+    return Lbp3OnlineBridge::Send(Lbp3OnlineBridge::Channel::Control, data, len, source,
+                                  destination);
 }
 
 int P2PControlRecvFrom(void* buf, u32 len, u32* from_addr, u16* from_port) {
-    return -1;
+    Lbp3OnlineBridge::Endpoint source{};
+    const int received =
+        Lbp3OnlineBridge::Receive(Lbp3OnlineBridge::Channel::Control, buf, len, nullptr, &source);
+    if (received >= 0) {
+        if (from_addr != nullptr) {
+            *from_addr = source.addr;
+        }
+        if (from_port != nullptr) {
+            *from_port = source.port != 0 ? source.port : source.vport;
+        }
+    }
+    return received;
+}
+
+bool P2PResolvePeer(std::string_view online_id, u32* out_addr, u16* out_port) {
+    return Lbp3OnlineBridge::ResolvePeer(online_id, out_addr, out_port);
 }
 
 int P2PMatching2SendTo(const void* data, u32 len, u32 dest_addr, u16 dest_port) {
@@ -115,13 +157,30 @@ u32 P2PSocket::GetPendingEvents(u32 requested_events) {
         return 0;
     }
 
-    u32 pending_events = requested_events & ORBIS_NET_EPOLLOUT;
-    std::scoped_lock lock{local_receive_mutex};
-    if (!local_receive_queue.empty()) {
-        pending_events |= requested_events & ORBIS_NET_EPOLLIN;
+    Lbp3OnlineBridge::Endpoint local{};
+    {
+        std::scoped_lock lock{p2p_registry_mutex};
+        if (is_bound) {
+            local = {
+                .addr = bound_addr.sin_addr,
+                .port = bound_addr.sin_port,
+                .vport = bound_addr.sin_vport,
+            };
+        }
     }
-    if (is_closed) {
-        pending_events |= (requested_events & ORBIS_NET_EPOLLIN) | ORBIS_NET_EPOLLHUP;
+    u32 pending_events = requested_events & ORBIS_NET_EPOLLOUT;
+    {
+        std::scoped_lock lock{local_receive_mutex};
+        if (!local_receive_queue.empty()) {
+            pending_events |= requested_events & ORBIS_NET_EPOLLIN;
+        }
+        if (is_closed) {
+            pending_events |= (requested_events & ORBIS_NET_EPOLLIN) | ORBIS_NET_EPOLLHUP;
+        }
+    }
+    if ((requested_events & ORBIS_NET_EPOLLIN) != 0 &&
+        Lbp3OnlineBridge::HasPending(Lbp3OnlineBridge::Channel::Game, &local)) {
+        pending_events |= ORBIS_NET_EPOLLIN;
     }
     return pending_events;
 }
@@ -145,18 +204,23 @@ int P2PSocket::Bind(const OrbisNetSockaddr* addr, u32 addrlen) {
         return SetP2PError(ORBIS_NET_EINVAL);
     }
 
-    std::scoped_lock lock{p2p_registry_mutex};
-    RemoveSocketFromRegistry(this);
-    bound_addr = new_addr;
-    is_bound = true;
-    if (bound_addr.sin_port != 0) {
-        p2p_registry[bound_addr.sin_port] = self;
-    }
-    if (bound_addr.sin_vport != 0 && bound_addr.sin_vport != bound_addr.sin_port) {
-        p2p_registry[bound_addr.sin_vport] = self;
+    {
+        std::scoped_lock lock{p2p_registry_mutex};
+        RemoveSocketFromRegistry(this);
+        bound_addr = new_addr;
+        is_bound = true;
+        if (bound_addr.sin_port != 0) {
+            p2p_registry[bound_addr.sin_port] = self;
+        }
+        if (bound_addr.sin_vport != 0 && bound_addr.sin_vport != bound_addr.sin_port) {
+            p2p_registry[bound_addr.sin_vport] = self;
+        }
     }
     LOG_DEBUG(Lib_Net, "Bound local P2P datagram socket to port {:#x}, vport {:#x}",
               ntohs(bound_addr.sin_port), ntohs(bound_addr.sin_vport));
+    if (Lbp3OnlineBridge::IsSupportedTitle() && !Lbp3OnlineBridge::EnsureConnected()) {
+        LOG_WARNING(Lib_Net, "LBP3 P2P socket is bound, but the local helper is not reachable yet");
+    }
     return 0;
 }
 
@@ -216,6 +280,34 @@ int P2PSocket::SendPacket(const void* msg, u32 len, int flags, const OrbisNetSoc
     }
 
     if (!destination) {
+        if (!source_is_bound) {
+            source_addr = {
+                .sin_len = sizeof(OrbisNetSockaddrIn),
+                .sin_family = ORBIS_NET_AF_INET,
+                .sin_addr = advertised_addr,
+            };
+        } else if (source_addr.sin_addr == htonl(INADDR_ANY)) {
+            source_addr.sin_addr = advertised_addr;
+        }
+        const Lbp3OnlineBridge::Endpoint source{
+            .addr = source_addr.sin_addr,
+            .port = source_addr.sin_port,
+            .vport = source_addr.sin_vport,
+        };
+        const Lbp3OnlineBridge::Endpoint remote{
+            .addr = destination_addr.sin_addr,
+            .port = destination_addr.sin_port,
+            .vport = destination_addr.sin_vport,
+        };
+        const int sent =
+            Lbp3OnlineBridge::Send(Lbp3OnlineBridge::Channel::Game, msg, len, source, remote);
+        if (sent >= 0) {
+            LOG_DEBUG(Lib_Net,
+                      "Relayed {} byte LBP3 P2P datagram to {:#x}, port {:#x}, vport {:#x}", len,
+                      ntohl(destination_addr.sin_addr), ntohs(destination_addr.sin_port),
+                      ntohs(destination_addr.sin_vport));
+            return sent;
+        }
         LOG_ERROR(Lib_Net,
                   "No local P2P datagram destination for address {:#x}, port {:#x}, vport {:#x}",
                   ntohl(destination_addr.sin_addr), ntohs(destination_addr.sin_port),
@@ -270,27 +362,63 @@ int P2PSocket::ReceivePacket(void* buf, u32 len, int flags, OrbisNetSockaddr* fr
     }
 
     LocalDatagram packet{};
+    bool have_local_packet = false;
     {
         std::scoped_lock lock{local_receive_mutex};
-        if (local_receive_queue.empty()) {
-            return SetP2PError(ORBIS_NET_EAGAIN);
+        if (!local_receive_queue.empty()) {
+            packet = std::move(local_receive_queue.front());
+            local_receive_queue.pop_front();
+            have_local_packet = true;
         }
-        packet = std::move(local_receive_queue.front());
-        local_receive_queue.pop_front();
     }
 
-    const size_t received = std::min<size_t>(len, packet.data.size());
-    if (received != 0) {
-        std::memcpy(buf, packet.data.data(), received);
+    if (have_local_packet) {
+        const size_t received = std::min<size_t>(len, packet.data.size());
+        if (received != 0) {
+            std::memcpy(buf, packet.data.data(), received);
+        }
+        if (fromlen != nullptr) {
+            const u32 available = *fromlen;
+            *fromlen = sizeof(packet.source);
+            if (from != nullptr && available != 0) {
+                std::memcpy(from, &packet.source, std::min<u32>(available, sizeof(packet.source)));
+            }
+        }
+        return static_cast<int>(received);
     }
-    if (fromlen != nullptr) {
-        const u32 available = *fromlen;
-        *fromlen = sizeof(packet.source);
-        if (from != nullptr && available != 0) {
-            std::memcpy(from, &packet.source, std::min<u32>(available, sizeof(packet.source)));
+
+    Lbp3OnlineBridge::Endpoint local{};
+    {
+        std::scoped_lock lock{p2p_registry_mutex};
+        if (is_bound) {
+            local = {
+                .addr = bound_addr.sin_addr,
+                .port = bound_addr.sin_port,
+                .vport = bound_addr.sin_vport,
+            };
         }
     }
-    return static_cast<int>(received);
+    Lbp3OnlineBridge::Endpoint remote{};
+    const int received =
+        Lbp3OnlineBridge::Receive(Lbp3OnlineBridge::Channel::Game, buf, len, &local, &remote);
+    if (received < 0) {
+        return SetP2PError(ORBIS_NET_EAGAIN);
+    }
+    if (fromlen != nullptr) {
+        OrbisNetSockaddrIn source{
+            .sin_len = sizeof(OrbisNetSockaddrIn),
+            .sin_family = ORBIS_NET_AF_INET,
+            .sin_port = remote.port,
+            .sin_addr = remote.addr,
+            .sin_vport = remote.vport,
+        };
+        const u32 available = *fromlen;
+        *fromlen = sizeof(source);
+        if (from != nullptr && available != 0) {
+            std::memcpy(from, &source, std::min<u32>(available, sizeof(source)));
+        }
+    }
+    return received;
 }
 
 int P2PSocket::GetSocketAddress(OrbisNetSockaddr* name, u32* namelen) {

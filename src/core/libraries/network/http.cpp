@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cctype>
 #include <chrono>
@@ -21,8 +22,10 @@
 #include <nlohmann/json.hpp>
 #include "common/elf_info.h"
 #include "common/logging/log.h"
+#include "common/memory_patcher.h"
 #include "common/path_util.h"
 #include "core/emulator_settings.h"
+#include "core/lbp3_online.h"
 #include "core/libraries/error_codes.h"
 #include "core/libraries/kernel/orbis_error.h"
 #include "core/libraries/kernel/process.h"
@@ -124,6 +127,246 @@ struct HttpRequest {
     void* epoll_user_arg = nullptr;
     std::vector<std::pair<std::string, std::string>> headers;
 };
+
+static bool IsLbp3HelperRequest(const HttpRequest& req) {
+    if (!Core::Lbp3Online::IsSupportedTitle()) {
+        return false;
+    }
+    return std::string_view{req.url}.contains("/LITTLEBIGPLANETPS3_XML/");
+}
+
+static bool IsLbp3LoginUrl(std::string_view url) {
+    return Core::Lbp3Online::IsSupportedTitle() &&
+           url.contains("/LITTLEBIGPLANETPS3_XML/login");
+}
+
+// The login response is parsed by the game after libSceHttp has handed the complete body back.
+// Watch the title's login state and its surrounding online-bootstrap state machine across that
+// boundary so a local-helper failure can be attributed to the exact guest branch. This is
+// intentionally enabled only by the explicit --lbp3-online mode and the supported v1.26 title.
+static void StartLbp3LoginStateWatcher() {
+    static std::atomic_bool watcher_running = false;
+    if (watcher_running.exchange(true) || MemoryPatcher::g_eboot_address == 0) {
+        return;
+    }
+
+    std::thread([] {
+        constexpr uintptr_t LoginStateOffset = 0x01315808;
+        constexpr uintptr_t LoginTicketOffset = 0x01315810;
+        constexpr uintptr_t LoginGenerationOffset = 0x01315890;
+        // CUSA00063 v1.26: singleton at 0x130e248, state field at +0x1a8.
+        constexpr uintptr_t BootstrapStateOffset = 0x0130e3f0;
+        constexpr uintptr_t BootstrapRequestActiveOffset = 0x0130e408;
+        // The state-10 result/error pair is copied here by the guest at 0x33cf2d and nearby paths.
+        constexpr uintptr_t BootstrapResultOffset = 0x0130d9d4;
+        constexpr uintptr_t BootstrapErrorOffset = 0x0130d9d8;
+        // CUSA00063 v1.26: outer bootstrap owner at 0x130d6b8. The byte at +0x339 is
+        // passed as the reset argument to 0x33c910; +0x338 is kept beside it so we can
+        // distinguish a permanently asserted reset from the adjacent lifecycle flag.
+        constexpr uintptr_t BootstrapLifecycleFlagOffset = 0x0130d9f0;
+        constexpr uintptr_t BootstrapResetFlagOffset = 0x0130d9f1;
+        // The outer online manager at 0x130d6b8 runs 26 child state machines while state 2 is
+        // active.  A clean completion sets +0x338 before advancing to state 3; if any child
+        // returns 1 or 3 it advances without that success byte and the +0x2f0 watchdog later
+        // tears the whole online stack down.  Keep this probe deliberately narrow so the exact
+        // failing child can be identified without enabling the general performance telemetry.
+        constexpr uintptr_t ManagerOuterStateOffset = 0x0130d9a4; // manager + 0x2ec
+        constexpr uintptr_t ManagerWatchdogOffset = 0x0130d9a8;   // manager + 0x2f0
+        constexpr uintptr_t ManagerSuccessFlagOffset = 0x0130d9f0; // manager + 0x338
+        constexpr uintptr_t ManagerLocalGatePointerOffset = 0x0130d6e8; // manager + 0x30
+        constexpr uintptr_t ManagerWatchdogGateOffset = 0x0130da20; // manager + 0x368
+        constexpr uintptr_t ManagerChildStatesOffset = 0x0130d794; // manager + 0xdc
+        constexpr uintptr_t ManagerChildHandlersOffset = 0x0130d800; // manager + 0x148
+        constexpr size_t ManagerChildCount = 26;
+        // CUSA00063 v1.26: the NP/session singleton used after the legacy XML bootstrap.  Its
+        // /v1/sessions callback writes substate 3 on success and substate 2 on failure.  Watching
+        // this separately is important because the generic disconnect dialog is raised after the
+        // legacy bootstrap has already reached its successful terminal state.
+        constexpr uintptr_t SessionOuterStateOffset = 0x0119a740;
+        constexpr uintptr_t SessionSubstateOffset = 0x0119a744;
+        constexpr uintptr_t SessionState2Offset = 0x0119a748;
+        constexpr uintptr_t SessionState3Offset = 0x0119a74c;
+        constexpr uintptr_t SessionFlagOffset = 0x0119a850;
+        const uintptr_t base = MemoryPatcher::g_eboot_address;
+        const auto* state = reinterpret_cast<const volatile u32*>(base + LoginStateOffset);
+        const auto* generation = reinterpret_cast<const volatile u32*>(base + LoginGenerationOffset);
+        const auto* ticket = reinterpret_cast<const volatile char*>(base + LoginTicketOffset);
+        const auto* bootstrap_state =
+            reinterpret_cast<const volatile u32*>(base + BootstrapStateOffset);
+        const auto* bootstrap_request_active =
+            reinterpret_cast<const volatile u8*>(base + BootstrapRequestActiveOffset);
+        const auto* bootstrap_result =
+            reinterpret_cast<const volatile u32*>(base + BootstrapResultOffset);
+        const auto* bootstrap_error =
+            reinterpret_cast<const volatile u32*>(base + BootstrapErrorOffset);
+        const auto* bootstrap_lifecycle_flag =
+            reinterpret_cast<const volatile u8*>(base + BootstrapLifecycleFlagOffset);
+        const auto* bootstrap_reset_flag =
+            reinterpret_cast<const volatile u8*>(base + BootstrapResetFlagOffset);
+        const auto* manager_outer_state =
+            reinterpret_cast<const volatile u32*>(base + ManagerOuterStateOffset);
+        const auto* manager_watchdog =
+            reinterpret_cast<const volatile u32*>(base + ManagerWatchdogOffset);
+        const auto* manager_success_flag =
+            reinterpret_cast<const volatile u8*>(base + ManagerSuccessFlagOffset);
+        const auto* manager_local_gate_pointer =
+            reinterpret_cast<const volatile uintptr_t*>(base + ManagerLocalGatePointerOffset);
+        const auto* manager_watchdog_gate =
+            reinterpret_cast<const volatile u8*>(base + ManagerWatchdogGateOffset);
+        const auto* manager_child_states =
+            reinterpret_cast<const volatile u32*>(base + ManagerChildStatesOffset);
+        const auto* manager_child_handlers =
+            reinterpret_cast<const volatile u64*>(base + ManagerChildHandlersOffset);
+        const auto* session_outer_state =
+            reinterpret_cast<const volatile u32*>(base + SessionOuterStateOffset);
+        const auto* session_substate =
+            reinterpret_cast<const volatile u32*>(base + SessionSubstateOffset);
+        const auto* session_state2 =
+            reinterpret_cast<const volatile u32*>(base + SessionState2Offset);
+        const auto* session_state3 =
+            reinterpret_cast<const volatile u32*>(base + SessionState3Offset);
+        const auto* session_flag =
+            reinterpret_cast<const volatile u8*>(base + SessionFlagOffset);
+
+        u32 previous_state = ~u32{0};
+        u32 previous_generation = ~u32{0};
+        u32 previous_bootstrap_state = ~u32{0};
+        u8 previous_request_active = ~u8{0};
+        u32 previous_bootstrap_result = ~u32{0};
+        u32 previous_bootstrap_error = ~u32{0};
+        u8 previous_lifecycle_flag = ~u8{0};
+        u8 previous_reset_flag = ~u8{0};
+        u32 previous_manager_outer_state = ~u32{0};
+        u32 previous_manager_watchdog = ~u32{0};
+        u8 previous_manager_success_flag = ~u8{0};
+        u8 previous_manager_local_gate = ~u8{0};
+        u8 previous_manager_watchdog_gate = ~u8{0};
+        std::array<u32, ManagerChildCount> previous_manager_child_states;
+        previous_manager_child_states.fill(~u32{0});
+        u32 previous_session_outer_state = ~u32{0};
+        u32 previous_session_substate = ~u32{0};
+        u32 previous_session_state2 = ~u32{0};
+        u32 previous_session_state3 = ~u32{0};
+        u8 previous_session_flag = ~u8{0};
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(90);
+        while (std::chrono::steady_clock::now() < deadline) {
+            const u32 current_state = *state;
+            const u32 current_generation = *generation;
+            if (current_state != previous_state || current_generation != previous_generation) {
+                char ticket_copy[129]{};
+                for (size_t i = 0; i < 128; ++i) {
+                    ticket_copy[i] = ticket[i];
+                    if (ticket_copy[i] == '\0') {
+                        break;
+                    }
+                }
+                LOG_CRITICAL(Lib_Http,
+                             "LBP3 guest login state: state={} generation={} ticket='{}'",
+                             current_state, current_generation, ticket_copy);
+                previous_state = current_state;
+                previous_generation = current_generation;
+            }
+            const u32 current_bootstrap_state = *bootstrap_state;
+            const u8 current_request_active = *bootstrap_request_active;
+            const u32 current_bootstrap_result = *bootstrap_result;
+            const u32 current_bootstrap_error = *bootstrap_error;
+            const u8 current_lifecycle_flag = *bootstrap_lifecycle_flag;
+            const u8 current_reset_flag = *bootstrap_reset_flag;
+            if (current_bootstrap_state != previous_bootstrap_state ||
+                current_request_active != previous_request_active ||
+                current_bootstrap_result != previous_bootstrap_result ||
+                current_bootstrap_error != previous_bootstrap_error ||
+                current_lifecycle_flag != previous_lifecycle_flag ||
+                current_reset_flag != previous_reset_flag) {
+                LOG_CRITICAL(Lib_Http,
+                             "LBP3 bootstrap state: state={} request_active={} result={:#x} "
+                             "error={:#x} lifecycle_flag={} reset_flag={}",
+                             current_bootstrap_state, current_request_active,
+                             current_bootstrap_result, current_bootstrap_error,
+                             current_lifecycle_flag, current_reset_flag);
+                previous_bootstrap_state = current_bootstrap_state;
+                previous_request_active = current_request_active;
+                previous_bootstrap_result = current_bootstrap_result;
+                previous_bootstrap_error = current_bootstrap_error;
+                previous_lifecycle_flag = current_lifecycle_flag;
+                previous_reset_flag = current_reset_flag;
+            }
+            const u32 current_manager_outer_state = *manager_outer_state;
+            const u32 current_manager_watchdog = *manager_watchdog;
+            const u8 current_manager_success_flag = *manager_success_flag;
+            const uintptr_t current_manager_local_gate_pointer = *manager_local_gate_pointer;
+            const u8 current_manager_local_gate = current_manager_local_gate_pointer != 0
+                                                      ? *reinterpret_cast<const volatile u8*>(
+                                                            current_manager_local_gate_pointer)
+                                                      : 0xff;
+            const u8 current_manager_watchdog_gate = *manager_watchdog_gate;
+            std::ostringstream manager_changes;
+            bool manager_child_changed = false;
+            for (size_t i = 0; i < ManagerChildCount; ++i) {
+                const u32 child_state = manager_child_states[i];
+                if (child_state == previous_manager_child_states[i]) {
+                    continue;
+                }
+                if (manager_child_changed) {
+                    manager_changes << ", ";
+                }
+                // Each child descriptor is 16 bytes: encoded handler followed by a manager-
+                // relative owner pointer.  Log both raw values only when that child's state
+                // changes, which is enough to map the failing slot back to guest code.
+                const u64 handler = manager_child_handlers[i * 2];
+                const u64 owner = manager_child_handlers[i * 2 + 1];
+                manager_changes << i << ':' << previous_manager_child_states[i] << "->"
+                                << child_state << " handler=0x" << std::hex << handler
+                                << " owner=0x" << owner << std::dec;
+                previous_manager_child_states[i] = child_state;
+                manager_child_changed = true;
+            }
+            const bool manager_header_changed =
+                current_manager_outer_state != previous_manager_outer_state ||
+                current_manager_success_flag != previous_manager_success_flag ||
+                current_manager_local_gate != previous_manager_local_gate ||
+                current_manager_watchdog_gate != previous_manager_watchdog_gate ||
+                (current_manager_watchdog == 0) != (previous_manager_watchdog == 0);
+            if (manager_header_changed || manager_child_changed) {
+                LOG_CRITICAL(Lib_Http,
+                             "LBP3 online manager: outer={} watchdog={} success={} local_gate={} "
+                             "watchdog_gate={} child_changes=[{}]",
+                             current_manager_outer_state, current_manager_watchdog,
+                             current_manager_success_flag, current_manager_local_gate,
+                             current_manager_watchdog_gate, manager_changes.str());
+                previous_manager_outer_state = current_manager_outer_state;
+                previous_manager_success_flag = current_manager_success_flag;
+                previous_manager_local_gate = current_manager_local_gate;
+                previous_manager_watchdog_gate = current_manager_watchdog_gate;
+            }
+            previous_manager_watchdog = current_manager_watchdog;
+            const u32 current_session_outer_state = *session_outer_state;
+            const u32 current_session_substate = *session_substate;
+            const u32 current_session_state2 = *session_state2;
+            const u32 current_session_state3 = *session_state3;
+            const u8 current_session_flag = *session_flag;
+            if (current_session_outer_state != previous_session_outer_state ||
+                current_session_substate != previous_session_substate ||
+                current_session_state2 != previous_session_state2 ||
+                current_session_state3 != previous_session_state3 ||
+                current_session_flag != previous_session_flag) {
+                LOG_CRITICAL(Lib_Http,
+                             "LBP3 session state: outer={} substate={} state2={:#x} "
+                             "state3={:#x} flag={}",
+                             current_session_outer_state, current_session_substate,
+                             current_session_state2, current_session_state3,
+                             current_session_flag);
+                previous_session_outer_state = current_session_outer_state;
+                previous_session_substate = current_session_substate;
+                previous_session_state2 = current_session_state2;
+                previous_session_state3 = current_session_state3;
+                previous_session_flag = current_session_flag;
+            }
+            std::this_thread::sleep_for(std::chrono::microseconds(250));
+        }
+        watcher_running.store(false);
+    }).detach();
+}
 
 struct HttpState {
     std::mutex m_mutex;
@@ -350,7 +593,54 @@ static const HostOverrideState& GetHostOverrideState() {
     return s;
 }
 
+static bool ApplyLbp3OnlineOverride(std::string& scheme, std::string& host, u16& port,
+                                    bool& is_secure) {
+    if (!Core::Lbp3Online::IsSupportedTitle()) {
+        return false;
+    }
+
+    const bool main_host = host == "littlebigplanetps3.online.scee.com";
+    const bool auxiliary_host = host == "presence.littlebigplanetps3.online.scee.com" ||
+                                host == "live.littlebigplanetps3.online.scee.com";
+    constexpr std::string_view resource_suffix = ".littlebigplanetps3.online.scee.com";
+    const bool resource_host = [&] {
+        if (!host.ends_with(resource_suffix)) {
+            return false;
+        }
+        const std::string_view prefix{host.data(), host.size() - resource_suffix.size()};
+        if (!prefix.starts_with("res") || prefix.size() == 3) {
+            return false;
+        }
+        // LBP's resource CDN shards are hexadecimal (res0..resf), not decimal-only.
+        // In particular, archived community levels routinely request hosts such as resb.
+        return std::ranges::all_of(prefix.substr(3), [](const char c) {
+            return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') ||
+                   (c >= 'A' && c <= 'F');
+        });
+    }();
+    const bool official_http =
+        scheme == "http" && port == 10060 && (main_host || auxiliary_host || resource_host);
+    const bool official_https = scheme == "https" && port == 10061 && main_host;
+    if (!official_http && !official_https) {
+        return false;
+    }
+
+    const std::string original_scheme = scheme;
+    const std::string original_host = host;
+    const u16 original_port = port;
+    scheme = "http";
+    host = "127.0.0.1";
+    port = 18063;
+    is_secure = false;
+    LOG_CRITICAL(Lib_Http, "LBP3 helper redirect: {}://{}:{} -> http://127.0.0.1:18063",
+                 original_scheme, original_host, original_port);
+    return true;
+}
+
 bool ApplyHostOverride(std::string& scheme, std::string& host, u16& port, bool& is_secure) {
+    if (ApplyLbp3OnlineOverride(scheme, host, port, is_secure)) {
+        return true;
+    }
     const auto& state = GetHostOverrideState();
     if (state.entries.empty()) {
         return false;
@@ -1563,12 +1853,26 @@ int PS4_SYSV_ABI sceHttpSendRequest(int reqId, const void* postData, u64 size) {
         }
     }
 
-    const bool online = EmulatorSettings.IsConnectedToNetwork();
+    // The explicit LBP3 helper mode is an isolated loopback network. It must
+    // remain usable when external host networking is disabled in the global
+    // config, but it must not grant arbitrary Internet access to the title.
+    const bool lbp3_loopback = Core::Lbp3Online::IsSupportedTitle() && plan.scheme == "http" &&
+                               plan.host == "127.0.0.1" && plan.port == 18063;
+    const bool online = EmulatorSettings.IsConnectedToNetwork() || lbp3_loopback;
     LOG_INFO(Lib_Http, "reqId={} dispatched to async worker [{} {} {}://{}:{}{}]", reqId,
              online ? "ONLINE" : "OFFLINE", HttpMethodName(plan.method), plan.scheme, plan.host,
              plan.port, plan.path);
+    if (lbp3_loopback) {
+        LOG_CRITICAL(Lib_Http, "LBP3 native HTTP submit: {} http://127.0.0.1:18063{} ({} bytes)",
+                     HttpMethodName(plan.method), plan.path, plan.body.size());
+        for (const auto& [name, value] : plan.headers) {
+            if (HeaderNameMatches(name, "Cookie") || HeaderNameMatches(name, "Authorization")) {
+                LOG_CRITICAL(Lib_Http, "LBP3 request auth header: {}: {}", name, value);
+            }
+        }
+    }
 
-    std::thread([req_ptr, reqId, plan = std::move(plan), online]() {
+    std::thread([req_ptr, reqId, plan = std::move(plan), online, lbp3_loopback]() {
         HttpResponse local_res;
         s32 worker_errno = 0;
         u32 success_event_bits = 0; // 0 = no event (offline path uses failure bits)
@@ -1578,6 +1882,13 @@ int PS4_SYSV_ABI sceHttpSendRequest(int reqId, const void* postData, u64 size) {
             worker_errno = ORBIS_HTTP_ERROR_RESOLVER_ENODNS;
         } else {
             worker_errno = RunRealHttpRequest(plan, local_res, success_event_bits);
+        }
+
+        if (lbp3_loopback) {
+            LOG_CRITICAL(Lib_Http,
+                         "LBP3 local backend completed: {} {} -> HTTP {} (transport={:#x})",
+                         HttpMethodName(plan.method), plan.path, local_res.status_code,
+                         static_cast<u32>(worker_errno));
         }
 
         std::lock_guard<std::mutex> lock(g_state.m_mutex);
@@ -2312,6 +2623,10 @@ int PS4_SYSV_ABI sceHttpReadData(s32 reqId, void* data, u64 size) {
         std::memcpy(data, req.res.body.data() + req.res.read_cursor, to_copy);
         req.res.read_cursor += to_copy;
     }
+    if (IsLbp3HelperRequest(req)) {
+        LOG_CRITICAL(Lib_Http, "LBP3 response read: reqId={} copied={} cursor={}/{} url={}", reqId,
+                     to_copy, req.res.read_cursor, req.res.body.size(), req.url);
+    }
     LOG_INFO(Lib_Http, "reqId={} copied {} bytes (cursor {}/{}) ", reqId, to_copy,
              req.res.read_cursor, req.res.body.size());
     return static_cast<int>(to_copy);
@@ -2526,6 +2841,10 @@ int PS4_SYSV_ABI sceHttpGetAllResponseHeaders(int reqId, char** header, u64* hea
         *headerSize = req.res.all_headers_blob.size();
         LOG_INFO(Lib_Http, "reqId={} returning {} bytes of headers", reqId, *headerSize);
     }
+    if (IsLbp3HelperRequest(req)) {
+        LOG_CRITICAL(Lib_Http, "LBP3 response headers: reqId={} bytes={} url={}", reqId,
+                     *headerSize, req.url);
+    }
     return ORBIS_OK;
 }
 
@@ -2558,6 +2877,10 @@ int PS4_SYSV_ABI sceHttpGetResponseContentLength(int reqId, int* result, u64* co
     }
     *result = req.res.content_length_result;
     *contentLength = req.res.content_length;
+    if (IsLbp3HelperRequest(req)) {
+        LOG_CRITICAL(Lib_Http, "LBP3 content length: reqId={} result={:#x} bytes={} url={}", reqId,
+                     static_cast<u32>(*result), *contentLength, req.url);
+    }
     LOG_INFO(Lib_Http, "reqId={} result={:#x} contentLength={}", reqId, static_cast<u32>(*result),
              *contentLength);
     return ORBIS_OK;
@@ -2596,6 +2919,10 @@ int PS4_SYSV_ABI sceHttpGetStatusCode(int reqId, int* statusCode) {
         return ORBIS_HTTP_ERROR_BEFORE_SEND;
     }
     *statusCode = req.res.status_code;
+    if (IsLbp3HelperRequest(req)) {
+        LOG_CRITICAL(Lib_Http, "LBP3 status consumed: reqId={} status={} url={}", reqId,
+                     *statusCode, req.url);
+    }
     LOG_INFO(Lib_Http, "reqId={} status={}", reqId, HttpStatusLabel(req.res.status_code));
     return ORBIS_OK;
 }
@@ -2879,6 +3206,19 @@ int PS4_SYSV_ABI sceHttpDeleteRequest(int reqId) {
         return ORBIS_HTTP_ERROR_INVALID_ID;
     }
     auto req_ptr = it->second;
+    if (IsLbp3HelperRequest(*req_ptr)) {
+        LOG_CRITICAL(Lib_Http,
+                     "LBP3 request deleted: reqId={} state={} status={} read={}/{} errno={:#x} "
+                     "url={}",
+                     reqId, static_cast<int>(req_ptr->state), req_ptr->res.status_code,
+                     req_ptr->res.read_cursor, req_ptr->res.body.size(),
+                     static_cast<u32>(req_ptr->last_errno), req_ptr->url);
+        if (IsLbp3LoginUrl(req_ptr->url) && req_ptr->res.status_code >= 200 &&
+            req_ptr->res.status_code < 400 &&
+            req_ptr->res.read_cursor == req_ptr->res.body.size()) {
+            StartLbp3LoginStateWatcher();
+        }
+    }
     if (req_ptr->state == HttpRequestState::Created) {
         LOG_INFO(Lib_Http,
                  "reqId={} abandoned before sceHttpSendRequest (state=Created); "

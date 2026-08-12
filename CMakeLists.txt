@@ -388,6 +388,8 @@ set(NETWORK_LIBS src/core/libraries/network/http.cpp
                  src/core/libraries/network/net_upnp.h
                  src/core/libraries/network/net_error.h
                  src/core/libraries/network/net.h
+                 src/core/libraries/network/lbp3_online_bridge.cpp
+                 src/core/libraries/network/lbp3_online_bridge.h
                  src/core/libraries/network/ssl.cpp
                  src/core/libraries/network/ssl.h
                  src/core/libraries/network/ssl2.cpp
@@ -839,6 +841,9 @@ set(CORE src/core/aerolib/stubs.cpp
          src/core/aerolib/stubs.h
          src/core/aerolib/aerolib.cpp
          src/core/aerolib/aerolib.h
+         src/core/lbp3_online.h
+         src/core/performance_telemetry.cpp
+         src/core/performance_telemetry.h
          src/core/address_space.cpp
          src/core/address_space.h
          src/core/file_sys/devices/base_device.cpp

@@ -4,6 +4,7 @@
 // Based on imgui_impl_sdl3.cpp from Dear ImGui repository
 
 #include <imgui.h>
+#include <cstdio>
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
 #include "core/memory.h"
@@ -55,6 +56,7 @@ struct SdlData {
     std::array<float, 60> framerateSecPerFrame;
     int framerateSecPerFrameIdx{};
     float framerateSecPerFrameAcc{};
+    Uint64 last_fps_report_time{};
 };
 
 // Backend data stored in io.BackendPlatformUserData to allow support for multiple Dear ImGui
@@ -840,6 +842,13 @@ void NewFrame(bool is_reusing_frame) {
         framerateSec = deltaTime;
         frameIdx = (frameIdx + 1) % count;
         DebugState.Framerate = acc > 0.0f ? 1.0f / (acc / (float)count) : FLT_MAX;
+        if (EmulatorSettings.IsShowFpsCounter() &&
+            current_time - bd->last_fps_report_time >= frequency) {
+            bd->last_fps_report_time = current_time;
+            std::fprintf(stderr, "[LBP3_FPS] %.1f fps (%.2f ms)\n", DebugState.Framerate,
+                         DebugState.Framerate > 0.0f ? 1000.0f / DebugState.Framerate : 0.0f);
+            std::fflush(stderr);
+        }
     }
 
     if (bd->mouse_pending_leave_frame && bd->mouse_pending_leave_frame >= ImGui::GetFrameCount() &&

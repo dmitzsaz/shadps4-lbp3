@@ -10,6 +10,7 @@
 #include "common/scope_exit.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
+#include "core/performance_telemetry.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "shader_recompiler/frontend/copy_shader.h"
 #include "shader_recompiler/info.h"
@@ -369,6 +370,10 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline() {
     }
     const auto [it, is_new] = graphics_pipelines.try_emplace(graphics_key);
     if (is_new) {
+        Core::PerfTelemetry::Increment(
+            Core::PerfTelemetry::Counter::GraphicsPipelineCompiles);
+        Core::PerfTelemetry::ScopedTimer telemetry_timer{
+            Core::PerfTelemetry::TimeMetric::GraphicsPipelineCompile};
         DebugState.BeginShaderCompile(DebugStateType::ShaderCompileKind::GraphicsPipeline);
         SCOPE_EXIT {
             DebugState.EndShaderCompile();
@@ -404,6 +409,9 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
     }
     const auto [it, is_new] = compute_pipelines.try_emplace(compute_key);
     if (is_new) {
+        Core::PerfTelemetry::Increment(Core::PerfTelemetry::Counter::ComputePipelineCompiles);
+        Core::PerfTelemetry::ScopedTimer telemetry_timer{
+            Core::PerfTelemetry::TimeMetric::ComputePipelineCompile};
         DebugState.BeginShaderCompile(DebugStateType::ShaderCompileKind::ComputePipeline);
         SCOPE_EXIT {
             DebugState.EndShaderCompile();
@@ -660,6 +668,9 @@ bool PipelineCache::RefreshComputeKey() {
 vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::RuntimeInfo& runtime_info,
                                               const std::span<const u32>& code, size_t perm_idx,
                                               Shader::Backend::Bindings& binding) {
+    Core::PerfTelemetry::Increment(Core::PerfTelemetry::Counter::GuestShaderCompiles);
+    Core::PerfTelemetry::ScopedTimer telemetry_timer{
+        Core::PerfTelemetry::TimeMetric::GuestShaderCompile};
     DebugState.BeginShaderCompile(DebugStateType::ShaderCompileKind::GuestShader);
     SCOPE_EXIT {
         DebugState.EndShaderCompile();

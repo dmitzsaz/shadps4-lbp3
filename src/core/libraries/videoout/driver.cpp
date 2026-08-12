@@ -7,6 +7,7 @@
 #include "common/thread.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
+#include "core/performance_telemetry.h"
 #include "core/libraries/kernel/time.h"
 #include "core/libraries/videoout/driver.h"
 #include "core/libraries/videoout/videoout_error.h"
@@ -250,6 +251,7 @@ void VideoOutDriver::Flip(const Request& req) {
 
     // Update flip status.
     auto* port = req.port;
+    u32 pending_flips{};
     {
         std::unique_lock lock{port->port_mutex};
         auto& flip_status = port->flip_status;
@@ -262,6 +264,7 @@ void VideoOutDriver::Flip(const Request& req) {
             --flip_status.gc_queue_num;
         }
         --flip_status.flip_pending_num;
+        pending_flips = flip_status.flip_pending_num;
     }
 
     // Trigger flip events for the port.
@@ -284,6 +287,15 @@ void VideoOutDriver::Flip(const Request& req) {
     // save to prev buf index
     port->prev_index = req.index;
 
+    u32 request_depth{};
+    {
+        std::scoped_lock lock{mutex};
+        request_depth = static_cast<u32>(requests.size());
+    }
+    const auto [game_width, game_height] = DebugState.game_resolution;
+    const auto [output_width, output_height] = DebugState.output_resolution;
+    Core::PerfTelemetry::RecordFrame(pending_flips, request_depth, game_width, game_height,
+                                     output_width, output_height);
 }
 
 void VideoOutDriver::DrawBlankFrame() {

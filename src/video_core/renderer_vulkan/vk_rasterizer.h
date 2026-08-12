@@ -66,6 +66,10 @@ public:
     void UnmapMemory(VAddr addr, u64 size);
 
     void CpSync();
+    void PrepareGuestFence();
+    [[nodiscard]] bool UsesLbp3PreemptiveReadbacks() const noexcept {
+        return buffer_cache.UsesLbp3PreemptiveReadbacks();
+    }
     u64 Flush();
     void Finish();
     void OnSubmit();
@@ -98,7 +102,6 @@ private:
     void UpdateColorBlendingState(const GraphicsPipeline* pipeline) const;
 
     bool FilterDraw();
-
     void BindBuffers(const Shader::Info& stage, Shader::Backend::Bindings& binding,
                      Shader::PushData& push_data);
     void BindTextures(const Shader::Info& stage, Shader::Backend::Bindings& binding);

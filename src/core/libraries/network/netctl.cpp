@@ -15,6 +15,7 @@
 #include <common/singleton.h>
 #include "common/logging/log.h"
 #include "core/emulator_settings.h"
+#include "core/lbp3_online.h"
 #include "core/libraries/error_codes.h"
 #include "core/libraries/libs.h"
 #include "core/libraries/network/net_ctl_codes.h"
@@ -166,8 +167,12 @@ int PS4_SYSV_ABI sceNetCtlGetIfStat() {
 
 int PS4_SYSV_ABI sceNetCtlGetInfo(int code, OrbisNetCtlInfo* info) {
     LOG_DEBUG(Lib_NetCtl, "code = {}", code);
-    if (!EmulatorSettings.IsConnectedToNetwork()) {
+    const bool lbp3_loopback = Core::Lbp3Online::IsSupportedTitle();
+    if (!EmulatorSettings.IsConnectedToNetwork() && !lbp3_loopback) {
         return ORBIS_NET_CTL_ERROR_NOT_CONNECTED;
+    }
+    if (info == nullptr) {
+        return ORBIS_NET_CTL_ERROR_INVALID_ADDR;
     }
 
     auto* netinfo = Common::Singleton<NetUtil::NetUtilInternal>::Instance();
@@ -184,10 +189,13 @@ int PS4_SYSV_ABI sceNetCtlGetInfo(int code, OrbisNetCtlInfo* info) {
         info->mtu = 1500; // default value
         break;
     case ORBIS_NET_CTL_INFO_LINK:
-        info->link = EmulatorSettings.IsConnectedToNetwork() ? ORBIS_NET_CTL_LINK_CONNECTED
-                                                             : ORBIS_NET_CTL_LINK_DISCONNECTED;
+        info->link = ORBIS_NET_CTL_LINK_CONNECTED;
         break;
     case ORBIS_NET_CTL_INFO_IP_ADDRESS: {
+        if (lbp3_loopback && !EmulatorSettings.IsConnectedToNetwork()) {
+            strcpy(info->ip_address, "127.0.0.1");
+            break;
+        }
         strcpy(info->ip_address,
                "127.0.0.1"); // placeholder in case ip retrieval failed
         auto success = netinfo->RetrieveIp();
@@ -199,6 +207,10 @@ int PS4_SYSV_ABI sceNetCtlGetInfo(int code, OrbisNetCtlInfo* info) {
         break;
     }
     case ORBIS_NET_CTL_INFO_NETMASK: {
+        if (lbp3_loopback && !EmulatorSettings.IsConnectedToNetwork()) {
+            strcpy(info->netmask, "255.0.0.0");
+            break;
+        }
         auto success = netinfo->RetrieveNetmask();
         if (success) {
             strncpy(info->netmask, netinfo->GetNetmask().data(), sizeof(info->netmask));
@@ -209,6 +221,10 @@ int PS4_SYSV_ABI sceNetCtlGetInfo(int code, OrbisNetCtlInfo* info) {
         break;
     }
     case ORBIS_NET_CTL_INFO_DEFAULT_ROUTE: {
+        if (lbp3_loopback && !EmulatorSettings.IsConnectedToNetwork()) {
+            strcpy(info->default_route, "127.0.0.1");
+            break;
+        }
         auto success = netinfo->RetrieveDefaultGateway();
         if (success) {
             strncpy(info->default_route, netinfo->GetDefaultGateway().data(),
@@ -224,11 +240,11 @@ int PS4_SYSV_ABI sceNetCtlGetInfo(int code, OrbisNetCtlInfo* info) {
         LOG_DEBUG(Lib_NetCtl, "http proxy config: {}", info->http_proxy_config);
         break;
     case ORBIS_NET_CTL_INFO_PRIMARY_DNS:
-        strcpy(info->primary_dns, "1.1.1.1");
+        strcpy(info->primary_dns, lbp3_loopback ? "127.0.0.1" : "1.1.1.1");
         LOG_DEBUG(Lib_NetCtl, "http primary dns: {}", info->primary_dns);
         break;
     case ORBIS_NET_CTL_INFO_SECONDARY_DNS:
-        strcpy(info->secondary_dns, "1.1.1.1");
+        strcpy(info->secondary_dns, lbp3_loopback ? "127.0.0.1" : "1.1.1.1");
         LOG_DEBUG(Lib_NetCtl, "http secondary dns: {}", info->secondary_dns);
         break;
     case ORBIS_NET_CTL_INFO_HTTP_PROXY_SERVER:
@@ -268,6 +284,21 @@ int PS4_SYSV_ABI sceNetCtlGetNatInfo(OrbisNetCtlNatInfo* nat_info) {
     }
     if (nat_info->size != sizeof(OrbisNetCtlNatInfo)) {
         return ORBIS_NET_CTL_ERROR_INVALID_SIZE;
+    }
+
+    // The LBP3 helper owns reachability and NAT traversal outside the emulated guest. The
+    // generic NetUtil value remains zero until shadNet has completed a real STUN exchange;
+    // LBP3 interprets that zero as "test still pending" and stalls its post-announce bootstrap
+    // in state 16 until a long timeout. Report a completed type-2 result for the isolated helper
+    // link so the title can proceed to network_settings.nws. This is deliberately scoped to the
+    // explicit --lbp3-online mode/title gate.
+    if (Core::Lbp3Online::IsSupportedTitle()) {
+        nat_info->stun_status = 1;
+        nat_info->nat_type = 2;
+        nat_info->mapped_addr = inet_addr("127.0.0.1");
+        LOG_CRITICAL(Lib_NetCtl,
+                     "LBP3 helper NAT result: stun_status=1 nat_type=2 mapped_addr=127.0.0.1");
+        return ORBIS_OK;
     }
 
     auto* netinfo = Common::Singleton<NetUtil::NetUtilInternal>::Instance();

@@ -8,9 +8,11 @@
 #include "common/singleton.h"
 #include "core/libraries/error_codes.h"
 #include "core/libraries/libs.h"
+#include "core/libraries/network/lbp3_online_bridge.h"
 #include "core/libraries/network/net.h"
 #include "core/libraries/network/net_util.h"
 #include "core/libraries/network/netctl.h"
+#include "core/libraries/network/sockets.h"
 #include "core/libraries/np/np_common.h"
 #include "core/libraries/np/np_handler.h"
 #include "core/libraries/np/np_manager.h"
@@ -57,6 +59,23 @@ s32 PS4_SYSV_ABI sceNpSignalingInitialize(s64 memorySize, s32 threadPriority, s3
     const s32 heap_rc = Helpers::InitSignalingHeap(memorySize);
     if (heap_rc < 0) {
         return heap_rc;
+    }
+
+    if (Net::Lbp3OnlineBridge::IsSupportedTitle()) {
+        Stubs::SetTransportHooks({
+            .signaling_send = Net::P2PSignalingSendTo,
+            .signaling_recv = Net::P2PSignalingRecvFrom,
+            .control_send = Net::P2PControlSendTo,
+            .control_recv = Net::P2PControlRecvFrom,
+            .transport_ready = Net::P2PTransportIsReady,
+            .configured_port = Net::GetP2PConfiguredPort,
+            .advertised_addr = Net::GetP2PAdvertisedAddr,
+            .ensure_transport = Net::EnsureP2PTransport,
+        });
+        Stubs::SetPeerResolver(Net::P2PResolvePeer);
+        Stubs::SetMatching2Enabled(false);
+        Stubs::SetMmServerEndpoint(0, 0);
+        LOG_INFO(Lib_NpSignaling, "Installed CUSA00063 helper transport without Matching2");
     }
 
     RegisterRuntimeHooks();

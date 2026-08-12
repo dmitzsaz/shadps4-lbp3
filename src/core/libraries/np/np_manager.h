@@ -113,6 +113,10 @@ s32 PS4_SYSV_ABI sceNpGetNpId(Libraries::UserService::OrbisUserServiceUserId use
                               OrbisNpId* np_id);
 s32 PS4_SYSV_ABI sceNpGetOnlineId(Libraries::UserService::OrbisUserServiceUserId user_id,
                                   OrbisNpOnlineId* online_id);
+s32 PS4_SYSV_ABI sceNpGetState(Libraries::UserService::OrbisUserServiceUserId user_id,
+                               OrbisNpState* state);
+s32 PS4_SYSV_ABI sceNpGetUserIdByOnlineId(
+    const OrbisNpOnlineId* online_id, Libraries::UserService::OrbisUserServiceUserId* user_id);
 s32 PS4_SYSV_ABI sceNpCheckNpAvailabilityA(s32 req_id,
                                            Libraries::UserService::OrbisUserServiceUserId user_id);
 s32 PS4_SYSV_ABI sceNpGetAccountLanguageA(s32 req_id,
@@ -121,5 +125,7 @@ s32 PS4_SYSV_ABI sceNpGetAccountLanguageA(s32 req_id,
 s32 PS4_SYSV_ABI
 sceNpGetParentalControlInfoA(s32 req_id, Libraries::UserService::OrbisUserServiceUserId user_id,
                              s8* age, OrbisNpParentalControlInfo* info);
+s32 PS4_SYSV_ABI sceNpLookupCreateTitleCtx(const OrbisNpId* self_np_id);
+s32 PS4_SYSV_ABI sceNpLookupDeleteTitleCtx(s32 title_ctx_id);
 void RegisterLib(Core::Loader::SymbolsResolver* sym);
 } // namespace Libraries::Np::NpManager

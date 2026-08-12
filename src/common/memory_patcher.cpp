@@ -15,6 +15,7 @@
 #include "common/path_util.h"
 #include "core/emulator_state.h"
 #include "core/file_format/psf.h"
+#include "core/performance_telemetry.h"
 #include "memory_patcher.h"
 
 namespace MemoryPatcher {
@@ -343,6 +344,9 @@ void ApplyPatchesFromXML(std::filesystem::path path) {
 }
 
 void OnGameLoaded() {
+    if (Core::PerfTelemetry::IsStartRequested()) {
+        Core::PerfTelemetry::Start();
+    }
     ApplyBuiltInLbp3PerformancePatches();
 
     std::filesystem::path patch_dir = Common::FS::GetUserPath(Common::FS::PathType::PatchesDir);

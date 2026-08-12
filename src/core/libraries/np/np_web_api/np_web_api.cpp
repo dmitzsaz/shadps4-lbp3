@@ -318,9 +318,23 @@ s32 PS4_SYSV_ABI sceNpWebApiGetConnectionStats(s32 userCtxId, const char* pApiGr
     return ORBIS_OK;
 }
 
-s32 PS4_SYSV_ABI sceNpWebApiGetErrorCode() {
-    const s32 code = getLastWebApiError();
-    LOG_INFO(Lib_NpWebApi, "called, lastErrorCode = {:#x}", code);
+s32 PS4_SYSV_ABI sceNpWebApiGetErrorCode(s32 httpStatusCode, const void* responseData,
+                                         u64 responseDataSize) {
+    // The native ABI takes the HTTP status and the response body.  The old no-argument
+    // implementation happened to compile, but read an unrelated thread-local error instead of
+    // the values LBP3 placed in rdi/rsi/rdx.  In particular, a successful session response could
+    // therefore be reported as a stale WebApi failure to the title's online state machine.
+    //
+    // Sony WebApi treats every 2xx status as success.  For an actual HTTP error retain the parsed
+    // server code captured while the response body was read; if the body contains no WebApi code,
+    // returning ORBIS_OK matches the behavior of the public LBP3 server plugin implementation and
+    // lets the title handle the HTTP status itself.
+    const s32 code =
+        (httpStatusCode >= 200 && httpStatusCode < 300) ? ORBIS_OK : getLastWebApiError();
+    LOG_CRITICAL(Lib_NpWebApi,
+                 "sceNpWebApiGetErrorCode: http_status={} response_data={} response_size={} -> "
+                 "{:#x}",
+                 httpStatusCode, fmt::ptr(responseData), responseDataSize, code);
     return code;
 }
 

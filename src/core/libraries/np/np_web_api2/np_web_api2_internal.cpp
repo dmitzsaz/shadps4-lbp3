@@ -3,9 +3,11 @@
 
 #include "common/logging/log.h"
 #include "core/emulator_settings.h"
+#include "core/lbp3_online.h"
 #include "core/libraries/kernel/time.h"
 #include "core/libraries/network/http2.h"
 #include "core/libraries/np/np_error.h"
+#include "core/libraries/np/np_manager.h"
 #include "core/libraries/np/np_types.h"
 #include "core/libraries/np/np_web_api2/np_web_api2_context.h"
 #include "core/libraries/np/np_web_api2/np_web_api2_internal.h"
@@ -663,8 +665,11 @@ s32 sendRequest(s64 request_id, s32 part_index, void* data, u64 data_size,
         return result;
     }
 
-    if (!EmulatorSettings.IsShadNetEnabled()) {
-        LOG_INFO(Lib_NpWebApi2, "Cannot send request, you are not signed in to shadNet");
+    NpManager::OrbisNpState np_state = NpManager::OrbisNpState::Unknown;
+    const s32 np_state_result = NpManager::sceNpGetState(user_ctx->GetUserId(), &np_state);
+    if (np_state_result < ORBIS_OK || np_state != NpManager::OrbisNpState::SignedIn) {
+        LOG_INFO(Lib_NpWebApi2, "Cannot send request, NP user {} is not signed in",
+                 user_ctx->GetUserId());
         request->RemoveUser();
         user_ctx->RemoveUser();
         lib_ctx->RemoveUser();
@@ -672,7 +677,9 @@ s32 sendRequest(s64 request_id, s32 part_index, void* data, u64 data_size,
     }
 
     if (request->GetHttpRequestId() == 0) {
-        std::string base_url = EmulatorSettings.GetShadNetWebApiServer();
+        const std::string base_url = Core::Lbp3Online::IsSupportedTitle()
+                                         ? "http://127.0.0.1:18063"
+                                         : EmulatorSettings.GetShadNetWebApiServer();
         s32 template_id = user_ctx->GetHttpTemplateId();
         // Technically this should be base_url + api_group + path,
         // but shadNet doesn't seem to use the api_group for endpoints?

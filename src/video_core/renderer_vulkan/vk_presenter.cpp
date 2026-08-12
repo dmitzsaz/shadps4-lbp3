@@ -9,6 +9,7 @@
 #include "core/debug_state.h"
 #include "core/devtools/layer.h"
 #include "core/emulator_settings.h"
+#include "core/performance_telemetry.h"
 #include "core/libraries/system/systemservice.h"
 #include "imgui/friends_layer.h"
 #include "imgui/invitation_prompt_layer.h"
@@ -696,6 +697,8 @@ static vk::Format GetFrameViewFormat(const Libraries::VideoOut::PixelFormat form
 
 Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& attribute,
                                VAddr cpu_address) {
+    Core::PerfTelemetry::ScopedTimer telemetry_timer{
+        Core::PerfTelemetry::TimeMetric::PrepareFrameCpu};
     auto desc = VideoCore::TextureCache::ImageDesc{attribute, cpu_address};
     const auto image_id = texture_cache.FindImage(desc);
     texture_cache.UpdateImage(image_id);
@@ -858,6 +861,8 @@ Frame* Presenter::PrepareBlankFrame(bool present_thread) {
 }
 
 void Presenter::Present(Frame* frame, bool is_reusing_frame) {
+    Core::PerfTelemetry::Increment(Core::PerfTelemetry::Counter::PresentCalls);
+    Core::PerfTelemetry::ScopedTimer telemetry_timer{Core::PerfTelemetry::TimeMetric::PresentCpu};
     // Free the frame for reuse
     const auto free_frame = [&] {
         if (!is_reusing_frame) {
@@ -1113,6 +1118,8 @@ Frame* Presenter::GetRenderFrame() {
     // Wait for free presentation frames
     Frame* frame;
     {
+        Core::PerfTelemetry::ScopedTimer telemetry_timer{
+            Core::PerfTelemetry::TimeMetric::FramePoolWait};
         std::unique_lock lock{free_mutex};
         free_cv.wait(lock, [this] { return !free_queue.empty(); });
         LOG_DEBUG(Render_Vulkan, "Got render frame, remaining {}", free_queue.size() - 1);
@@ -1130,13 +1137,17 @@ Frame* Presenter::GetRenderFrame() {
         return result;
     };
 
-    // Wait for the presentation to be finished so all frame resources are free
-    while (wait() != vk::Result::eSuccess) {
-        ASSERT_MSG(result != vk::Result::eErrorDeviceLost,
-                   "Device lost during waiting for a frame");
-        // Retry if the waiting times out
-        if (result == vk::Result::eTimeout) {
-            continue;
+    {
+        Core::PerfTelemetry::ScopedTimer telemetry_timer{
+            Core::PerfTelemetry::TimeMetric::PresentFenceWait};
+        // Wait for the presentation to be finished so all frame resources are free
+        while (wait() != vk::Result::eSuccess) {
+            ASSERT_MSG(result != vk::Result::eErrorDeviceLost,
+                       "Device lost during waiting for a frame");
+            // Retry if the waiting times out
+            if (result == vk::Result::eTimeout) {
+                continue;
+            }
         }
     }
 

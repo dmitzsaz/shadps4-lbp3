@@ -4,6 +4,7 @@
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/thread.h"
+#include "core/performance_telemetry.h"
 #include "imgui/renderer/texture_manager.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -35,6 +36,7 @@ void Scheduler::BeginRendering(const RenderState& new_state) {
     EndRendering();
     is_rendering = true;
     render_state = new_state;
+    Core::PerfTelemetry::Increment(Core::PerfTelemetry::Counter::RenderPassBegins);
 
     std::array<vk::RenderingAttachmentInfo, 8> color_attachments;
     for (u32 i = 0; i < render_state.num_color_attachments; ++i) {
@@ -88,6 +90,7 @@ void Scheduler::EndRendering() {
         return;
     }
     is_rendering = false;
+    Core::PerfTelemetry::Increment(Core::PerfTelemetry::Counter::RenderPassEnds);
     current_cmdbuf.endRendering();
 }
 
@@ -149,6 +152,8 @@ void Scheduler::AllocateWorkerCommandBuffers() {
 }
 
 void Scheduler::SubmitExecution(SubmitInfo& info) {
+    Core::PerfTelemetry::Increment(Core::PerfTelemetry::Counter::VkSubmits);
+    Core::PerfTelemetry::ScopedTimer telemetry_timer{Core::PerfTelemetry::TimeMetric::VkSubmitCpu};
     std::scoped_lock lk{submit_mutex};
     const u64 signal_value = master_semaphore.NextTick();
 

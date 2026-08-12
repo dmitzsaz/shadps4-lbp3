@@ -23,9 +23,6 @@ namespace Libraries::Np::NpMatching2 {
 
 int PS4_SYSV_ABI sceNpMatching2CreateContext(const OrbisNpMatching2CreateContextParameter* param,
                                              OrbisNpMatching2ContextId* ctxId) {
-    LOG_INFO(Lib_NpMatching2, "called, npId = {}, serviceLabel = {}, size = {}",
-             param->npId->handle.data, param->serviceLabel, param->size);
-
     if (!IsInitialized()) {
         LOG_ERROR(Lib_NpMatching2, "not initialized");
         return ORBIS_NP_MATCHING2_ERROR_NOT_INITIALIZED;
@@ -35,14 +32,14 @@ int PS4_SYSV_ABI sceNpMatching2CreateContext(const OrbisNpMatching2CreateContext
         return ORBIS_NP_MATCHING2_ERROR_INVALID_ARGUMENT;
     }
 
+    LOG_INFO(Lib_NpMatching2, "called, npId = {}, serviceLabel = {}, size = {}",
+             param->npId->handle.data, param->serviceLabel, param->size);
+
     return ContextManager::Instance().CreateContext(param->npId, param->serviceLabel, ctxId);
 }
 
 int PS4_SYSV_ABI sceNpMatching2CreateContextA(const OrbisNpMatching2CreateContextParameterA* param,
                                               OrbisNpMatching2ContextId* ctxId) {
-    LOG_INFO(Lib_NpMatching2, "called, userId = {}, serviceLabel = {}, size = {}", param->userId,
-             param->serviceLabel, param->size);
-
     if (!IsInitialized()) {
         LOG_ERROR(Lib_NpMatching2, "not initialized");
         return ORBIS_NP_MATCHING2_ERROR_NOT_INITIALIZED;
@@ -52,8 +49,15 @@ int PS4_SYSV_ABI sceNpMatching2CreateContextA(const OrbisNpMatching2CreateContex
         return ORBIS_NP_MATCHING2_ERROR_INVALID_ARGUMENT;
     }
 
-    const Libraries::Np::OrbisNpId np_id =
-        Libraries::Np::NpHandler::GetInstance().GetNpId(param->userId);
+    LOG_INFO(Lib_NpMatching2, "called, userId = {}, serviceLabel = {}, size = {}", param->userId,
+             param->serviceLabel, param->size);
+
+    Libraries::Np::OrbisNpId np_id{};
+    if (Libraries::Np::NpManager::sceNpGetNpId(param->userId, &np_id) != ORBIS_OK) {
+        // Keep normal shadNet behavior unchanged while allowing the LBP3 helper identity
+        // to flow through Matching2's user-id based context API.
+        np_id = Libraries::Np::NpHandler::GetInstance().GetNpId(param->userId);
+    }
 
     return ContextManager::Instance().CreateContext(&np_id, param->serviceLabel, ctxId, true);
 }
