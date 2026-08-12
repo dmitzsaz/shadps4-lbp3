@@ -10,6 +10,7 @@
 #include "core/libraries/network/lbp3_online_bridge.h"
 #include "core/libraries/np/np_auth.h"
 #include "core/libraries/np/np_error.h"
+#include "core/libraries/np/np_manager.h"
 #include "core/libraries/system/userservice.h"
 
 namespace Libraries::Np::NpAuth {
@@ -36,6 +37,7 @@ static std::vector<NpAuthRequest> g_auth_requests;
 
 static bool IsLbp3HelperAuthAvailable() {
     return Core::Lbp3Online::IsSupportedTitle() &&
+           Libraries::Np::NpManager::IsLbp3HelperSignedInVisible() &&
            Libraries::Net::Lbp3OnlineBridge::EnsureConnected();
 }
 

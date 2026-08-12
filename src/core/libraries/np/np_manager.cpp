@@ -14,6 +14,7 @@
 #include "common/logging/log.h"
 #include "common/memory_patcher.h"
 #include "core/emulator_settings.h"
+#include "core/lbp3_online.h"
 #include "core/libraries/error_codes.h"
 #include "core/libraries/kernel/process.h"
 #include "core/libraries/libs.h"
@@ -85,6 +86,7 @@ struct NpRequest {
     NpRequestState state;
     bool async;
     s32 result;
+    bool parental_control;
 };
 
 static void FillCountryCodeFromProfile(Libraries::UserService::OrbisUserServiceUserId user_id,
@@ -146,8 +148,8 @@ static void FillDateOfBirthFromProfile(Libraries::UserService::OrbisUserServiceU
     out->day = ok ? static_cast<u16>(d) : 1;
 }
 
-static bool GetLbp3HelperOnlineId(Libraries::UserService::OrbisUserServiceUserId user_id,
-                                  std::string* online_id) {
+static bool GetLbp3HelperOnlineIdRaw(Libraries::UserService::OrbisUserServiceUserId user_id,
+                                     std::string* online_id) {
     if (online_id == nullptr || !Net::Lbp3OnlineBridge::IsSupportedTitle()) {
         return false;
     }
@@ -157,6 +159,20 @@ static bool GetLbp3HelperOnlineId(Libraries::UserService::OrbisUserServiceUserId
     }
     *online_id = Net::Lbp3OnlineBridge::OnlineId();
     return !online_id->empty();
+}
+
+bool IsLbp3HelperSignedInVisible() {
+    // The helper identity is a valid local NP session as soon as the bridge is connected.
+    // Legacy callback delivery may still be deferred until LBP3's presentation owner is ready,
+    // but sceNpGetState/GetNpId/NpAuth must not transiently report SIGNED_OUT in the meantime.
+    // Parental-control initialization is now handled independently and no longer requires this
+    // old visibility gate.
+    return true;
+}
+
+static bool GetLbp3HelperOnlineId(Libraries::UserService::OrbisUserServiceUserId user_id,
+                                  std::string* online_id) {
+    return IsLbp3HelperSignedInVisible() && GetLbp3HelperOnlineIdRaw(user_id, online_id);
 }
 
 static bool IsLbp3HelperAvailable(Libraries::UserService::OrbisUserServiceUserId user_id) {
@@ -220,6 +236,7 @@ static s32 CreateNpRequest(bool async) {
             // There is no request at this index, set the index to ready then break.
             g_requests[req_index].state = NpRequestState::Ready;
             g_requests[req_index].async = async;
+            g_requests[req_index].parental_control = false;
             break;
         }
         req_index++;
@@ -227,7 +244,7 @@ static s32 CreateNpRequest(bool async) {
 
     if (req_index == static_cast<s32>(g_requests.size())) {
         // There are no requests to replace.
-        NpRequest new_request{NpRequestState::Ready, async, 0};
+        NpRequest new_request{NpRequestState::Ready, async, 0, false};
         g_requests.emplace_back(new_request);
     }
 
@@ -273,6 +290,32 @@ static s32 CompleteRequest(NpRequest& req, s32 result) {
         return ORBIS_OK;
     }
     return result;
+}
+
+static s32 CompleteUnrestrictedAdultParentalControlRequest(
+    s32 req_id, s8* age, OrbisNpParentalControlInfo* info) {
+    std::scoped_lock lk{g_request_mutex};
+    s32 err;
+    NpRequest* req = GetRequest(req_id, &err);
+    if (req == nullptr) {
+        LOG_CRITICAL(Lib_NpManager,
+                     "LBP3 parental control rejected: req_id={:#x}, request_error={:#x}", req_id,
+                     static_cast<u32>(err));
+        return err;
+    }
+
+    req->parental_control = true;
+    *age = 30;
+    *info = {
+        .content_restriction = false,
+        .chat_restriction = false,
+        .user_generated_content_restriction = false,
+    };
+    LOG_CRITICAL(Lib_NpManager,
+                 "LBP3 parental control completed: req_id={:#x}, async={}, result=0x0, age={}, "
+                 "content=0, chat=0, ugc=0",
+                 req_id, req->async, *age);
+    return CompleteRequest(*req, ORBIS_OK);
 }
 
 s32 PS4_SYSV_ABI sceNpCreateRequest() {
@@ -450,6 +493,14 @@ s32 PS4_SYSV_ABI sceNpGetParentalControlInfo(s32 req_id, OrbisNpOnlineId* online
     if (online_id == nullptr || age == nullptr || info == nullptr) {
         return ORBIS_NP_ERROR_INVALID_ARGUMENT;
     }
+
+    // The local online mode emulates an unrestricted adult PSN account.  This must be keyed to
+    // the explicit mode rather than title metadata or helper readiness: LBP3 performs this lookup
+    // early and may use the Online ID it cached before the helper identity was installed.
+    if (Core::Lbp3Online::IsEnabled()) {
+        return CompleteUnrestrictedAdultParentalControlRequest(req_id, age, info);
+    }
+
     s32 user_id = FindLbp3HelperUserByOnlineId(*online_id);
     if (user_id == -1) {
         user_id = Libraries::Np::NpHandler::GetInstance().GetUserIdByOnlineId(*online_id);
@@ -466,6 +517,9 @@ sceNpGetParentalControlInfoA(s32 req_id, Libraries::UserService::OrbisUserServic
     if (age == nullptr || info == nullptr ||
         user_id == Libraries::UserService::ORBIS_USER_SERVICE_USER_ID_INVALID) {
         return ORBIS_NP_ERROR_INVALID_ARGUMENT;
+    }
+    if (Core::Lbp3Online::IsEnabled()) {
+        return CompleteUnrestrictedAdultParentalControlRequest(req_id, age, info);
     }
     std::scoped_lock lk{g_request_mutex};
     s32 err;
@@ -556,6 +610,11 @@ s32 PS4_SYSV_ABI sceNpWaitAsync(s32 req_id, s32* result) {
     // Since we're not actually performing any sort of network request here,
     // we can just set result based on the request and return.
     *result = g_requests[req_index].result;
+    if (g_requests[req_index].parental_control) {
+        LOG_CRITICAL(Lib_NpManager,
+                     "LBP3 parental control waited: req_id={:#x}, state={}, result={:#x}", req_id,
+                     static_cast<u32>(g_requests[req_index].state), static_cast<u32>(*result));
+    }
     LOG_WARNING(Lib_NpManager, "called req_id = {:#x}, returning result = {:#x}", req_id,
                 static_cast<u32>(*result));
     return ORBIS_OK;
@@ -582,6 +641,11 @@ s32 PS4_SYSV_ABI sceNpPollAsync(s32 req_id, s32* result) {
     // Since we're not actually performing any sort of network request here,
     // we can just set result based on the request and return.
     *result = g_requests[req_index].result;
+    if (g_requests[req_index].parental_control) {
+        LOG_CRITICAL(Lib_NpManager,
+                     "LBP3 parental control polled: req_id={:#x}, state={}, result={:#x}", req_id,
+                     static_cast<u32>(g_requests[req_index].state), static_cast<u32>(*result));
+    }
     LOG_WARNING(Lib_NpManager, "called req_id = {:#x}, returning result = {:#x}", req_id,
                 static_cast<u32>(*result));
     return ORBIS_OK;
@@ -599,6 +663,12 @@ s32 PS4_SYSV_ABI sceNpDeleteRequest(s32 req_id) {
         return ORBIS_NP_ERROR_REQUEST_NOT_FOUND;
     }
 
+    if (g_requests[req_index].parental_control) {
+        LOG_CRITICAL(Lib_NpManager,
+                     "LBP3 parental control deleted: req_id={:#x}, state={}, result={:#x}", req_id,
+                     static_cast<u32>(g_requests[req_index].state),
+                     static_cast<u32>(g_requests[req_index].result));
+    }
     g_active_requests--;
     g_requests[req_index].state = NpRequestState::None;
     return ORBIS_OK;
@@ -836,8 +906,18 @@ s32 PS4_SYSV_ABI sceNpGetState(Libraries::UserService::OrbisUserServiceUserId us
     }
     if (IsLbp3HelperAvailable(user_id)) {
         *state = OrbisNpState::SignedIn;
-        LOG_DEBUG(Lib_NpManager, "LBP3 helper connected, local NP state=SignedIn");
+        LOG_DEBUG(Lib_NpManager, "LBP3 helper connected, local NP state={}",
+                  "SignedIn");
         return ORBIS_OK;
+    }
+    if (Net::Lbp3OnlineBridge::IsSupportedTitle()) {
+        std::string helper_online_id;
+        if (GetLbp3HelperOnlineIdRaw(user_id, &helper_online_id)) {
+            *state = OrbisNpState::SignedOut;
+            LOG_DEBUG(Lib_NpManager,
+                      "LBP3 helper connected, local NP state=SignedOut (callback edge pending)");
+            return ORBIS_OK;
+        }
     }
     if (!g_shadnet_enabled) {
         *state = OrbisNpState::SignedOut;
@@ -1071,7 +1151,7 @@ static void QueueNpStateEvent(Libraries::UserService::OrbisUserServiceUserId use
     event.has_np_id = state == OrbisNpState::SignedIn;
     if (event.has_np_id) {
         std::string helper_online_id;
-        if (GetLbp3HelperOnlineId(user_id, &helper_online_id)) {
+        if (GetLbp3HelperOnlineIdRaw(user_id, &helper_online_id)) {
             SetNpId(event.np_id, helper_online_id);
         } else {
             // NpId is built from the user's shadnet_npid at login; GetNpId returns by value.
@@ -1095,7 +1175,7 @@ static void EnsureLbp3HelperSignedInSticky(const char* reason) {
             continue;
         }
         std::string helper_online_id;
-        if (!GetLbp3HelperOnlineId(user->user_id, &helper_online_id)) {
+        if (!GetLbp3HelperOnlineIdRaw(user->user_id, &helper_online_id)) {
             continue;
         }
 
@@ -1140,8 +1220,9 @@ static void LogStickySignedInReplay(const char* callback_kind) {
 void NotifyNpStateFromUserServiceEvent(Libraries::UserService::OrbisUserServiceEventType event_type,
                                        Libraries::UserService::OrbisUserServiceUserId user_id) {
     switch (event_type) {
-    case Libraries::UserService::OrbisUserServiceEventType::Login:
-        if (IsLbp3HelperAvailable(user_id)) {
+    case Libraries::UserService::OrbisUserServiceEventType::Login: {
+        std::string helper_online_id;
+        if (GetLbp3HelperOnlineIdRaw(user_id, &helper_online_id)) {
             QueueNpStateEvent(user_id, OrbisNpState::SignedIn);
             LOG_INFO(Lib_NpManager, "LBP3 helper queued initial SignedIn for user_id={}", user_id);
         } else if (g_shadnet_enabled) {
@@ -1154,6 +1235,7 @@ void NotifyNpStateFromUserServiceEvent(Libraries::UserService::OrbisUserServiceE
                      user_id);
         }
         break;
+    }
     case Libraries::UserService::OrbisUserServiceEventType::Logout:
         if (Net::Lbp3OnlineBridge::IsSupportedTitle()) {
             QueueNpStateEvent(user_id, OrbisNpState::SignedOut);

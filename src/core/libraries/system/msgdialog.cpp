@@ -75,6 +75,13 @@ Error PS4_SYSV_ABI sceMsgDialogOpen(const OrbisParam* param) {
         return Error::ARG_NULL;
     }
     LOG_DEBUG(Lib_MsgDlg, "called param->mode: {}", magic_enum::enum_name(param->mode));
+    if (param->mode == MsgDialogMode::SYSTEM_MSG && param->sysMsgParam != nullptr) {
+        LOG_CRITICAL(Lib_MsgDlg,
+                     "system message opened: type={} caller={} user_id={} param={} sys_param={}",
+                     static_cast<u32>(param->sysMsgParam->sysMsgType),
+                     __builtin_return_address(0), param->userId, fmt::ptr(param),
+                     fmt::ptr(param->sysMsgParam));
+    }
     ASSERT(param->size == sizeof(OrbisParam));
     ASSERT(param->baseParam.size == sizeof(CommonDialog::BaseParam));
     g_result = {};
