@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
@@ -14,13 +15,22 @@
 #include <thread>
 #include <vector>
 
+#include <nlohmann/json.hpp>
+
 #ifndef _WIN32
 #include <fcntl.h>
 #endif
 
+#include "common/arch.h"
 #include "common/logging/log.h"
+#include "common/memory_patcher.h"
 #include "core/lbp3_online.h"
 #include "sockets.h"
+
+#if __has_include(<httplib.h>)
+#include <httplib.h>
+#define LBP3_BRIDGE_WITH_HTTPLIB 1
+#endif
 
 namespace Libraries::Net::Lbp3OnlineBridge {
 
@@ -41,6 +51,19 @@ constexpr u16 DefaultHelperPort = 46973;
 constexpr auto HelloInterval = std::chrono::seconds(2);
 constexpr auto HelloAckTimeout = std::chrono::seconds(6);
 
+// Guest virtual addresses for CUSA00063 01.26; they exclude the SELF file bias (0x4000).
+constexpr uintptr_t MatchingDispatcherOffset = 0x338cc0;
+constexpr uintptr_t FindBestRoomBuilderOffset = 0x33a830;
+constexpr uintptr_t VectorPushU64Offset = 0xb04e70;
+constexpr uintptr_t OnlineManagerOffset = 0x130d6b8;
+constexpr uintptr_t MatchingObjectPointerOffset = 0x20;
+constexpr uintptr_t MatchingQueueOffset = 0x230;
+constexpr uintptr_t MatchingQueueSizeOffset = 0x238;
+constexpr uintptr_t MatchingQueueCapacityOffset = 0x23c;
+constexpr uintptr_t MatchingActiveStateOffset = 0x30;
+constexpr uintptr_t MatchingBlockingStateOffset = 0x110;
+constexpr u64 FindBestRoomSelector = 4;
+
 #ifdef _WIN32
 constexpr net_socket InvalidSocket = INVALID_SOCKET;
 #else
@@ -58,6 +81,7 @@ struct Frame {
 
 struct BridgeState {
     std::mutex mutex;
+    std::mutex find_best_room_mutex;
     net_socket socket{InvalidSocket};
     sockaddr_in helper{};
     bool endpoint_configured{};
@@ -67,6 +91,13 @@ struct BridgeState {
     Clock::time_point last_hello{};
     Clock::time_point last_hello_ack{};
     std::array<std::deque<Frame>, 3> queues;
+    std::atomic_bool update_my_player_data_seen{false};
+    std::atomic_bool find_best_room_queued{false};
+    std::atomic_bool find_best_room_signatures_rejected{false};
+    Clock::time_point helper_roster_last_check{};
+    Clock::time_point helper_roster_first_seen{};
+    bool helper_roster_requests_join{};
+    std::string helper_roster_local_online_id;
 
     ~BridgeState() {
 #ifdef _WIN32
@@ -483,6 +514,150 @@ bool ResolvePeer(std::string_view online_id, u32* out_addr, u16* out_port) {
     *out_addr = VirtualAddrForOnlineId(online_id);
     *out_port = ConfiguredPort();
     return true;
+}
+
+void ObserveMatchingRequest(std::string_view body) {
+    if (!IsSupportedTitle()) {
+        return;
+    }
+    if (body.contains("UpdateMyPlayerData") || body.contains("CreateRoom") ||
+        body.contains("UpdatePlayersInRoom")) {
+        State().update_my_player_data_seen.store(true, std::memory_order_release);
+    }
+}
+
+namespace {
+
+bool HasBytes(uintptr_t address, std::initializer_list<u8> expected) {
+    const auto* bytes = reinterpret_cast<const u8*>(address);
+    return std::equal(expected.begin(), expected.end(), bytes);
+}
+
+bool ValidateFindBestRoomGuestCode(uintptr_t base) {
+    return HasBytes(base + MatchingDispatcherOffset,
+                    {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56}) &&
+           HasBytes(base + MatchingDispatcherOffset + 0x18a,
+                    {0x49, 0x8b, 0xbc, 0x24, 0x30, 0x02, 0x00, 0x00, 0x8b, 0x1f}) &&
+           HasBytes(base + FindBestRoomBuilderOffset,
+                    {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55}) &&
+           HasBytes(base + VectorPushU64Offset,
+                    {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x54, 0x53});
+}
+
+bool HelperRosterRequestsJoin(const std::string& local_online_id) {
+#ifndef LBP3_BRIDGE_WITH_HTTPLIB
+    return false;
+#else
+    httplib::Client client("http://127.0.0.1:18063");
+    client.set_connection_timeout(std::chrono::milliseconds(50));
+    client.set_read_timeout(std::chrono::milliseconds(100));
+    client.set_write_timeout(std::chrono::milliseconds(100));
+    const auto response = client.Get("/status");
+    if (!response || response->status != 200) {
+        return false;
+    }
+
+    try {
+        const auto status = nlohmann::json::parse(response->body);
+        if (status.value("role", std::string{}) != "member") {
+            return false;
+        }
+        const auto& roster = status.at("roster");
+        if (!roster.is_array() || roster.size() < 2 || !roster.front().is_string() ||
+            roster.front().get<std::string>() == local_online_id) {
+            return false;
+        }
+        return std::any_of(roster.begin(), roster.end(), [&](const auto& entry) {
+            return entry.is_string() && entry.template get<std::string>() == local_online_id;
+        });
+    } catch (const std::exception& error) {
+        LOG_WARNING(Lib_Net, "LBP3 helper /status could not arm FindBestRoom: {}", error.what());
+        return false;
+    }
+#endif
+}
+
+} // namespace
+
+void MaybeQueueFindBestRoom() {
+#if !defined(ARCH_X86_64)
+    return;
+#else
+    BridgeState& state = State();
+    if (!IsSupportedTitle() || state.find_best_room_queued.load(std::memory_order_acquire) ||
+        state.find_best_room_signatures_rejected.load(std::memory_order_relaxed)) {
+        return;
+    }
+
+    std::unique_lock join_lock{state.find_best_room_mutex, std::try_to_lock};
+    if (!join_lock.owns_lock() ||
+        state.find_best_room_queued.load(std::memory_order_acquire)) {
+        return;
+    }
+
+    const uintptr_t base = MemoryPatcher::g_eboot_address;
+    if (base == 0) {
+        return;
+    }
+    if (!ValidateFindBestRoomGuestCode(base)) {
+        if (!state.find_best_room_signatures_rejected.exchange(true)) {
+            LOG_ERROR(Lib_Net,
+                      "LBP3 FindBestRoom hook disabled: CUSA00063 01.26 guest signatures differ");
+        }
+        return;
+    }
+
+    const auto now = Clock::now();
+    constexpr auto HelperStatusInterval = std::chrono::seconds(1);
+    if (state.helper_roster_last_check.time_since_epoch().count() == 0 ||
+        now - state.helper_roster_last_check >= HelperStatusInterval) {
+        state.helper_roster_last_check = now;
+        state.helper_roster_local_online_id = OnlineId();
+        state.helper_roster_requests_join =
+            !state.helper_roster_local_online_id.empty() &&
+            HelperRosterRequestsJoin(state.helper_roster_local_online_id);
+        if (!state.helper_roster_requests_join) {
+            state.helper_roster_first_seen = {};
+        } else if (state.helper_roster_first_seen.time_since_epoch().count() == 0) {
+            state.helper_roster_first_seen = now;
+            LOG_INFO(Lib_Net, "LBP3 helper host-first member roster observed; arming FindBestRoom");
+        }
+    }
+    if (!state.helper_roster_requests_join) {
+        return;
+    }
+
+    const std::string& local_online_id = state.helper_roster_local_online_id;
+    if (!state.update_my_player_data_seen.load(std::memory_order_acquire) &&
+        now - state.helper_roster_first_seen < std::chrono::seconds(12)) {
+        return;
+    }
+
+    const uintptr_t manager = base + OnlineManagerOffset;
+    const uintptr_t matching =
+        *reinterpret_cast<const uintptr_t*>(manager + MatchingObjectPointerOffset);
+    if (matching == 0 || matching < 0x100000000ull || matching >= 0x1000000000ull ||
+        *reinterpret_cast<const u32*>(matching + MatchingActiveStateOffset) != 0 ||
+        *reinterpret_cast<const u32*>(matching + MatchingBlockingStateOffset) != 0) {
+        return;
+    }
+
+    const u32 size = *reinterpret_cast<const u32*>(matching + MatchingQueueSizeOffset);
+    const u32 capacity = *reinterpret_cast<const u32*>(matching + MatchingQueueCapacityOffset);
+    const uintptr_t data = *reinterpret_cast<const uintptr_t*>(matching + MatchingQueueOffset);
+    if (size != 0 || size > capacity || (capacity != 0 && data == 0)) {
+        return;
+    }
+
+    using PushU64 = PS4_SYSV_ABI void (*)(void*, const u64*);
+    const auto push = reinterpret_cast<PushU64>(base + VectorPushU64Offset);
+    const u64 selector = FindBestRoomSelector;
+    push(reinterpret_cast<void*>(matching + MatchingQueueOffset), &selector);
+    state.find_best_room_queued.store(true, std::memory_order_release);
+    LOG_CRITICAL(Lib_Net,
+                 "LBP3 FindBestRoom selector queued (selector={} local='{}' matching={:#x})",
+                 selector, local_online_id, matching);
+#endif
 }
 
 int Send(Channel channel, const void* data, u32 len, const Endpoint& source,

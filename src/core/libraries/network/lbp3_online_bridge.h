@@ -33,6 +33,12 @@ std::string OnlineId();
 u32 VirtualAddrForOnlineId(std::string_view online_id);
 bool ResolvePeer(std::string_view online_id, u32* out_addr, u16* out_port);
 
+// Arms the title's own FindBestRoom request after the helper has confirmed that this
+// client is a member of a host-first PartyChat roster. MaybeQueueFindBestRoom must run
+// from a guest thread; NP callback pumps provide that safe delivery point.
+void ObserveMatchingRequest(std::string_view body);
+void MaybeQueueFindBestRoom();
+
 int Send(Channel channel, const void* data, u32 len, const Endpoint& source,
          const Endpoint& destination);
 int Receive(Channel channel, void* data, u32 len, const Endpoint* local, Endpoint* source);

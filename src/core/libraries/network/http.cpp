@@ -31,6 +31,7 @@
 #include "core/libraries/kernel/process.h"
 #include "core/libraries/libs.h"
 #include "core/libraries/network/http.h"
+#include "core/libraries/network/lbp3_online_bridge.h"
 #include "http_error.h"
 
 #if __has_include(<httplib.h>)
@@ -595,33 +596,15 @@ static const HostOverrideState& GetHostOverrideState() {
 
 static bool ApplyLbp3OnlineOverride(std::string& scheme, std::string& host, u16& port,
                                     bool& is_secure) {
-    if (!Core::Lbp3Online::IsSupportedTitle()) {
+    // --lbp3-online is fail-closed from process start. An NP/WebAPI request may be created
+    // before title metadata has finished loading, so waiting for IsSupportedTitle here risks
+    // leaking an early request to a real service.
+    if (!Core::Lbp3Online::IsEnabled()) {
         return false;
     }
 
-    const bool main_host = host == "littlebigplanetps3.online.scee.com";
-    const bool auxiliary_host = host == "presence.littlebigplanetps3.online.scee.com" ||
-                                host == "live.littlebigplanetps3.online.scee.com";
-    constexpr std::string_view resource_suffix = ".littlebigplanetps3.online.scee.com";
-    const bool resource_host = [&] {
-        if (!host.ends_with(resource_suffix)) {
-            return false;
-        }
-        const std::string_view prefix{host.data(), host.size() - resource_suffix.size()};
-        if (!prefix.starts_with("res") || prefix.size() == 3) {
-            return false;
-        }
-        // LBP's resource CDN shards are hexadecimal (res0..resf), not decimal-only.
-        // In particular, archived community levels routinely request hosts such as resb.
-        return std::ranges::all_of(prefix.substr(3), [](const char c) {
-            return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') ||
-                   (c >= 'A' && c <= 'F');
-        });
-    }();
-    const bool official_http =
-        scheme == "http" && port == 10060 && (main_host || auxiliary_host || resource_host);
-    const bool official_https = scheme == "https" && port == 10061 && main_host;
-    if (!official_http && !official_https) {
+    // The helper is the only HTTP endpoint the emulated title may reach in this mode.
+    if (scheme == "http" && host == "127.0.0.1" && port == 18063) {
         return false;
     }
 
@@ -1021,6 +1004,24 @@ static s32 RunRealHttpRequest(const SendRequestPlan& plan_in, HttpResponse& out_
     };
 
     for (int depth = 0; depth <= MaxRedirects; ++depth) {
+        // Reapply immediately before I/O to cover absolute Location redirects and request paths
+        // that bypass connection creation. Rewrite Host too so PartyChat never receives a Sony
+        // virtual host and no redirect can escape localhost.
+        bool is_secure = plan.scheme == "https";
+        if (ApplyLbp3OnlineOverride(plan.scheme, plan.host, plan.port, is_secure)) {
+            const std::string host_value = plan.host + ":" + std::to_string(plan.port);
+            bool found_host = false;
+            for (auto& [name, value] : plan.headers) {
+                if (HeaderNameMatches(name, "Host")) {
+                    value = host_value;
+                    found_host = true;
+                }
+            }
+            if (!found_host) {
+                plan.headers.emplace_back("Host", host_value);
+            }
+        }
+
         if (plan.scheme == "https" && !ORBIS_HTTP_HAS_HTTPS) {
             LOG_ERROR(Lib_Http, "HTTPS request but cpp-httplib lacks OpenSSL support");
             SynthesizeTransportFailureResponse(out_res);
@@ -1850,13 +1851,18 @@ int PS4_SYSV_ABI sceHttpSendRequest(int reqId, const void* postData, u64 size) {
         if (postData && size > 0) {
             plan.body.assign(static_cast<const u8*>(postData),
                              static_cast<const u8*>(postData) + size);
+            if (plan.path.contains("/LITTLEBIGPLANETPS3_XML/match")) {
+                Net::Lbp3OnlineBridge::ObserveMatchingRequest(
+                    std::string_view{reinterpret_cast<const char*>(plan.body.data()),
+                                     plan.body.size()});
+            }
         }
     }
 
     // The explicit LBP3 helper mode is an isolated loopback network. It must
     // remain usable when external host networking is disabled in the global
     // config, but it must not grant arbitrary Internet access to the title.
-    const bool lbp3_loopback = Core::Lbp3Online::IsSupportedTitle() && plan.scheme == "http" &&
+    const bool lbp3_loopback = Core::Lbp3Online::IsEnabled() && plan.scheme == "http" &&
                                plan.host == "127.0.0.1" && plan.port == 18063;
     const bool online = EmulatorSettings.IsConnectedToNetwork() || lbp3_loopback;
     LOG_INFO(Lib_Http, "reqId={} dispatched to async worker [{} {} {}://{}:{}{}]", reqId,

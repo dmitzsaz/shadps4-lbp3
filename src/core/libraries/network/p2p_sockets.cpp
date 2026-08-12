@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <limits>
 
 #include <common/assert.h>
 #include <common/logging/log.h>
@@ -142,7 +143,13 @@ void P2PSocket::Unregister() {
 }
 
 int P2PSocket::Close() {
-    Unregister();
+    {
+        std::scoped_lock lock{p2p_registry_mutex};
+        RemoveSocketFromRegistry(this);
+        is_bound = false;
+        is_connected = false;
+        peer_addr = {};
+    }
     {
         std::scoped_lock lock{local_receive_mutex};
         is_closed = true;
@@ -229,12 +236,23 @@ int P2PSocket::SendPacket(const void* msg, u32 len, int flags, const OrbisNetSoc
     if (socket_type != ORBIS_NET_SOCK_DGRAM_P2P) {
         return inner.SendPacket(msg, len, flags, to, tolen);
     }
-    if (to == nullptr || tolen < sizeof(OrbisNetSockaddrIn) || (msg == nullptr && len != 0)) {
+    if (msg == nullptr && len != 0) {
         return SetP2PError(ORBIS_NET_EINVAL);
     }
 
     OrbisNetSockaddrIn destination_addr{};
-    std::memcpy(&destination_addr, to, sizeof(destination_addr));
+    if (to != nullptr) {
+        if (tolen < sizeof(OrbisNetSockaddrIn)) {
+            return SetP2PError(ORBIS_NET_EINVAL);
+        }
+        std::memcpy(&destination_addr, to, sizeof(destination_addr));
+    } else {
+        std::scoped_lock lock{p2p_registry_mutex};
+        if (!is_connected) {
+            return SetP2PError(ORBIS_NET_EDESTADDRREQ);
+        }
+        destination_addr = peer_addr;
+    }
     if (destination_addr.sin_family != ORBIS_NET_AF_INET) {
         return SetP2PError(ORBIS_NET_EINVAL);
     }
@@ -352,6 +370,42 @@ int P2PSocket::SendPacket(const void* msg, u32 len, int flags, const OrbisNetSoc
     return static_cast<int>(len);
 }
 
+int P2PSocket::SendMessage(const OrbisNetMsghdr* msg, int flags) {
+    if (socket_type != ORBIS_NET_SOCK_DGRAM_P2P) {
+        return inner.SendMessage(msg, flags);
+    }
+    if (msg == nullptr || msg->msg_iovlen < 0 ||
+        (msg->msg_iovlen != 0 && msg->msg_iov == nullptr)) {
+        return SetP2PError(ORBIS_NET_EINVAL);
+    }
+
+    size_t total = 0;
+    for (int i = 0; i < msg->msg_iovlen; ++i) {
+        const auto& iov = msg->msg_iov[i];
+        if (iov.iov_base == nullptr && iov.iov_len != 0) {
+            return SetP2PError(ORBIS_NET_EFAULT);
+        }
+        if (iov.iov_len > std::numeric_limits<u32>::max() - total) {
+            return SetP2PError(ORBIS_NET_EMSGSIZE);
+        }
+        total += static_cast<size_t>(iov.iov_len);
+    }
+
+    std::vector<u8> payload(total);
+    size_t cursor = 0;
+    for (int i = 0; i < msg->msg_iovlen; ++i) {
+        const auto& iov = msg->msg_iov[i];
+        if (iov.iov_len != 0) {
+            std::memcpy(payload.data() + cursor, iov.iov_base, static_cast<size_t>(iov.iov_len));
+            cursor += static_cast<size_t>(iov.iov_len);
+        }
+    }
+
+    const auto* destination = static_cast<const OrbisNetSockaddr*>(msg->msg_name);
+    return SendPacket(payload.empty() ? nullptr : payload.data(), static_cast<u32>(payload.size()),
+                      flags, destination, destination != nullptr ? msg->msg_namelen : 0);
+}
+
 int P2PSocket::ReceivePacket(void* buf, u32 len, int flags, OrbisNetSockaddr* from,
                              u32* fromlen) {
     if (socket_type != ORBIS_NET_SOCK_DGRAM_P2P) {
@@ -421,6 +475,78 @@ int P2PSocket::ReceivePacket(void* buf, u32 len, int flags, OrbisNetSockaddr* fr
     return received;
 }
 
+int P2PSocket::ReceiveMessage(OrbisNetMsghdr* msg, int flags) {
+    if (socket_type != ORBIS_NET_SOCK_DGRAM_P2P) {
+        return inner.ReceiveMessage(msg, flags);
+    }
+    if (msg == nullptr || msg->msg_iovlen < 0 ||
+        (msg->msg_iovlen != 0 && msg->msg_iov == nullptr)) {
+        return SetP2PError(ORBIS_NET_EINVAL);
+    }
+
+    size_t capacity = 0;
+    for (int i = 0; i < msg->msg_iovlen; ++i) {
+        const auto& iov = msg->msg_iov[i];
+        if (iov.iov_base == nullptr && iov.iov_len != 0) {
+            return SetP2PError(ORBIS_NET_EFAULT);
+        }
+        if (iov.iov_len > std::numeric_limits<u32>::max() - capacity) {
+            return SetP2PError(ORBIS_NET_EMSGSIZE);
+        }
+        capacity += static_cast<size_t>(iov.iov_len);
+    }
+
+    std::vector<u8> payload(capacity);
+    u32 source_len = msg->msg_name != nullptr ? msg->msg_namelen : 0;
+    const int received = ReceivePacket(
+        payload.empty() ? nullptr : payload.data(), static_cast<u32>(payload.size()), flags,
+        static_cast<OrbisNetSockaddr*>(msg->msg_name),
+        msg->msg_name != nullptr ? &source_len : nullptr);
+    if (received < 0) {
+        return received;
+    }
+    if (msg->msg_name != nullptr) {
+        msg->msg_namelen = source_len;
+    }
+    msg->msg_flags = 0;
+
+    size_t cursor = 0;
+    size_t remaining = static_cast<size_t>(received);
+    for (int i = 0; i < msg->msg_iovlen && remaining != 0; ++i) {
+        const size_t copied = std::min<size_t>(remaining, msg->msg_iov[i].iov_len);
+        if (copied != 0) {
+            std::memcpy(msg->msg_iov[i].iov_base, payload.data() + cursor, copied);
+            cursor += copied;
+            remaining -= copied;
+        }
+    }
+    return received;
+}
+
+int P2PSocket::Connect(const OrbisNetSockaddr* addr, u32 namelen) {
+    if (socket_type != ORBIS_NET_SOCK_DGRAM_P2P) {
+        return inner.Connect(addr, namelen);
+    }
+    if (addr == nullptr || namelen < sizeof(OrbisNetSockaddrIn)) {
+        return SetP2PError(ORBIS_NET_EINVAL);
+    }
+
+    OrbisNetSockaddrIn destination{};
+    std::memcpy(&destination, addr, sizeof(destination));
+    if (destination.sin_family != ORBIS_NET_AF_INET) {
+        return SetP2PError(ORBIS_NET_EAFNOSUPPORT);
+    }
+    {
+        std::scoped_lock lock{p2p_registry_mutex};
+        peer_addr = destination;
+        is_connected = true;
+    }
+    LOG_DEBUG(Lib_Net, "Connected virtual P2P datagram socket to {:#x}, port {:#x}, vport {:#x}",
+              ntohl(destination.sin_addr), ntohs(destination.sin_port),
+              ntohs(destination.sin_vport));
+    return 0;
+}
+
 int P2PSocket::GetSocketAddress(OrbisNetSockaddr* name, u32* namelen) {
     if (socket_type != ORBIS_NET_SOCK_DGRAM_P2P) {
         return inner.GetSocketAddress(name, namelen);
@@ -446,6 +572,30 @@ int P2PSocket::GetSocketAddress(OrbisNetSockaddr* name, u32* namelen) {
     *namelen = sizeof(address);
     if (available != 0) {
         std::memcpy(name, &address, std::min<u32>(available, sizeof(address)));
+    }
+    return 0;
+}
+
+int P2PSocket::GetPeerName(OrbisNetSockaddr* addr, u32* namelen) {
+    if (socket_type != ORBIS_NET_SOCK_DGRAM_P2P) {
+        return inner.GetPeerName(addr, namelen);
+    }
+    if (addr == nullptr || namelen == nullptr) {
+        return SetP2PError(ORBIS_NET_EINVAL);
+    }
+
+    OrbisNetSockaddrIn peer{};
+    {
+        std::scoped_lock lock{p2p_registry_mutex};
+        if (!is_connected) {
+            return SetP2PError(ORBIS_NET_ENOTCONN);
+        }
+        peer = peer_addr;
+    }
+    const u32 available = *namelen;
+    *namelen = sizeof(peer);
+    if (available != 0) {
+        std::memcpy(addr, &peer, std::min<u32>(available, sizeof(peer)));
     }
     return 0;
 }

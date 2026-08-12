@@ -153,6 +153,11 @@ int main(int argc, char* argv[]) {
     std::shared_ptr<EmulatorSettingsImpl> emu_settings = std::make_shared<EmulatorSettingsImpl>();
     EmulatorSettingsImpl::SetInstance(emu_settings);
     emu_settings->Load();
+    if (lbp3Online) {
+        // Helper mode is an explicit request for an isolated localhost network session.
+        // Keep the user's persistent global network setting untouched.
+        EmulatorSettings.SetConnectedToNetwork(true);
+    }
 
     // Configure logger appropriately
     Common::Log::g_should_append |= EmulatorSettings.IsLogAppend();

@@ -346,7 +346,7 @@ s32 PS4_SYSV_ABI sceNpCheckNpAvailabilityA(s32 req_id,
     if (helper_available) {
         return CompleteRequest(*req, ORBIS_OK);
     }
-    if (!g_shadnet_enabled || !Libraries::Np::NpHandler::GetInstance().IsPsnSignedIn(user_id)) {
+    if (!IsNpUserOnline(user_id)) {
         return CompleteRequest(*req, ORBIS_NP_ERROR_SIGNED_OUT);
     }
     LOG_DEBUG(Lib_NpManager, "req_id = {:#x}, user_id = {}", req_id, user_id);
@@ -1356,6 +1356,7 @@ s32 PS4_SYSV_ABI sceNpCheckCallback() {
     LOG_DEBUG(Lib_NpManager, "called");
     EnsureLbp3HelperSignedInSticky("sceNpCheckCallback");
     DispatchPendingNpStateCallbacks();
+    Net::Lbp3OnlineBridge::MaybeQueueFindBestRoom();
 
     std::scoped_lock lk{g_np_callbacks_mutex};
     for (auto& [key, cb] : g_np_callbacks) {
@@ -1368,6 +1369,7 @@ s32 PS4_SYSV_ABI sceNpCheckCallbackForLib() {
     LOG_DEBUG(Lib_NpManager, "(STUBBED) called");
     EnsureLbp3HelperSignedInSticky("sceNpCheckCallbackForLib");
     DispatchPendingNpStateCallbacks();
+    Net::Lbp3OnlineBridge::MaybeQueueFindBestRoom();
     return ORBIS_OK;
 }
 

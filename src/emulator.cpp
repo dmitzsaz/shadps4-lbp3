@@ -280,6 +280,11 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     }
 
     EmulatorSettings.Load(id);
+    if (Core::Lbp3Online::IsEnabled()) {
+        // Per-title settings are loaded after main's global settings, so restore the explicit
+        // process-local helper network override here as well.
+        EmulatorSettings.SetConnectedToNetwork(true);
+    }
     // Switch to configured log
     Common::Log::Switch((!id.empty() && EmulatorSettings.IsLogSeparate()) ? id + ".log"
                                                                           : "shad_log.txt");

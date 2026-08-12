@@ -8,6 +8,7 @@
 #include "common/error.h"
 #include "common/singleton.h"
 #include "core/file_sys/fs.h"
+#include "core/lbp3_online.h"
 #include "net_error.h"
 #include "sockets.h"
 #include "sys_net.h"
@@ -16,11 +17,44 @@ namespace Libraries::Net {
 
 using FDTable = Common::Singleton<Core::FileSys::HandleTable>;
 
+namespace {
+
+bool IsExternalAddress(const OrbisNetSockaddr* addr, u32 addrlen) {
+    if (addr == nullptr || addr->sa_family == ORBIS_NET_AF_UNIX) {
+        return false;
+    }
+    if (addr->sa_family == ORBIS_NET_AF_INET) {
+        if (addrlen < sizeof(OrbisNetSockaddrIn)) {
+            return false;
+        }
+        const auto* ipv4 = reinterpret_cast<const OrbisNetSockaddrIn*>(addr);
+        return (ntohl(ipv4->sin_addr) & 0xff000000u) != 0x7f000000u;
+    }
+    return addr->sa_family == ORBIS_NET_AF_INET6;
+}
+
+bool RejectExternalLbp3Socket(const Socket& socket, const OrbisNetSockaddr* addr, u32 addrlen,
+                              std::string_view action) {
+    const bool bridged_p2p = socket.socket_type == ORBIS_NET_SOCK_DGRAM_P2P ||
+                             socket.socket_type == ORBIS_NET_SOCK_STREAM_P2P;
+    if (!Core::Lbp3Online::IsEnabled() || bridged_p2p || !IsExternalAddress(addr, addrlen)) {
+        return false;
+    }
+    *Libraries::Kernel::__Error() = ORBIS_NET_EACCES;
+    LOG_ERROR(Lib_Net, "LBP3 online blocked external guest socket {}", action);
+    return true;
+}
+
+} // namespace
+
 int PS4_SYSV_ABI sys_connect(OrbisNetId s, const OrbisNetSockaddr* addr, u32 addrlen) {
     auto file = FDTable::Instance()->GetSocket(s);
     if (!file) {
         *Libraries::Kernel::__Error() = ORBIS_NET_EBADF;
         LOG_ERROR(Lib_Net, "socket id is invalid = {}", s);
+        return -1;
+    }
+    if (RejectExternalLbp3Socket(*file->socket, addr, addrlen, "connect")) {
         return -1;
     }
     LOG_DEBUG(Lib_Net, "s = {} ({})", s, file->m_guest_name);
@@ -362,6 +396,9 @@ int PS4_SYSV_ABI sys_sendto(OrbisNetId s, const void* buf, u64 len, int flags,
         LOG_ERROR(Lib_Net, "socket id is invalid = {}", s);
         return -1;
     }
+    if (RejectExternalLbp3Socket(*file->socket, addr, addrlen, "sendto")) {
+        return -1;
+    }
     LOG_DEBUG(Lib_Net, "s = {} ({}), len = {}, flags = {:#x}", s, file->m_guest_name, len, flags);
     int returncode = file->socket->SendPacket(buf, len, flags, addr, addrlen);
     if (returncode >= 0) {
@@ -376,6 +413,12 @@ int PS4_SYSV_ABI sys_sendmsg(OrbisNetId s, const OrbisNetMsghdr* msg, int flags)
     if (!file) {
         *Libraries::Kernel::__Error() = ORBIS_NET_EBADF;
         LOG_ERROR(Lib_Net, "socket id is invalid = {}", s);
+        return -1;
+    }
+    if (msg != nullptr &&
+        RejectExternalLbp3Socket(*file->socket,
+                                 static_cast<const OrbisNetSockaddr*>(msg->msg_name),
+                                 msg->msg_namelen, "sendmsg")) {
         return -1;
     }
     LOG_DEBUG(Lib_Net, "s = {} ({}), flags = {:#x}", s, file->m_guest_name, flags);

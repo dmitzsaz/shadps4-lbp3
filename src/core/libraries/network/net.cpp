@@ -17,6 +17,7 @@
 #include "common/logging/log.h"
 #include "common/singleton.h"
 #include "core/file_sys/fs.h"
+#include "core/lbp3_online.h"
 #include "core/libraries/error_codes.h"
 #include "core/libraries/libs.h"
 #include "core/libraries/network/net.h"
@@ -1490,6 +1491,20 @@ int PS4_SYSV_ABI sceNetResolverStartNtoa(OrbisNetId resolverid, const char* host
         *sceNetErrnoLoc() = ORBIS_NET_RESOLVER_ENODNS;
         file->resolver->resolution_error = ORBIS_NET_ERROR_RESOLVER_ENODNS;
         return ORBIS_NET_ERROR_RESOLVER_ENODNS;
+    }
+
+    // Keep helper mode hermetic for direct guest DNS as well as libHttp. P2P addresses are
+    // virtual and use the PartyChat bridge, so the title never needs an external DNS result.
+    if (Core::Lbp3Online::IsEnabled()) {
+        if (addr == nullptr) {
+            *sceNetErrnoLoc() = ORBIS_NET_EINVAL;
+            return ORBIS_NET_ERROR_EINVAL;
+        }
+        addr->inaddr_addr = htonl(INADDR_LOOPBACK);
+        file->resolver->resolution_error = ORBIS_OK;
+        LOG_WARNING(Lib_Net, "LBP3 online DNS override: {} -> 127.0.0.1",
+                    hostname ? hostname : "(null)");
+        return ORBIS_OK;
     }
 
     if ((flags & ORBIS_NET_RESOLVER_ASYNC) != 0) {

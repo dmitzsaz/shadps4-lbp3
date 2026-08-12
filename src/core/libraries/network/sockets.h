@@ -148,26 +148,18 @@ struct P2PSocket : public Socket, public std::enable_shared_from_this<P2PSocket>
     int Listen(int backlog) override {
         return inner.Listen(backlog);
     }
-    int SendMessage(const OrbisNetMsghdr* msg, int flags) override {
-        return inner.SendMessage(msg, flags);
-    }
+    int SendMessage(const OrbisNetMsghdr* msg, int flags) override;
     int SendPacket(const void* msg, u32 len, int flags, const OrbisNetSockaddr* to,
                    u32 tolen) override;
     SocketPtr Accept(OrbisNetSockaddr* addr, u32* addrlen) override {
         return inner.Accept(addr, addrlen);
     }
-    int ReceiveMessage(OrbisNetMsghdr* msg, int flags) override {
-        return inner.ReceiveMessage(msg, flags);
-    }
+    int ReceiveMessage(OrbisNetMsghdr* msg, int flags) override;
     int ReceivePacket(void* buf, u32 len, int flags, OrbisNetSockaddr* from,
                       u32* fromlen) override;
-    int Connect(const OrbisNetSockaddr* addr, u32 namelen) override {
-        return inner.Connect(addr, namelen);
-    }
+    int Connect(const OrbisNetSockaddr* addr, u32 namelen) override;
     int GetSocketAddress(OrbisNetSockaddr* name, u32* namelen) override;
-    int GetPeerName(OrbisNetSockaddr* addr, u32* namelen) override {
-        return inner.GetPeerName(addr, namelen);
-    }
+    int GetPeerName(OrbisNetSockaddr* addr, u32* namelen) override;
     int fstat(Libraries::Kernel::OrbisKernelStat* stat) override {
         return inner.fstat(stat);
     }
@@ -189,7 +181,9 @@ private:
 
     static constexpr size_t MaxQueuedDatagrams = 256;
     OrbisNetSockaddrIn bound_addr{};
+    OrbisNetSockaddrIn peer_addr{};
     bool is_bound = false;
+    bool is_connected = false;
     bool is_closed = false;
     std::mutex local_receive_mutex;
     std::condition_variable local_receive_cv;
