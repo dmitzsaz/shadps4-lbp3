@@ -38,6 +38,11 @@ bool IsKosmicKrisp(const Vulkan::Instance& instance) {
 }
 
 bool UseLbp3PreemptiveReadbacks(const Vulkan::Instance& instance) {
+    // A/B baseline: A23's delayed ownership, global drain and permanent hotness are disabled.
+    return false;
+}
+
+bool UseLbp3WidenedReadbacks(const Vulkan::Instance& instance) {
     return IsKosmicKrisp(instance) && Common::ElfInfo::Instance().GameSerial() == "CUSA00063";
 }
 
@@ -67,10 +72,11 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
                            0,        AllFlags,  BDA_PAGETABLE_SIZE} {
     host_import_states_v159.clear();
     use_lbp3_preemptive_readbacks = UseLbp3PreemptiveReadbacks(instance);
-    if (use_lbp3_preemptive_readbacks) {
+    use_lbp3_widened_readbacks = UseLbp3WidenedReadbacks(instance);
+    if (use_lbp3_widened_readbacks) {
         LOG_CRITICAL(Render_Vulkan,
-                     "LBP3 A23 single-allocation global fault-storm drain enabled "
-                     "(PR #3404/RFC #4316)");
+                     "LBP3 clean #4839 baseline enabled: immediate GPU ownership, 512 KiB "
+                     "R/W fault windows, A23 global drain/hotness disabled");
     }
     Vulkan::SetObjectName(instance.GetDevice(), gds_buffer.Handle(), "GDS Buffer");
     Vulkan::SetObjectName(instance.GetDevice(), bda_pagetable_buffer.Handle(),
@@ -141,6 +147,24 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write) {
             // conservative host/device barrier.
             gpu_modified_ranges.Subtract(device_addr, size);
             buffer.MarkHostWrite();
+            return;
+        }
+
+        if (use_lbp3_widened_readbacks) {
+            constexpr u64 WindowSize = 512_KB;
+            const VAddr buffer_begin = buffer.CpuAddr();
+            const VAddr buffer_end = buffer_begin + buffer.SizeBytes();
+            const VAddr window_begin = std::max<VAddr>(
+                Common::AlignDown(device_addr, WindowSize), buffer_begin);
+            const VAddr window_end = std::min<VAddr>(
+                std::max<VAddr>(window_begin + WindowSize, device_addr + size), buffer_end);
+            // Download only the GPU-dirty islands in the widened window. The window becomes
+            // GPU-clean, while only the bytes actually written by the CPU become CPU-dirty.
+            DownloadBufferMemory<false>(buffer, window_begin, window_end - window_begin, false,
+                                        false);
+            if (is_write) {
+                memory_tracker->MarkRegionAsCpuModified(device_addr, size);
+            }
             return;
         }
 
@@ -226,6 +250,9 @@ void BufferCache::ProcessFaultReadbackRequests() {
     constexpr auto FaultBurstGap = std::chrono::milliseconds{8};
     constexpr u32 FaultStormThreshold = 3;
     constexpr u64 FaultStormDrainBudget = 32_MB;
+    // shadPS4 #4839: service the first fault with a wider per-buffer window instead of
+    // waiting for the A23 storm detector to observe several serialized faults.
+    constexpr u64 FaultReadbackWindowSize = 512_KB;
 
     struct PlannedRange {
         BufferId buffer_id{};
@@ -281,8 +308,17 @@ void BufferCache::ProcessFaultReadbackRequests() {
             ranges.push_back(PlannedRange{
                 .buffer_id = buffer_id,
                 .buffer_addr = buffer.CpuAddr(),
-                .begin = request->device_addr,
-                .end = request->device_addr + request->size,
+                .begin = std::max<VAddr>(
+                    Common::AlignDown(request->device_addr, FaultReadbackWindowSize),
+                    buffer.CpuAddr()),
+                .end = std::min<VAddr>(
+                    std::max<VAddr>(
+                        std::max<VAddr>(
+                            Common::AlignDown(request->device_addr, FaultReadbackWindowSize),
+                            buffer.CpuAddr()) +
+                            FaultReadbackWindowSize,
+                        request->device_addr + request->size),
+                    buffer.CpuAddr() + buffer.SizeBytes()),
             });
         }
 
@@ -381,11 +417,17 @@ void BufferCache::ProcessFaultReadbackRequests() {
                            range.end >= request->device_addr + request->size;
                 });
                 if (!covered) {
+                    const VAddr window_begin = std::max<VAddr>(
+                        Common::AlignDown(request->device_addr, FaultReadbackWindowSize),
+                        buffer.CpuAddr());
                     ranges.push_back(PlannedRange{
                         .buffer_id = buffer_id,
                         .buffer_addr = buffer.CpuAddr(),
-                        .begin = request->device_addr,
-                        .end = request->device_addr + request->size,
+                        .begin = window_begin,
+                        .end = std::min<VAddr>(
+                            std::max<VAddr>(window_begin + FaultReadbackWindowSize,
+                                            request->device_addr + request->size),
+                            buffer.CpuAddr() + buffer.SizeBytes()),
                     });
                 }
             }
@@ -534,7 +576,9 @@ void BufferCache::ProcessFaultReadbackRequests() {
                         for (const PlannedRange& range : completed_ranges) {
                             const u64 size = range.end - range.begin;
                             memory_tracker->UnmarkRegionAsGpuModified(range.begin, size);
-                            memory_tracker->MarkRegionAsCpuModified(range.begin, size);
+                            if (range.global_drain) {
+                                memory_tracker->MarkRegionAsCpuModified(range.begin, size);
+                            }
                         }
                     });
                     download_work_submitted = true;
@@ -553,8 +597,8 @@ void BufferCache::ProcessFaultReadbackRequests() {
         if (!storm_batch_complete) {
             for (const PlannedRange& range : merged_ranges) {
                 Buffer& buffer = slot_buffers[range.buffer_id];
-                DownloadBufferMemory<true>(buffer, range.begin, range.end - range.begin, true,
-                                           !fault_readback_storm);
+                DownloadBufferMemory<true>(buffer, range.begin, range.end - range.begin,
+                                           range.global_drain, !fault_readback_storm);
             }
             download_work_submitted = !merged_ranges.empty();
         }
@@ -562,6 +606,15 @@ void BufferCache::ProcessFaultReadbackRequests() {
         if (download_work_submitted) {
             scheduler.Finish();
             scheduler.PopPendingOperations();
+        }
+        // Only the bytes from the guest write fault become CPU-modified. The surrounding
+        // #4839 window was downloaded speculatively and must remain clean, otherwise later GPU
+        // reads see false CPU ownership and can trigger needless uploads or visual corruption.
+        for (FaultReadbackRequest* request : requests) {
+            const BufferId buffer_id = FindBuffer(request->device_addr, request->size);
+            if (!slot_buffers[buffer_id].IsHostImported()) {
+                memory_tracker->MarkRegionAsCpuModified(request->device_addr, request->size);
+            }
         }
         if (!merged_ranges.empty()) {
             for (const PlannedRange& range : merged_ranges) {

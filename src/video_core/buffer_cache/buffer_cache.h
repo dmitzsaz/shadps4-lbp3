@@ -286,6 +286,7 @@ private:
     bool fault_readback_storm{};
     bool fault_readback_storm_logged{};
     bool use_lbp3_preemptive_readbacks{};
+    bool use_lbp3_widened_readbacks{};
     SplitRangeMap<BufferId> buffer_ranges;
     PageTable page_table;
 };
