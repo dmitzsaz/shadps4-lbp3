@@ -161,13 +161,15 @@ public:
         frame_path = stem.string() + "_frames.csv";
         sample_path = stem.string() + "_samples.csv";
         thread_path = stem.string() + "_threads.csv";
+        fault_path = stem.string() + "_faults.csv";
         meta_path = stem.string() + "_meta.txt";
 
         frames.open(frame_path, std::ios::out | std::ios::trunc);
         samples.open(sample_path, std::ios::out | std::ios::trunc);
         threads.open(thread_path, std::ios::out | std::ios::trunc);
+        faults.open(fault_path, std::ios::out | std::ios::trunc);
         metadata.open(meta_path, std::ios::out | std::ios::trunc);
-        if (!frames.is_open() || !samples.is_open() || !threads.is_open() ||
+        if (!frames.is_open() || !samples.is_open() || !threads.is_open() || !faults.is_open() ||
             !metadata.is_open()) {
             LOG_ERROR(Core, "Could not open performance telemetry files in {}",
                       telemetry_dir.string());
@@ -180,16 +182,20 @@ public:
                   "on_submit_cpu_ms,raster_flush_cpu_ms,prepare_frame_cpu_ms,present_cpu_ms,"
                   "frame_pool_wait_ms,present_fence_wait_ms,vk_submit_cpu_ms,gpu_wait_ms,"
                   "gfx_pipeline_compile_ms,compute_pipeline_compile_ms,guest_shader_compile_ms,"
-                  "host_shader_compile_ms,fault_service_ms,sampler_overhead_ms,draw_calls,"
+                  "host_shader_compile_ms,fault_service_ms,sampler_overhead_ms,"
+                  "scheduler_finish_ms,draw_calls,"
                   "draws_emitted,indirect_draw_calls,dispatch_calls,dispatches_emitted,"
                   "descriptor_writes,render_pass_begins,render_pass_ends,vk_submits,gpu_waits,"
                   "gpu_frames,gfx_submits,asc_submits,gfx_dwords,asc_dwords,"
                   "gfx_pipeline_compiles,compute_pipeline_compiles,guest_shader_compiles,"
-                  "host_shader_compiles,guest_write_faults,guest_read_faults,present_calls,"
+                  "host_shader_compiles,guest_write_faults,guest_read_faults,"
+                  "zero_byte_write_faults,actual_readback_bytes,cpu_upload_bytes,"
+                  "scheduler_finishes,global_drain_count,global_drain_bytes,present_calls,"
                   "guest_stall_ms,guest_stall_active\n";
         samples << "elapsed_ms,thread_id,thread_name,kind,pc,image,image_offset,symbol,"
                    "symbol_offset,samples\n";
         threads << "elapsed_ms,thread_id,thread_name,cpu_percent,run_state\n";
+        faults << "elapsed_ms,type,address,buffer_base,generation,copied_bytes\n";
 
         metadata << "serial=" << Common::ElfInfo::Instance().GameSerial() << '\n';
         metadata << "eboot_base=0x" << std::hex << MemoryPatcher::g_eboot_address << '\n';
@@ -197,6 +203,7 @@ public:
         metadata << "frames=" << frame_path.string() << '\n';
         metadata << "samples=" << sample_path.string() << '\n';
         metadata << "threads=" << thread_path.string() << '\n';
+        metadata << "faults=" << fault_path.string() << '\n';
         metadata.flush();
 
         for (auto& counter : counters) {
@@ -236,6 +243,7 @@ public:
         frames.flush();
         samples.flush();
         threads.flush();
+        faults.flush();
         metadata.flush();
         LOG_INFO(Core, "Performance telemetry stopped after {} frames; log {}", frame_number,
                  frame_path.string());
@@ -262,6 +270,19 @@ public:
         }
         timings[static_cast<size_t>(metric)].fetch_add(duration.count(),
                                                        std::memory_order_relaxed);
+    }
+
+    void RecordFault(bool is_write, VAddr address, VAddr buffer_base, u64 generation,
+                     u64 copied_bytes) noexcept {
+        if (!IsEnabled()) {
+            return;
+        }
+        const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+            Clock::now() - start_time);
+        std::scoped_lock lock{fault_mutex};
+        faults << std::fixed << std::setprecision(3) << elapsed.count() / 1000.0 << ','
+               << (is_write ? 'W' : 'R') << ",0x" << std::hex << address << ",0x" << buffer_base
+               << std::dec << ',' << generation << ',' << copied_bytes << '\n';
     }
 
     void RecordFrame(u32 pending_flips, u32 request_depth, u32 game_width, u32 game_height,
@@ -333,7 +354,8 @@ public:
                << milliseconds(TimeMetric::GuestShaderCompile) << ','
                << milliseconds(TimeMetric::HostShaderCompile) << ','
                << milliseconds(TimeMetric::FaultService) << ','
-               << milliseconds(TimeMetric::SamplerOverhead) << ',' << counter(Counter::DrawCalls)
+               << milliseconds(TimeMetric::SamplerOverhead) << ','
+               << milliseconds(TimeMetric::SchedulerFinish) << ',' << counter(Counter::DrawCalls)
                << ',' << counter(Counter::DrawsEmitted) << ','
                << counter(Counter::IndirectDrawCalls) << ',' << counter(Counter::DispatchCalls)
                << ',' << counter(Counter::DispatchesEmitted) << ','
@@ -348,7 +370,13 @@ public:
                << counter(Counter::GuestShaderCompiles) << ','
                << counter(Counter::HostShaderCompiles) << ','
                << counter(Counter::GuestWriteFaults) << ','
-               << counter(Counter::GuestReadFaults) << ',' << counter(Counter::PresentCalls) << ','
+               << counter(Counter::GuestReadFaults) << ','
+               << counter(Counter::ZeroByteWriteFaults) << ','
+               << counter(Counter::ActualReadbackBytes) << ','
+               << counter(Counter::CpuUploadBytes) << ','
+               << counter(Counter::SchedulerFinishes) << ','
+               << counter(Counter::GlobalDrainCount) << ','
+               << counter(Counter::GlobalDrainBytes) << ',' << counter(Counter::PresentCalls) << ','
                << std::chrono::duration<double, std::milli>(guest_stall_delta).count() << ','
                << (guest_stall.active ? 1 : 0) << '\n';
 
@@ -559,6 +587,9 @@ private:
 #ifdef __APPLE__
     std::jthread sampler;
 #endif
+    std::ofstream faults;
+    std::filesystem::path fault_path;
+    std::mutex fault_mutex;
 };
 
 Recorder& GetRecorder() {
@@ -598,6 +629,11 @@ void Increment(Counter counter, u64 amount) noexcept {
 
 void AddTime(TimeMetric metric, std::chrono::nanoseconds duration) noexcept {
     GetRecorder().AddTime(metric, duration);
+}
+
+void RecordFault(bool is_write, VAddr address, VAddr buffer_base, u64 generation,
+                 u64 copied_bytes) noexcept {
+    GetRecorder().RecordFault(is_write, address, buffer_base, generation, copied_bytes);
 }
 
 void RecordFrame(u32 pending_flips, u32 request_depth, u32 game_width, u32 game_height,

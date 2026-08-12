@@ -277,6 +277,7 @@ private:
     };
     std::unordered_map<VAddr, std::vector<std::shared_ptr<PreemptiveDownload>>>
         preemptive_downloads;
+    std::unordered_map<VAddr, u64> gpu_write_generations;
     std::mutex preemptive_downloads_mutex;
     std::vector<FaultReadbackRequest*> fault_readback_requests;
     std::mutex fault_readback_mutex;

@@ -31,6 +31,12 @@ enum class Counter : u8 {
     HostShaderCompiles,
     GuestWriteFaults,
     GuestReadFaults,
+    ZeroByteWriteFaults,
+    ActualReadbackBytes,
+    CpuUploadBytes,
+    SchedulerFinishes,
+    GlobalDrainCount,
+    GlobalDrainBytes,
     PresentCalls,
     Count,
 };
@@ -53,6 +59,7 @@ enum class TimeMetric : u8 {
     GuestShaderCompile,
     HostShaderCompile,
     FaultService,
+    SchedulerFinish,
     SamplerOverhead,
     Count,
 };
@@ -68,6 +75,8 @@ void SetStartRequested(bool requested) noexcept;
 
 void Increment(Counter counter, u64 amount = 1) noexcept;
 void AddTime(TimeMetric metric, std::chrono::nanoseconds duration) noexcept;
+void RecordFault(bool is_write, VAddr address, VAddr buffer_base, u64 generation,
+                 u64 copied_bytes) noexcept;
 
 void RecordFrame(u32 pending_flips, u32 request_depth, u32 game_width, u32 game_height,
                  u32 output_width, u32 output_height);

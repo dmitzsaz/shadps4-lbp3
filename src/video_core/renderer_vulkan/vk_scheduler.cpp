@@ -105,6 +105,9 @@ void Scheduler::Flush() {
 }
 
 void Scheduler::Finish() {
+    Core::PerfTelemetry::Increment(Core::PerfTelemetry::Counter::SchedulerFinishes);
+    Core::PerfTelemetry::ScopedTimer finish_timer{
+        Core::PerfTelemetry::TimeMetric::SchedulerFinish};
     // When finishing, we need to wait for the submission to have executed on the device.
     const u64 presubmit_tick = CurrentTick();
     SubmitInfo info{};

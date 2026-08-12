@@ -11,6 +11,7 @@
 #include "common/elf_info.h"
 #include "common/scope_exit.h"
 #include "core/memory.h"
+#include "core/performance_telemetry.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/buffer_cache/memory_tracker.h"
@@ -158,6 +159,18 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write) {
                 Common::AlignDown(device_addr, WindowSize), buffer_begin);
             const VAddr window_end = std::min<VAddr>(
                 std::max<VAddr>(window_begin + WindowSize, device_addr + size), buffer_end);
+            u64 copied_bytes = 0;
+            gpu_modified_ranges.ForEachInRange(
+                window_begin, window_end - window_begin,
+                [&](VAddr dirty_begin, VAddr dirty_end) { copied_bytes += dirty_end - dirty_begin; });
+            Core::PerfTelemetry::Increment(Core::PerfTelemetry::Counter::ActualReadbackBytes,
+                                           copied_bytes);
+            if (is_write && copied_bytes == 0) {
+                Core::PerfTelemetry::Increment(Core::PerfTelemetry::Counter::ZeroByteWriteFaults);
+            }
+            Core::PerfTelemetry::RecordFault(is_write, device_addr, buffer_begin,
+                                             gpu_write_generations[buffer_begin], copied_bytes);
+
             // Download only the GPU-dirty islands in the widened window. The window becomes
             // GPU-clean, while only the bytes actually written by the CPU become CPU-dirty.
             DownloadBufferMemory<false>(buffer, window_begin, window_end - window_begin, false,
@@ -1390,6 +1403,10 @@ void BufferCache::TrackGpuWrite(VAddr device_addr, u64 size) {
     if (size == 0) {
         return;
     }
+    const BufferId buffer_id = FindBuffer(device_addr, size);
+    if (!IsBufferInvalid(buffer_id)) {
+        ++gpu_write_generations[slot_buffers[buffer_id].CpuAddr()];
+    }
 
     if (!use_lbp3_preemptive_readbacks) {
         gpu_modified_ranges.Add(device_addr, size);
@@ -1825,6 +1842,8 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, VAddr device_addr, u32 size,
             .bufferMemoryBarrierCount = 1,
             .pBufferMemoryBarriers = &pre_barrier,
         });
+        Core::PerfTelemetry::Increment(Core::PerfTelemetry::Counter::CpuUploadBytes,
+                                       total_size_bytes);
         cmdbuf.copyBuffer(src_buffer, buffer.buffer, copies);
         cmdbuf.pipelineBarrier2(vk::DependencyInfo{
             .dependencyFlags = vk::DependencyFlagBits::eByRegion,
