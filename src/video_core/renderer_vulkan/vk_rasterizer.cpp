@@ -395,16 +395,6 @@ u64 Rasterizer::Flush() {
     return current_tick;
 }
 
-void Rasterizer::PrepareGuestFence() {
-    buffer_cache.CommitPendingGpuRanges();
-    if (buffer_cache.PreparePreemptiveDownloads()) {
-        // The emulated fence label is written immediately below in Liverpool.
-        // Submit the staged copies first so a CPU page fault can wait on their
-        // single shared timeline tick instead of creating one submit per page.
-        scheduler.Flush();
-    }
-}
-
 void Rasterizer::Finish() {
     scheduler.Finish();
 }

@@ -14,7 +14,6 @@
 #include "core/memory.h"
 #include "core/platform.h"
 #include "core/performance_telemetry.h"
-#include "video_core/amdgpu/fence_detector.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/amdgpu/pm4_cmds.h"
 #include "video_core/renderdoc.h"
@@ -256,8 +255,6 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
     }
     const bool host_markers_enabled = rasterizer && EmulatorSettings.IsVkHostMarkersEnabled();
     const bool guest_markers_enabled = rasterizer && EmulatorSettings.IsVkGuestMarkersEnabled();
-    const FenceDetector fence_detector{
-        dcb, rasterizer && rasterizer->UsesLbp3PreemptiveReadbacks()};
 
     const auto base_addr = reinterpret_cast<uintptr_t>(dcb.data());
     while (!dcb.empty()) {
@@ -720,9 +717,6 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 const auto* event_eos = reinterpret_cast<const PM4CmdEventWriteEos*>(header);
                 if (rasterizer) {
                     rasterizer->ProcessDownloadImages();
-                    if (fence_detector.IsFence(header)) {
-                        rasterizer->PrepareGuestFence();
-                    }
                 }
                 event_eos->SignalFence([](void* address, u64 data, u32 num_bytes) {
                     auto* memory = Core::Memory::Instance();
@@ -744,9 +738,6 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 const auto* event_eop = reinterpret_cast<const PM4CmdEventWriteEop*>(header);
                 if (rasterizer) {
                     rasterizer->ProcessDownloadImages();
-                    if (fence_detector.IsFence(header)) {
-                        rasterizer->PrepareGuestFence();
-                    }
                 }
                 event_eop->SignalFence(
                     [](void* address, u64 data, u32 num_bytes) {
@@ -798,9 +789,6 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 const auto* write_data = reinterpret_cast<const PM4CmdWriteData*>(header);
                 ASSERT(write_data->dst_sel.Value() == 2 || write_data->dst_sel.Value() == 5);
                 const u32 data_size = (header->type3.count.Value() - 2) * 4;
-                if (rasterizer && fence_detector.IsFence(header)) {
-                    rasterizer->PrepareGuestFence();
-                }
                 u64* address = write_data->Address<u64*>();
                 if (!write_data->wr_one_addr.Value()) {
                     std::memcpy(address, write_data->data, data_size);
@@ -840,9 +828,6 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     break;
                 }
                 const PM4CmdRewind* rewind = reinterpret_cast<const PM4CmdRewind*>(header);
-                // REWIND polls guest memory from the CPU command processor. Commit deferred
-                // GPU destinations first so a protected read can fetch the produced value.
-                rasterizer->PrepareGuestFence();
                 while (!rewind->Valid()) {
                     YIELD_GFX();
                 }
@@ -945,8 +930,6 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
     FIBER_ENTER(acb_task_name[vqid]);
     auto& queue = asc_queues[{vqid}];
     const bool host_markers_enabled = rasterizer && EmulatorSettings.IsVkHostMarkersEnabled();
-    const FenceDetector fence_detector{
-        acb, rasterizer && rasterizer->UsesLbp3PreemptiveReadbacks()};
 
     struct IndirectPatch {
         const PM4Header* header;
@@ -1071,7 +1054,6 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 break;
             }
             const PM4CmdRewind* rewind = reinterpret_cast<const PM4CmdRewind*>(header);
-            rasterizer->PrepareGuestFence();
             while (!rewind->Valid()) {
                 YIELD_ASC(vqid);
             }
@@ -1156,9 +1138,6 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             const auto* write_data = reinterpret_cast<const PM4CmdWriteData*>(header);
             ASSERT(write_data->dst_sel.Value() == 2 || write_data->dst_sel.Value() == 5);
             const u32 data_size = (header->type3.count.Value() - 2) * 4;
-            if (rasterizer && fence_detector.IsFence(header)) {
-                rasterizer->PrepareGuestFence();
-            }
             if (!write_data->wr_one_addr.Value()) {
                 std::memcpy(write_data->Address<void*>(), write_data->data, data_size);
             } else {
@@ -1190,9 +1169,6 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             const auto* release_mem = reinterpret_cast<const PM4CmdReleaseMem*>(header);
             if (rasterizer) {
                 rasterizer->ProcessDownloadImages();
-                if (fence_detector.IsFence(header)) {
-                    rasterizer->PrepareGuestFence();
-                }
             }
             release_mem->SignalFence(
                 [pipe_id = queue.pipe_id] {

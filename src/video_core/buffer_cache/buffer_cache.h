@@ -3,12 +3,6 @@
 
 #pragma once
 
-#include <chrono>
-#include <memory>
-#include <mutex>
-#include <semaphore>
-#include <unordered_map>
-#include <vector>
 #include <boost/container/small_vector.hpp>
 #include "common/lru_cache.h"
 #include "common/slot_vector.h"
@@ -160,19 +154,8 @@ public:
     /// Processes the fault buffer.
     void ProcessFaultBuffer();
 
-    /// Stages repeatedly read GPU-written ranges before a guest fence.
-    /// Returns true when copy commands were recorded into the current command buffer.
-    bool PreparePreemptiveDownloads();
-
-    /// Commits GPU-written ranges and arms read protection at a CPU-visible guest fence.
-    void CommitPendingGpuRanges();
-
-    [[nodiscard]] bool UsesLbp3PreemptiveReadbacks() const noexcept {
-        return use_lbp3_preemptive_readbacks;
-    }
-
     /// Synchronizes all buffers in the specified range.
-    void SynchronizeBuffersInRange(VAddr device_addr, u64 size, bool is_written = false);
+    void SynchronizeBuffersInRange(VAddr device_addr, u64 size);
 
     /// Synchronizes all buffers neede for DMA.
     void SynchronizeDmaBuffers();
@@ -195,25 +178,7 @@ private:
     }
 
     template <bool async>
-    void DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 size, bool is_write,
-                              bool allow_preemptive = true);
-
-    struct FaultReadbackRequest {
-        VAddr device_addr{};
-        u64 size{};
-        VAddr buffer_addr{};
-        u64 buffer_size{};
-        std::binary_semaphore finished{0};
-    };
-
-    /// Joins simultaneous guest write faults into one GPU submission and wait.
-    void QueueFaultReadback(VAddr device_addr, u64 size);
-    void ProcessFaultReadbackRequests();
-
-    void TrackGpuWrite(VAddr device_addr, u64 size);
-    void CancelPreemptiveDownloads(VAddr device_addr, u64 size);
-    bool TryConsumePreemptiveDownloads(const Buffer& buffer, VAddr device_addr, u64 size,
-                                       std::span<const vk::BufferCopy> copies, bool is_write);
+    void DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 size);
 
     [[nodiscard]] OverlapResult ResolveOverlaps(VAddr device_addr, u32 wanted_size);
 
@@ -254,7 +219,6 @@ private:
     StreamBuffer staging_buffer;
     StreamBuffer stream_buffer;
     StreamBuffer download_buffer;
-    StreamBuffer fault_storm_download_buffer;
     StreamBuffer device_buffer;
     Buffer gds_buffer;
     Buffer bda_pagetable_buffer;
@@ -265,27 +229,6 @@ private:
     u64 gc_tick = 0;
     Common::LeastRecentlyUsedCache<BufferId, u64> lru_cache;
     RangeSet gpu_modified_ranges;
-    RangeSet gpu_modified_ranges_pending;
-    RangeSet preemptive_candidates;
-    struct PreemptiveDownload {
-        VAddr device_addr{};
-        u64 size{};
-        u8* staging{};
-        u64 done_tick{};
-        bool cancelled{};
-        bool ready{};
-    };
-    std::unordered_map<VAddr, std::vector<std::shared_ptr<PreemptiveDownload>>>
-        preemptive_downloads;
-    std::mutex preemptive_downloads_mutex;
-    std::vector<FaultReadbackRequest*> fault_readback_requests;
-    std::mutex fault_readback_mutex;
-    bool fault_readback_scheduled{};
-    std::chrono::steady_clock::time_point last_fault_readback{};
-    u32 fault_readback_burst_count{};
-    bool fault_readback_storm{};
-    bool fault_readback_storm_logged{};
-    bool use_lbp3_preemptive_readbacks{};
     SplitRangeMap<BufferId> buffer_ranges;
     PageTable page_table;
 };

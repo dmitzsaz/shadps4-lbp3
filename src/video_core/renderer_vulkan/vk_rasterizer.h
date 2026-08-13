@@ -66,10 +66,6 @@ public:
     void UnmapMemory(VAddr addr, u64 size);
 
     void CpSync();
-    void PrepareGuestFence();
-    [[nodiscard]] bool UsesLbp3PreemptiveReadbacks() const noexcept {
-        return buffer_cache.UsesLbp3PreemptiveReadbacks();
-    }
     u64 Flush();
     void Finish();
     void OnSubmit();
