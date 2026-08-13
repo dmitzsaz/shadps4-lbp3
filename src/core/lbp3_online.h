@@ -24,13 +24,14 @@ inline void SetEnabled(bool enabled) {
 }
 
 // Call only after the title metadata has been loaded by Core::Emulator.
-[[nodiscard]] inline bool IsSupportedTitle() {
-    if (!IsEnabled()) {
-        return false;
-    }
+[[nodiscard]] inline bool IsSupportedTitleVersion() {
     const auto& info = Common::ElfInfo::Instance();
     return info.IsInitialized() && info.GameSerial() == SupportedSerial &&
            info.AppVer() == SupportedAppVersion;
+}
+
+[[nodiscard]] inline bool IsSupportedTitle() {
+    return IsEnabled() && IsSupportedTitleVersion();
 }
 
 } // namespace Core::Lbp3Online

@@ -376,13 +376,16 @@ int PS4_SYSV_ABI sceNetCtlGetScanInfoForSsidScanIpcInt() {
 
 int PS4_SYSV_ABI sceNetCtlGetState(int* state) {
     const auto external_network = EmulatorSettings.IsConnectedToNetwork();
-    LOG_DEBUG(Lib_NetCtl, "external_network = {}, virtual IPv4 link is ready",
-              external_network);
+    const bool lbp3_offline = Core::Lbp3Online::IsSupportedTitleVersion() && !external_network;
+    LOG_DEBUG(Lib_NetCtl, "external_network = {}, lbp3_offline = {}", external_network,
+              lbp3_offline);
 
     // The guest always has an isolated virtual IPv4 link for local sockets. The external
     // network setting controls hostname resolution and host-network access, not whether that
-    // virtual interface exists.
-    *state = ORBIS_NET_CTL_STATE_IPOBTAINED;
+    // virtual interface exists. LBP3 is the exception: it treats IPOBTAINED as an instruction
+    // to begin NP sign-in, then presents ORBIS_NP_ERROR_SIGNED_OUT when PartyChat is absent.
+    // Report DISCONNECTED for this title so it selects its normal offline boot path.
+    *state = lbp3_offline ? ORBIS_NET_CTL_STATE_DISCONNECTED : ORBIS_NET_CTL_STATE_IPOBTAINED;
     return ORBIS_OK;
 }
 

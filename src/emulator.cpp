@@ -34,6 +34,7 @@
 #include "core/file_sys/fs.h"
 #include "core/libraries/kernel/kernel.h"
 #include "core/libraries/libs.h"
+#include "core/libraries/network/lbp3_online_bridge.h"
 #include "core/libraries/np/np_trophy.h"
 #include "core/libraries/save_data/save_backup.h"
 #include "core/linker.h"
@@ -280,11 +281,6 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     }
 
     EmulatorSettings.Load(id);
-    if (Core::Lbp3Online::IsEnabled()) {
-        // Per-title settings are loaded after main's global settings, so restore the explicit
-        // process-local helper network override here as well.
-        EmulatorSettings.SetConnectedToNetwork(true);
-    }
     // Switch to configured log
     Common::Log::Switch((!id.empty() && EmulatorSettings.IsLogSeparate()) ? id + ".log"
                                                                           : "shad_log.txt");
@@ -301,6 +297,22 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     game_info.raw_firmware_ver = fw_version;
     game_info.sdk_ver = ReadCompiledSdkVersion(eboot_path);
     game_info.psf_attributes = psf_attributes;
+
+    if (Core::Lbp3Online::IsEnabled()) {
+        // --lbp3-online is opportunistic: an already-running PartyChat helper enables the
+        // isolated localhost backend. If the helper is absent, boot exactly as an offline
+        // session instead of exposing ORBIS_NP_ERROR_SIGNED_OUT to the title. This override is
+        // process-local and never changes the user's persisted network setting.
+        if (Libraries::Net::Lbp3OnlineBridge::EnsureConnected()) {
+            EmulatorSettings.SetConnectedToNetwork(true);
+            LOG_INFO(Lib_Net, "LBP3 PartyChat helper detected; local online mode enabled");
+        } else {
+            Core::Lbp3Online::SetEnabled(false);
+            EmulatorSettings.SetConnectedToNetwork(false);
+            LOG_WARNING(Lib_Net,
+                        "LBP3 PartyChat helper is unavailable; continuing in offline mode");
+        }
+    }
 
     const auto pic1_path = mnt->GetHostPath("/app0/sce_sys/pic1.png");
     if (std::filesystem::exists(pic1_path)) {
