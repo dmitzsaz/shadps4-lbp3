@@ -76,7 +76,7 @@ public:
     bool LoadGraphicsPipeline(Serialization::Archive& ar);
     bool LoadPipelineStage(Serialization::Archive& ar, size_t stage);
 
-    const GraphicsPipeline* GetGraphicsPipeline();
+    const GraphicsPipeline* GetGraphicsPipeline(bool expand_quad_list = false);
 
     const ComputePipeline* GetComputePipeline();
 
@@ -96,7 +96,7 @@ public:
     }
 
 private:
-    bool RefreshGraphicsKey();
+    bool RefreshGraphicsKey(bool expand_quad_list);
     bool RefreshGraphicsStages();
     bool RefreshComputeKey();
 

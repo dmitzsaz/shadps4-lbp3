@@ -104,6 +104,17 @@ public:
         }
     }
 
+    /// Immutable relative indices used to lower direct QuadList draws to TriangleList draws.
+    [[nodiscard]] const Buffer& GetQuadIndexBuffer() const noexcept {
+        return quad_index_buffer;
+    }
+
+    /// Number of valid u32 indices in the immutable QuadList index buffer.
+    [[nodiscard]] u32 GetQuadIndexCount() const noexcept {
+        const size_t quad_count = quad_index_buffer.SizeBytes() / (6 * sizeof(u32));
+        return static_cast<u32>(quad_count * 6);
+    }
+
     /// Invalidates any buffer in the logical page range.
     void InvalidateMemory(VAddr device_addr, u64 size, bool download = true);
 
@@ -218,6 +229,7 @@ private:
     std::unique_ptr<MemoryTracker> memory_tracker;
     StreamBuffer staging_buffer;
     StreamBuffer stream_buffer;
+    StreamBuffer quad_index_buffer;
     StreamBuffer download_buffer;
     StreamBuffer device_buffer;
     Buffer gds_buffer;

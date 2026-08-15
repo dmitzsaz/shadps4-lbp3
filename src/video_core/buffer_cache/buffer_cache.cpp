@@ -41,6 +41,7 @@ static constexpr size_t DataShareBufferSize = 64_KB;
 static constexpr size_t StagingBufferSize = 512_MB;
 static constexpr size_t DownloadBufferSize = 32_MB;
 static constexpr size_t UboStreamBufferSize = 64_MB;
+static constexpr size_t QuadIndexBufferSize = 4_MB;
 static constexpr size_t DeviceBufferSize = 128_MB;
 
 BufferCache::BufferCache(const Vulkan::Instance &instance_,
@@ -55,6 +56,8 @@ BufferCache::BufferCache(const Vulkan::Instance &instance_,
                      StagingBufferSize},
       stream_buffer{instance, scheduler, MemoryUsage::Stream,
                     UboStreamBufferSize},
+      quad_index_buffer{instance, scheduler, MemoryUsage::Stream,
+                        QuadIndexBufferSize},
       download_buffer{instance, scheduler, MemoryUsage::Download,
                       DownloadBufferSize},
       device_buffer{instance, scheduler, MemoryUsage::DeviceLocal,
@@ -68,11 +71,31 @@ BufferCache::BufferCache(const Vulkan::Instance &instance_,
                         "GDS Buffer");
   Vulkan::SetObjectName(instance.GetDevice(), bda_pagetable_buffer.Handle(),
                         "BDA Page Table Buffer");
+  Vulkan::SetObjectName(instance.GetDevice(), quad_index_buffer.Handle(),
+                        "QuadList Index Buffer");
 
   memory_tracker = std::make_unique<MemoryTracker>(tracker);
 
   std::memset(gds_buffer.mapped_data.data(), 0, DataShareBufferSize);
   bda_pagetable_buffer.Fill(0, BDA_PAGETABLE_SIZE, 0);
+
+  // A direct non-indexed QuadList is exactly two triangles per four vertices. Keep one immutable
+  // relative index buffer for every draw instead of asking the driver to tessellate every quad.
+  const u32 quad_index_count = GetQuadIndexCount();
+  const auto [mapped_indices, index_offset] =
+      quad_index_buffer.Map(u64{quad_index_count} * sizeof(u32), alignof(u32));
+  ASSERT_MSG(mapped_indices != nullptr && index_offset == 0,
+             "Failed to initialize the QuadList index buffer");
+  auto* indices = reinterpret_cast<u32*>(mapped_indices);
+  for (u32 index = 0, vertex = 0; index < quad_index_count; index += 6, vertex += 4) {
+    indices[index + 0] = vertex + 1;
+    indices[index + 1] = vertex + 2;
+    indices[index + 2] = vertex + 0;
+    indices[index + 3] = vertex + 2;
+    indices[index + 4] = vertex + 3;
+    indices[index + 5] = vertex + 0;
+  }
+  quad_index_buffer.Commit();
 
   // Set up garbage collection parameters
   if (!instance.CanReportMemoryUsage()) {

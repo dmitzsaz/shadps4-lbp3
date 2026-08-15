@@ -198,7 +198,15 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     }
 
     const auto& regs = liverpool->regs;
-    const GraphicsPipeline* pipeline = pipeline_cache.GetGraphicsPipeline();
+    const u64 expanded_quad_index_count = (u64{regs.num_indices} / 4) * 6;
+    const bool expand_quad_list =
+        !is_indexed && regs.num_indices >= 4 &&
+        regs.primitive_type == AmdGpu::PrimitiveType::QuadList &&
+        regs.stage_enable.raw == AmdGpu::ShaderStageEnable::VgtStages::Vs &&
+        expanded_quad_index_count <= buffer_cache.GetQuadIndexCount();
+    const u32 expanded_index_count =
+        expand_quad_list ? static_cast<u32>(expanded_quad_index_count) : 0;
+    const GraphicsPipeline* pipeline = pipeline_cache.GetGraphicsPipeline(expand_quad_list);
     if (!pipeline) {
         return;
     }
@@ -212,10 +220,13 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     buffer_cache.BindVertexBuffers(*pipeline, buffer_barriers);
     if (is_indexed) {
         buffer_cache.BindIndexBuffer(index_offset, buffer_barriers);
+    } else if (expand_quad_list) {
+        scheduler.CommandBuffer().bindIndexBuffer(buffer_cache.GetQuadIndexBuffer().Handle(), 0,
+                                                  vk::IndexType::eUint32);
     }
 
     pipeline->BindResources(set_writes, buffer_barriers, push_data);
-    UpdateDynamicState(pipeline, is_indexed);
+    UpdateDynamicState(pipeline, is_indexed || expand_quad_list, expand_quad_list);
     scheduler.BeginRendering(state);
 
     const auto& vs_info = pipeline->GetStage(Shader::LogicalStage::Vertex);
@@ -227,6 +238,9 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
 
     if (is_indexed) {
         cmdbuf.drawIndexed(regs.num_indices, regs.num_instances.NumInstances(), 0,
+                           s32(vertex_offset), instance_offset);
+    } else if (expand_quad_list) {
+        cmdbuf.drawIndexed(expanded_index_count, regs.num_instances.NumInstances(), 0,
                            s32(vertex_offset), instance_offset);
     } else {
         cmdbuf.draw(regs.num_indices, regs.num_instances.NumInstances(), vertex_offset,
@@ -287,7 +301,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     }
 
     pipeline->BindResources(set_writes, buffer_barriers, push_data);
-    UpdateDynamicState(pipeline, is_indexed);
+    UpdateDynamicState(pipeline, is_indexed, false);
     scheduler.BeginRendering(state);
 
     // We can safely ignore both SGPR UD indices and results of fetch shader parsing, as vertex and
@@ -1122,10 +1136,11 @@ void Rasterizer::UnmapMemory(VAddr addr, u64 size) {
     }
 }
 
-void Rasterizer::UpdateDynamicState(const GraphicsPipeline* pipeline, const bool is_indexed) const {
+void Rasterizer::UpdateDynamicState(const GraphicsPipeline* pipeline, const bool is_indexed,
+                                    const bool force_disable_primitive_restart) const {
     UpdateViewportScissorState();
     UpdateDepthStencilState();
-    UpdatePrimitiveState(is_indexed);
+    UpdatePrimitiveState(is_indexed, force_disable_primitive_restart);
     UpdateRasterizationState();
     UpdateColorBlendingState(pipeline);
 
@@ -1322,7 +1337,8 @@ void Rasterizer::UpdateDepthStencilState() const {
     }
 }
 
-void Rasterizer::UpdatePrimitiveState(const bool is_indexed) const {
+void Rasterizer::UpdatePrimitiveState(const bool is_indexed,
+                                      const bool force_disable_primitive_restart) const {
     const auto& regs = liverpool->regs;
     auto& dynamic_state = scheduler.GetDynamicState();
 
@@ -1341,7 +1357,7 @@ void Rasterizer::UpdatePrimitiveState(const bool is_indexed) const {
     };
 
     const auto prim_restart =
-        (regs.enable_primitive_restart & 1) != 0 &&
+        !force_disable_primitive_restart && (regs.enable_primitive_restart & 1) != 0 &&
         (instance.IsListRestartSupported() || !is_list_topology(regs.primitive_type)) &&
         (instance.IsPatchListRestartSupported() || !is_patch_list_topology(regs.primitive_type));
     ASSERT_MSG(!is_indexed || !prim_restart || regs.primitive_restart_index == 0xFFFF ||
