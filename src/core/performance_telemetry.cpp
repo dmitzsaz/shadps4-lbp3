@@ -214,7 +214,8 @@ public:
                   "direct_import_attempts,direct_import_successes,direct_import_failures,"
                   "direct_buffer_binds,direct_readback_bytes,direct_upload_bytes,"
                   "direct_fault_submits,direct_fault_finishes,direct_visibility_barriers,"
-                  "ordered_guest_releases,guest_fence_submits,"
+                  "ordered_guest_releases,guest_fence_submits,lbp3_ng_cpu_hle_dispatches,"
+                  "lbp3_ng_cpu_hle_releases,"
                   "guest_stall_ms,guest_stall_active\n";
         samples << "elapsed_ms,thread_id,thread_name,kind,pc,image,image_offset,symbol,"
                    "symbol_offset,samples\n";
@@ -420,6 +421,8 @@ public:
                << counter(Counter::DirectVisibilityBarriers) << ','
                << counter(Counter::OrderedGuestReleases) << ','
                << counter(Counter::GuestFenceSubmits) << ','
+               << counter(Counter::Lbp3NgCpuHleDispatches) << ','
+               << counter(Counter::Lbp3NgCpuHleReleases) << ','
                << std::chrono::duration<double, std::milli>(guest_stall_delta).count() << ','
                << (guest_stall.active ? 1 : 0) << '\n';
 

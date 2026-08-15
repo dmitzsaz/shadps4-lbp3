@@ -121,6 +121,10 @@ public:
     /// Flushes any GPU modified buffer in the logical page range back to CPU memory.
     void ReadMemory(VAddr device_addr, u64 size, bool is_write = false);
 
+    /// Marks bytes written through guest backing as CPU-authoritative. Host-imported buffers
+    /// retain direct backing and publish the host write on their next native bind.
+    void NotifyCpuWrite(VAddr device_addr, u64 size);
+
     /// Flushes GPU-modified data outside an image on its partially covered edge pages.
     void ReadEdgeImagePages(const Image& image);
 

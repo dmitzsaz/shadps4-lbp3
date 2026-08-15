@@ -350,6 +350,7 @@ void Rasterizer::DispatchDirect(bool async_compute) {
     if (ExecuteShaderHLE(cs, liverpool->regs, cs_program, *this, async_compute)) {
         return;
     }
+    MarkLbp3NgNativeGpuWork();
 
     if (!BindResources(pipeline)) {
         return;
@@ -463,6 +464,26 @@ bool Rasterizer::HasPendingGuestFences() const noexcept {
 
 bool Rasterizer::IsGuestFenceTickFree(u64 tick) noexcept {
     return scheduler.IsFree(tick);
+}
+
+void Rasterizer::MarkLbp3NgCpuHleDispatch() noexcept {
+    if (!lbp3_ng_cpu_hle_phase_started) {
+        lbp3_ng_cpu_hle_phase_started = true;
+        lbp3_ng_cpu_hle_phase = true;
+    }
+}
+
+void Rasterizer::MarkLbp3NgNativeGpuWork() noexcept {
+    if (lbp3_ng_cpu_hle_phase_started) {
+        lbp3_ng_cpu_hle_phase = false;
+    }
+}
+
+bool Rasterizer::ConsumeLbp3NgCpuHlePhase() noexcept {
+    const bool cpu_only = lbp3_ng_cpu_hle_phase_started && lbp3_ng_cpu_hle_phase;
+    lbp3_ng_cpu_hle_phase_started = false;
+    lbp3_ng_cpu_hle_phase = false;
+    return cpu_only;
 }
 
 void Rasterizer::Finish() {

@@ -1358,6 +1358,18 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                      packet.data_sel == DataSelect::Data64)) {
                     const u32 num_bytes = packet.data_sel == DataSelect::Data64 ? sizeof(u64)
                                                                                : sizeof(u32);
+                    if (rasterizer->ConsumeLbp3NgCpuHlePhase()) {
+                        // A wholly CPU-executed NG phase has no native producer submission to
+                        // retire. Publish its completion value now; the following WAIT_REG_MEM
+                        // observes the same guest ordering without closing an empty Vulkan/Metal
+                        // command buffer for every rolling phase.
+                        TrackGuestRelease(vqid, packet.Address<VAddr>(), packet.DataQWord(),
+                                          num_bytes, 0);
+                        packet.SignalFence(write_guest, [] {}, [](VAddr, u16, u16) {});
+                        Core::PerfTelemetry::Increment(
+                            Core::PerfTelemetry::Counter::Lbp3NgCpuHleReleases);
+                        break;
+                    }
                     if (const u64 tick = rasterizer->WriteGuestFence(
                             packet.Address<VAddr>(), packet.DataQWord(), num_bytes)) {
                         TrackGuestRelease(vqid, packet.Address<VAddr>(), packet.DataQWord(),

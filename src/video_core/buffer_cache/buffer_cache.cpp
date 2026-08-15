@@ -227,6 +227,30 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write) {
     });
 }
 
+void BufferCache::NotifyCpuWrite(VAddr device_addr, u64 size) {
+    if (size == 0 || !IsRegionRegistered(device_addr, size)) {
+        texture_cache.InvalidateMemory(device_addr, size);
+        return;
+    }
+
+    const BufferId buffer_id = page_table[device_addr >> CACHING_PAGEBITS].buffer_id;
+    if (!IsBufferInvalid(buffer_id)) {
+        Buffer& buffer = slot_buffers[buffer_id];
+        if (buffer.IsHostImported() && buffer.IsInBounds(device_addr, size)) {
+            gpu_modified_ranges.Subtract(device_addr, size);
+            buffer.MarkHostWrite();
+            texture_cache.InvalidateMemory(device_addr, size);
+            return;
+        }
+    }
+
+    // CPU HLE writes through the physical guest backing, bypassing the protected virtual alias.
+    // Reproduce the normal write-fault state transition without downloading bytes that have just
+    // been replaced by the CPU implementation.
+    InvalidateMemory(device_addr, size, false);
+    texture_cache.InvalidateMemory(device_addr, size);
+}
+
 template <bool async>
 void BufferCache::DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 size) {
     const bool direct_target = IsLbp3NgDirectBackingCandidate(instance, buffer.SizeBytes());

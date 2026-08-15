@@ -72,6 +72,9 @@ public:
     [[nodiscard]] bool DeferGuestFence(Common::UniqueFunction<void>&& callback);
     [[nodiscard]] bool HasPendingGuestFences() const noexcept;
     [[nodiscard]] bool IsGuestFenceTickFree(u64 tick) noexcept;
+    void MarkLbp3NgCpuHleDispatch() noexcept;
+    void MarkLbp3NgNativeGpuWork() noexcept;
+    [[nodiscard]] bool ConsumeLbp3NgCpuHlePhase() noexcept;
     void Finish();
     void OnSubmit();
 
@@ -151,6 +154,8 @@ private:
     using ImageBindingInfo = std::pair<VideoCore::ImageId, VideoCore::TextureCache::ImageDesc>;
     boost::container::static_vector<ImageBindingInfo, Shader::NUM_IMAGES> image_bindings;
     u64 guest_fence_recording_tick{};
+    bool lbp3_ng_cpu_hle_phase_started{};
+    bool lbp3_ng_cpu_hle_phase{};
     bool fault_process_pending{};
     bool attachment_feedback_loop{};
 };

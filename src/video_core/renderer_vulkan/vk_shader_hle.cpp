@@ -1,11 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include <cstdlib>
-#include <cstring>
-
 #include "shader_recompiler/info.h"
-#include "common/elf_info.h"
+#include "video_core/renderer_vulkan/vk_lbp3_ng_cpu_hle.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_hle.h"
@@ -16,33 +13,9 @@ namespace Vulkan {
 
 static constexpr u64 COPY_SHADER_HASH = 0xfefebf9f;
 
-// Diagnostic inverse A/B for the exact LBP3 NG/gas compute packet. The guest dispatch packets,
-// RELEASE_MEM writes and WAIT_REG_MEM protocol still execute; only the six native kernels are
-// omitted. Keeping this behind an explicit environment variable prevents the diagnostic control
-// from becoming a graphics hotfix.
-static bool IsLbp3ParticleComputeAb(u64 hash, bool async_compute) {
-    const char* enabled = std::getenv("SHADPS4_LBP3_SKIP_PARTICLE_COMPUTE_AB");
-    if (!enabled || std::strcmp(enabled, "1") != 0 || !async_compute ||
-        Common::ElfInfo::Instance().GameSerial() != "CUSA00063" ||
-        Common::ElfInfo::Instance().AppVer() != "01.26") {
-        return false;
-    }
-
-    switch (hash) {
-    case 0x15f3a569593c4c58:
-    case 0x39392c783089119f:
-    case 0x744d4d82942b9961:
-    case 0x0020a4d78a49461c:
-    case 0xcdd355b7331679a5:
-    case 0x01e2c7ba10806334:
-        return true;
-    default:
-        return false;
-    }
-}
-
 static bool ExecuteCopyShaderHLE(const Shader::Info& info, const AmdGpu::ComputeProgram& cs_program,
                                  Rasterizer& rasterizer) {
+    rasterizer.MarkLbp3NgNativeGpuWork();
     auto& scheduler = rasterizer.GetScheduler();
     auto& buffer_cache = rasterizer.GetBufferCache();
 
@@ -152,7 +125,7 @@ static bool ExecuteCopyShaderHLE(const Shader::Info& info, const AmdGpu::Compute
 bool ExecuteShaderHLE(const Shader::Info& info, const AmdGpu::Regs& regs,
                       const AmdGpu::ComputeProgram& cs_program, Rasterizer& rasterizer,
                       bool async_compute) {
-    if (IsLbp3ParticleComputeAb(info.pgm_hash, async_compute)) {
+    if (ExecuteLbp3NgCpuHle(info, cs_program, rasterizer, async_compute)) {
         return true;
     }
 

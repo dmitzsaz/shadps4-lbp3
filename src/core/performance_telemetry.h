@@ -43,6 +43,8 @@ enum class Counter : u8 {
     DirectVisibilityBarriers,
     OrderedGuestReleases,
     GuestFenceSubmits,
+    Lbp3NgCpuHleDispatches,
+    Lbp3NgCpuHleReleases,
     Count,
 };
 
