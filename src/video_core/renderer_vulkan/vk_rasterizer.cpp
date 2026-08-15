@@ -320,7 +320,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     ResetBindings();
 }
 
-void Rasterizer::DispatchDirect() {
+void Rasterizer::DispatchDirect(bool async_compute) {
     RENDERER_TRACE;
     Core::PerfTelemetry::Increment(Core::PerfTelemetry::Counter::DispatchCalls);
     Core::PerfTelemetry::ScopedTimer telemetry_timer{Core::PerfTelemetry::TimeMetric::DispatchCpu};
@@ -333,7 +333,7 @@ void Rasterizer::DispatchDirect() {
     }
 
     const auto& cs = pipeline->GetStage(Shader::LogicalStage::Compute);
-    if (ExecuteShaderHLE(cs, liverpool->regs, cs_program, *this)) {
+    if (ExecuteShaderHLE(cs, liverpool->regs, cs_program, *this, async_compute)) {
         return;
     }
 

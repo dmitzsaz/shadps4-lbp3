@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "shader_recompiler/info.h"
+#include "common/elf_info.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_hle.h"
@@ -11,6 +12,30 @@ extern std::unique_ptr<AmdGpu::Liverpool> liverpool;
 namespace Vulkan {
 
 static constexpr u64 COPY_SHADER_HASH = 0xfefebf9f;
+
+// LBP3 v1.26 runs this six-shader NG-particle simulation packet on the async-compute queue.
+// The built-in game patch suppresses both particle render paths, so executing this packet only
+// creates GPU-written buffers that the guest immediately reads back. Treat it as completed here
+// so the following GNM completion-label commands still run without the unused Metal work and
+// GPU-to-CPU fault train.
+static bool IsSuppressedLbp3ParticleCompute(u64 hash, bool async_compute) {
+    if (!async_compute || Common::ElfInfo::Instance().GameSerial() != "CUSA00063" ||
+        Common::ElfInfo::Instance().AppVer() != "01.26") {
+        return false;
+    }
+
+    switch (hash) {
+    case 0x15f3a569593c4c58:
+    case 0x39392c783089119f:
+    case 0x744d4d82942b9961:
+    case 0x0020a4d78a49461c:
+    case 0xcdd355b7331679a5:
+    case 0x01e2c7ba10806334:
+        return true;
+    default:
+        return false;
+    }
+}
 
 static bool ExecuteCopyShaderHLE(const Shader::Info& info, const AmdGpu::ComputeProgram& cs_program,
                                  Rasterizer& rasterizer) {
@@ -121,7 +146,12 @@ static bool ExecuteCopyShaderHLE(const Shader::Info& info, const AmdGpu::Compute
 }
 
 bool ExecuteShaderHLE(const Shader::Info& info, const AmdGpu::Regs& regs,
-                      const AmdGpu::ComputeProgram& cs_program, Rasterizer& rasterizer) {
+                      const AmdGpu::ComputeProgram& cs_program, Rasterizer& rasterizer,
+                      bool async_compute) {
+    if (IsSuppressedLbp3ParticleCompute(info.pgm_hash, async_compute)) {
+        return true;
+    }
+
     switch (info.pgm_hash) {
     case COPY_SHADER_HASH:
         return ExecuteCopyShaderHLE(info, cs_program, rasterizer);

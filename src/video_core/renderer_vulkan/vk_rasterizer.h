@@ -46,7 +46,7 @@ public:
     void DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u32 size, u32 max_count,
                       VAddr count_address);
 
-    void DispatchDirect();
+    void DispatchDirect(bool async_compute);
     void DispatchIndirect(VAddr address, u32 offset, u32 size);
 
     void ScopeMarkerBegin(const std::string_view& str, bool from_guest = false);
