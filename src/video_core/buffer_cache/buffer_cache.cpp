@@ -37,11 +37,14 @@ bool IsKosmicKrisp(const Vulkan::Instance& instance) {
     return instance.GetDriverID() == vk::DriverId::eMesaKosmickrisp;
 }
 
+bool IsLbp3KosmicKrisp(const Vulkan::Instance& instance) {
+    return Common::ElfInfo::Instance().GameSerial() == "CUSA00063" && IsKosmicKrisp(instance);
+}
+
 constexpr std::array Lbp3NgDirectBackingSizes{0x21a8000ULL, 0x0a4000ULL};
 
 bool IsLbp3NgDirectBackingCandidate(const Vulkan::Instance& instance, u64 size) {
-    return Common::ElfInfo::Instance().GameSerial() == "CUSA00063" && IsKosmicKrisp(instance) &&
-           std::ranges::contains(Lbp3NgDirectBackingSizes, size);
+    return IsLbp3KosmicKrisp(instance) && std::ranges::contains(Lbp3NgDirectBackingSizes, size);
 }
 
 } // namespace
@@ -595,6 +598,36 @@ void BufferCache::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gd
     buffer->Fill(buffer->Offset(address), num_bytes, value);
 }
 
+bool BufferCache::WriteGuestFence(VAddr address, u64 value, u32 num_bytes) {
+    if (!IsLbp3KosmicKrisp(instance) || !instance.SupportsExternalMemoryHost() ||
+        (num_bytes != sizeof(u32) && num_bytes != sizeof(u64)) ||
+        address % alignof(u32) != 0 || !memory->IsValidMapping(address, num_bytes)) {
+        return false;
+    }
+
+    BufferId buffer_id = page_table[address >> CACHING_PAGEBITS].buffer_id;
+    if (IsBufferInvalid(buffer_id) || !slot_buffers[buffer_id].IsInBounds(address, num_bytes) ||
+        !slot_buffers[buffer_id].IsHostImported()) {
+        // RELEASE_MEM labels are tiny and normally have no cache allocation at
+        // all. If the page already belongs to a device-local buffer, replace it
+        // with a joined imported incarnation before recording the first write.
+        buffer_id = CreateBuffer(address, num_bytes, true);
+    }
+
+    Buffer& buffer = slot_buffers[buffer_id];
+    if (!buffer.IsHostImported() || !buffer.IsInBounds(address, num_bytes)) {
+        return false;
+    }
+
+    SynchronizeBuffer(buffer, address, num_bytes, true, false);
+    const u32 offset = buffer.Offset(address);
+    buffer.Fill(offset, sizeof(u32), static_cast<u32>(value));
+    if (num_bytes == sizeof(u64)) {
+        buffer.Fill(offset + sizeof(u32), sizeof(u32), static_cast<u32>(value >> 32));
+    }
+    return true;
+}
+
 void BufferCache::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, bool src_gds) {
     if (!dst_gds && !IsRegionGpuModified(dst, num_bytes) && !IsHostImportedRange(dst, num_bytes)) {
         if (!src_gds && !IsRegionGpuModified(src, num_bytes) &&
@@ -1001,7 +1034,7 @@ void BufferCache::JoinOverlap(BufferId new_buffer_id, BufferId overlap_id,
     DeleteBuffer(overlap_id);
 }
 
-BufferId BufferCache::CreateBuffer(VAddr device_addr, u32 wanted_size) {
+BufferId BufferCache::CreateBuffer(VAddr device_addr, u32 wanted_size, bool force_direct_import) {
     const VAddr device_addr_end = Common::AlignUp(device_addr + wanted_size, CACHING_PAGESIZE);
     device_addr = Common::AlignDown(device_addr, CACHING_PAGESIZE);
     wanted_size = static_cast<u32>(device_addr_end - device_addr);
@@ -1011,7 +1044,8 @@ BufferId BufferCache::CreateBuffer(VAddr device_addr, u32 wanted_size) {
         slot_buffers.insert(instance, scheduler, MemoryUsage::DeviceLocal, overlap.begin,
                             AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress, size);
     Buffer& new_buffer = slot_buffers[new_buffer_id];
-    const bool direct_candidate = IsLbp3NgDirectBackingCandidate(instance, size);
+    const bool direct_candidate = IsLbp3NgDirectBackingCandidate(instance, size) ||
+                                  (force_direct_import && IsLbp3KosmicKrisp(instance));
     if (direct_candidate) {
         Core::PerfTelemetry::Increment(Core::PerfTelemetry::Counter::DirectImportAttempts);
     }

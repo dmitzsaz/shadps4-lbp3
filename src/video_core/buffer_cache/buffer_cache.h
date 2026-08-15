@@ -135,6 +135,10 @@ public:
     /// Writes a value to GPU buffer. (uses command buffer to temporarily store the data)
     void FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds);
 
+    /// Records a completion value directly into coherent guest backing.
+    /// Returns false when a direct host import cannot be established.
+    [[nodiscard]] bool WriteGuestFence(VAddr address, u64 value, u32 num_bytes);
+
     /// Performs buffer to buffer data copy on the GPU.
     void CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, bool src_gds);
 
@@ -199,7 +203,7 @@ private:
 
     void JoinOverlap(BufferId new_buffer_id, BufferId overlap_id, bool accumulate_stream_score);
 
-    BufferId CreateBuffer(VAddr device_addr, u32 wanted_size);
+    BufferId CreateBuffer(VAddr device_addr, u32 wanted_size, bool force_direct_import = false);
 
     void Register(BufferId buffer_id);
 

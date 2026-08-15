@@ -1202,6 +1202,21 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
 
             if (rasterizer && fence_detector.IsFence(header)) {
                 const PM4CmdReleaseMem packet = *release_mem;
+                // GFX8 compute RELEASE_MEM uses INT_SEL=3 to mean
+                // SEND_DATA_AFTER_WR_CONFIRM, not an interrupt. Publish the
+                // completion value from the producer command buffer itself so
+                // the guest observes it after the dispatch without a host
+                // timeline waiter and CPU memcpy in between.
+                if (packet.int_sel == InterruptSelect::DataAfterWriteConfirm &&
+                    (packet.data_sel == DataSelect::Data32Low ||
+                     packet.data_sel == DataSelect::Data64)) {
+                    const u32 num_bytes = packet.data_sel == DataSelect::Data64 ? sizeof(u64)
+                                                                               : sizeof(u32);
+                    if (rasterizer->WriteGuestFence(packet.Address<VAddr>(), packet.DataQWord(),
+                                                    num_bytes)) {
+                        break;
+                    }
+                }
                 if (packet.data_sel == DataSelect::GdsMemStore) {
                     // The GDS transfer itself remains a GPU command. Only its
                     // externally visible interrupt is published after the

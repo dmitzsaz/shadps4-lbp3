@@ -413,6 +413,17 @@ u64 Rasterizer::Flush() {
     return current_tick;
 }
 
+bool Rasterizer::WriteGuestFence(VAddr address, u64 value, u32 num_bytes) {
+    if (!buffer_cache.WriteGuestFence(address, value, num_bytes)) {
+        return false;
+    }
+    const bool recorded_visibility = buffer_cache.CommitHostImportedWritesForCpu();
+    ASSERT(recorded_visibility);
+    guest_fence_recording_tick = scheduler.CurrentTick();
+    Core::PerfTelemetry::Increment(Core::PerfTelemetry::Counter::OrderedGuestReleases);
+    return true;
+}
+
 bool Rasterizer::DeferGuestFence(Common::UniqueFunction<void>&& callback) {
     const bool recorded_visibility = buffer_cache.CommitHostImportedWritesForCpu();
     const u64 current_tick = scheduler.CurrentTick();

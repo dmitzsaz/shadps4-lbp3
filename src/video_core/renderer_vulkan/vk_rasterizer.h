@@ -68,6 +68,7 @@ public:
 
     void CpSync();
     u64 Flush();
+    [[nodiscard]] bool WriteGuestFence(VAddr address, u64 value, u32 num_bytes);
     [[nodiscard]] bool DeferGuestFence(Common::UniqueFunction<void>&& callback);
     [[nodiscard]] bool HasPendingGuestFences() const noexcept;
     void Finish();

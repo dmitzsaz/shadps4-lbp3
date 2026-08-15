@@ -72,7 +72,7 @@ private:
             }
             case PM4ItOpcode::EventWriteEop: {
                 const auto* event_eop = reinterpret_cast<const PM4CmdEventWriteEop*>(header);
-                if (event_eop->int_sel != InterruptSelect::None) {
+                if (SelectsInterrupt(event_eop->int_sel)) {
                     fences.push_back({header});
                 }
                 if (event_eop->data_sel == DataSelect::Data32Low) {
@@ -101,7 +101,7 @@ private:
                            release_mem->data_sel == DataSelect::GdsMemStore) {
                     fences.push_back({header});
                 } else if (release_mem->data_sel == DataSelect::None &&
-                           release_mem->int_sel == InterruptSelect::IrqOnly) {
+                           SelectsInterrupt(release_mem->int_sel)) {
                     fences.push_back({header});
                 }
                 break;
