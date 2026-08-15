@@ -81,13 +81,15 @@ GraphicsPipeline::GraphicsPipeline(
         .pVertexAttributeDescriptions = sdata.vertex_attributes.data(),
     };
 
-    const auto topology = LiverpoolToVK::PrimitiveType(key.prim_type);
+    const auto topology = key.expand_quad_list ? vk::PrimitiveTopology::eTriangleList
+                                               : LiverpoolToVK::PrimitiveType(key.prim_type);
     const vk::PipelineInputAssemblyStateCreateInfo input_assembly = {
         .topology = topology,
     };
 
     const bool is_rect_list = key.prim_type == AmdGpu::PrimitiveType::RectList;
-    const bool is_quad_list = key.prim_type == AmdGpu::PrimitiveType::QuadList;
+    const bool is_quad_list =
+        key.prim_type == AmdGpu::PrimitiveType::QuadList && !key.expand_quad_list;
     const vk::PipelineTessellationStateCreateInfo tessellation_state = {
         .patchControlPoints = is_rect_list ? 3U : (is_quad_list ? 4U : key.patch_control_points),
     };

@@ -1090,6 +1090,8 @@ set(VIDEO_CORE src/video_core/amdgpu/cb_db_extent.h
                src/video_core/renderer_vulkan/vk_graphics_pipeline.h
                src/video_core/renderer_vulkan/vk_instance.cpp
                src/video_core/renderer_vulkan/vk_instance.h
+               src/video_core/renderer_vulkan/vk_lbp3_ng_cpu_hle.cpp
+               src/video_core/renderer_vulkan/vk_lbp3_ng_cpu_hle.h
                src/video_core/renderer_vulkan/vk_master_semaphore.cpp
                src/video_core/renderer_vulkan/vk_master_semaphore.h
                src/video_core/renderer_vulkan/vk_pipeline_cache.cpp

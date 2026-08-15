@@ -5,6 +5,7 @@
 
 #include "common/recursive_lock.h"
 #include "common/shared_first_mutex.h"
+#include "common/unique_function.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/page_manager.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
@@ -46,7 +47,7 @@ public:
     void DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u32 size, u32 max_count,
                       VAddr count_address);
 
-    void DispatchDirect();
+    void DispatchDirect(bool async_compute);
     void DispatchIndirect(VAddr address, u32 offset, u32 size);
 
     void ScopeMarkerBegin(const std::string_view& str, bool from_guest = false);
@@ -67,6 +68,12 @@ public:
 
     void CpSync();
     u64 Flush();
+    [[nodiscard]] u64 WriteGuestFence(VAddr address, u64 value, u32 num_bytes);
+    [[nodiscard]] bool DeferGuestFence(Common::UniqueFunction<void>&& callback);
+    [[nodiscard]] bool HasPendingGuestFences() const noexcept;
+    void MarkLbp3NgCpuHleDispatch() noexcept;
+    void MarkLbp3NgNativeGpuWork() noexcept;
+    [[nodiscard]] bool ConsumeLbp3NgCpuHlePhase() noexcept;
     void Finish();
     void OnSubmit();
 
@@ -90,10 +97,11 @@ private:
     void DepthStencilCopy(bool is_depth, bool is_stencil);
     void EliminateFastClear();
 
-    void UpdateDynamicState(const GraphicsPipeline* pipeline, bool is_indexed) const;
+    void UpdateDynamicState(const GraphicsPipeline* pipeline, bool is_indexed,
+                            bool force_disable_primitive_restart) const;
     void UpdateViewportScissorState() const;
     void UpdateDepthStencilState() const;
-    void UpdatePrimitiveState(bool is_indexed) const;
+    void UpdatePrimitiveState(bool is_indexed, bool force_disable_primitive_restart) const;
     void UpdateRasterizationState() const;
     void UpdateColorBlendingState(const GraphicsPipeline* pipeline) const;
 
@@ -144,6 +152,9 @@ private:
     boost::container::static_vector<BufferBindingInfo, Shader::NUM_BUFFERS> buffer_bindings;
     using ImageBindingInfo = std::pair<VideoCore::ImageId, VideoCore::TextureCache::ImageDesc>;
     boost::container::static_vector<ImageBindingInfo, Shader::NUM_IMAGES> image_bindings;
+    u64 guest_fence_recording_tick{};
+    bool lbp3_ng_cpu_hle_phase_started{};
+    bool lbp3_ng_cpu_hle_phase{};
     bool fault_process_pending{};
     bool attachment_feedback_loop{};
 };

@@ -143,7 +143,8 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(Stage stage, LogicalS
             regs.clipper_control.clip_space == AmdGpu::ClipSpace::MinusWToW;
         info.vs_info.tess_emulated_primitive =
             regs.primitive_type == AmdGpu::PrimitiveType::RectList ||
-            regs.primitive_type == AmdGpu::PrimitiveType::QuadList;
+            (regs.primitive_type == AmdGpu::PrimitiveType::QuadList &&
+             !graphics_key.expand_quad_list);
         info.vs_info.clip_disable = regs.IsClipDisabled();
         if (l_stage == LogicalStage::TessellationEval) {
             info.es_vs_info.tess_type = regs.tess_config.type;
@@ -364,8 +365,8 @@ PipelineCache::~PipelineCache() {
     Sync();
 }
 
-const GraphicsPipeline* PipelineCache::GetGraphicsPipeline() {
-    if (!RefreshGraphicsKey()) {
+const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(bool expand_quad_list) {
+    if (!RefreshGraphicsKey(expand_quad_list)) {
         return nullptr;
     }
     const auto [it, is_new] = graphics_pipelines.try_emplace(graphics_key);
@@ -435,7 +436,7 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
     return it->second.get();
 }
 
-bool PipelineCache::RefreshGraphicsKey() {
+bool PipelineCache::RefreshGraphicsKey(bool expand_quad_list) {
     std::memset(&graphics_key, 0, sizeof(GraphicsPipelineKey));
     const auto& regs = liverpool->regs;
     auto& key = graphics_key;
@@ -449,6 +450,7 @@ bool PipelineCache::RefreshGraphicsKey() {
                              : AmdGpu::DepthBuffer::StencilFormat::Invalid;
     key.depth_clamp_enable = !regs.depth_render_override.disable_viewport_clamp;
     key.depth_clip_enable = regs.clipper_control.ZclipEnable();
+    key.expand_quad_list = expand_quad_list;
     key.clip_space = regs.clipper_control.clip_space;
     key.provoking_vtx_last = regs.polygon_control.provoking_vtx_last;
     key.prim_type = regs.primitive_type;

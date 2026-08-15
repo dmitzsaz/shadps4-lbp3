@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "shader_recompiler/info.h"
+#include "video_core/renderer_vulkan/vk_lbp3_ng_cpu_hle.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_hle.h"
@@ -14,6 +15,7 @@ static constexpr u64 COPY_SHADER_HASH = 0xfefebf9f;
 
 static bool ExecuteCopyShaderHLE(const Shader::Info& info, const AmdGpu::ComputeProgram& cs_program,
                                  Rasterizer& rasterizer) {
+    rasterizer.MarkLbp3NgNativeGpuWork();
     auto& scheduler = rasterizer.GetScheduler();
     auto& buffer_cache = rasterizer.GetBufferCache();
 
@@ -121,7 +123,12 @@ static bool ExecuteCopyShaderHLE(const Shader::Info& info, const AmdGpu::Compute
 }
 
 bool ExecuteShaderHLE(const Shader::Info& info, const AmdGpu::Regs& regs,
-                      const AmdGpu::ComputeProgram& cs_program, Rasterizer& rasterizer) {
+                      const AmdGpu::ComputeProgram& cs_program, Rasterizer& rasterizer,
+                      bool async_compute) {
+    if (ExecuteLbp3NgCpuHle(info, cs_program, rasterizer, async_compute)) {
+        return true;
+    }
+
     switch (info.pgm_hash) {
     case COPY_SHADER_HASH:
         return ExecuteCopyShaderHLE(info, cs_program, rasterizer);

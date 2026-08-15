@@ -43,6 +43,15 @@ public:
     template <bool track, bool is_read = false>
     void UpdatePageWatchersForRegion(VAddr base_addr, RegionBits& mask) const;
 
+    /// Temporarily makes a mapped range CPU-readable and writable without
+    /// changing watcher counts. This is used while an external host-memory
+    /// API validates and retains the existing guest allocation.
+    void RelaxPageProtection(VAddr addr, u64 size) const;
+
+    /// Reapplies the permissions implied by all current page watchers after a
+    /// temporary RelaxPageProtection call.
+    void RefreshPageProtection(VAddr addr, u64 size) const;
+
     /// Returns page aligned address.
     static constexpr VAddr GetPageAddr(VAddr addr) {
         return Common::AlignDown(addr, PM_PAGE_SIZE);

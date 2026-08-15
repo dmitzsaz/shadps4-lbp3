@@ -104,11 +104,26 @@ public:
         }
     }
 
+    /// Immutable relative indices used to lower direct QuadList draws to TriangleList draws.
+    [[nodiscard]] const Buffer& GetQuadIndexBuffer() const noexcept {
+        return quad_index_buffer;
+    }
+
+    /// Number of valid u32 indices in the immutable QuadList index buffer.
+    [[nodiscard]] u32 GetQuadIndexCount() const noexcept {
+        const size_t quad_count = quad_index_buffer.SizeBytes() / (6 * sizeof(u32));
+        return static_cast<u32>(quad_count * 6);
+    }
+
     /// Invalidates any buffer in the logical page range.
     void InvalidateMemory(VAddr device_addr, u64 size, bool download = true);
 
     /// Flushes any GPU modified buffer in the logical page range back to CPU memory.
     void ReadMemory(VAddr device_addr, u64 size, bool is_write = false);
+
+    /// Marks bytes written through guest backing as CPU-authoritative. Host-imported buffers
+    /// retain direct backing and publish the host write on their next native bind.
+    void NotifyCpuWrite(VAddr device_addr, u64 size);
 
     /// Flushes GPU-modified data outside an image on its partially covered edge pages.
     void ReadEdgeImagePages(const Image& image);
@@ -123,6 +138,10 @@ public:
 
     /// Writes a value to GPU buffer. (uses command buffer to temporarily store the data)
     void FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds);
+
+    /// Records a completion value directly into coherent guest backing.
+    /// Returns false when a direct host import cannot be established.
+    [[nodiscard]] bool WriteGuestFence(VAddr address, u64 value, u32 num_bytes);
 
     /// Performs buffer to buffer data copy on the GPU.
     void CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, bool src_gds);
@@ -160,6 +179,10 @@ public:
     /// Synchronizes all buffers neede for DMA.
     void SynchronizeDmaBuffers();
 
+    /// Makes writes to direct host-imported buffers visible to the guest CPU.
+    /// Returns true when a GPU-to-host barrier was recorded.
+    [[nodiscard]] bool CommitHostImportedWritesForCpu();
+
     /// Runs the garbage collector.
     void RunGarbageCollector();
 
@@ -184,7 +207,7 @@ private:
 
     void JoinOverlap(BufferId new_buffer_id, BufferId overlap_id, bool accumulate_stream_score);
 
-    BufferId CreateBuffer(VAddr device_addr, u32 wanted_size);
+    BufferId CreateBuffer(VAddr device_addr, u32 wanted_size, bool force_direct_import = false);
 
     void Register(BufferId buffer_id);
 
@@ -205,6 +228,10 @@ private:
 
     void WriteDataBuffer(Buffer& buffer, VAddr address, const void* value, u32 num_bytes);
 
+    void TrackHostImportedWrite(const Buffer& buffer, VAddr device_addr, u64 size);
+
+    [[nodiscard]] bool IsHostImportedRange(VAddr device_addr, u64 size);
+
     void TouchBuffer(const Buffer& buffer);
 
     void DeleteBuffer(BufferId buffer_id);
@@ -218,6 +245,7 @@ private:
     std::unique_ptr<MemoryTracker> memory_tracker;
     StreamBuffer staging_buffer;
     StreamBuffer stream_buffer;
+    StreamBuffer quad_index_buffer;
     StreamBuffer download_buffer;
     StreamBuffer device_buffer;
     Buffer gds_buffer;
@@ -231,6 +259,13 @@ private:
     RangeSet gpu_modified_ranges;
     SplitRangeMap<BufferId> buffer_ranges;
     PageTable page_table;
+
+    struct HostImportedWriteRange {
+        vk::Buffer buffer{};
+        u64 begin{};
+        u64 end{};
+    };
+    boost::container::small_vector<HostImportedWriteRange, 4> pending_host_imported_writes;
 };
 
 } // namespace VideoCore

@@ -54,6 +54,7 @@ struct GraphicsPipelineKey {
         AmdGpu::ClipSpace clip_space : 1;
         AmdGpu::ProvokingVtxLast provoking_vtx_last : 1;
         u32 depth_clip_enable : 1;
+        u32 expand_quad_list : 1;
     };
 
     GraphicsPipelineKey() {

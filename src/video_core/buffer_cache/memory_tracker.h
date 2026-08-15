@@ -54,6 +54,14 @@ public:
                             });
     }
 
+    void RelaxProtectionForHostImport(VAddr cpu_addr, u64 size) const {
+        tracker->RelaxPageProtection(cpu_addr, size);
+    }
+
+    void RefreshProtectionAfterHostImport(VAddr cpu_addr, u64 size) const {
+        tracker->RefreshPageProtection(cpu_addr, size);
+    }
+
     /// Unmark region as modified from the host GPU
     void UnmarkRegionAsGpuModified(VAddr dirty_cpu_addr, u64 query_size) noexcept {
         IteratePages<false>(dirty_cpu_addr, query_size,

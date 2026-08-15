@@ -72,7 +72,7 @@ private:
             }
             case PM4ItOpcode::EventWriteEop: {
                 const auto* event_eop = reinterpret_cast<const PM4CmdEventWriteEop*>(header);
-                if (event_eop->int_sel != InterruptSelect::None) {
+                if (SelectsInterrupt(event_eop->int_sel)) {
                     fences.push_back({header});
                 }
                 if (event_eop->data_sel == DataSelect::Data32Low) {
@@ -96,6 +96,13 @@ private:
                     fences.push_back({header,
                                       reinterpret_cast<VAddr>(release_mem->Address<void*>()),
                                       release_mem->DataQWord()});
+                } else if (release_mem->data_sel == DataSelect::GpuClock64 ||
+                           release_mem->data_sel == DataSelect::PerfCounter ||
+                           release_mem->data_sel == DataSelect::GdsMemStore) {
+                    fences.push_back({header});
+                } else if (release_mem->data_sel == DataSelect::None &&
+                           SelectsInterrupt(release_mem->int_sel)) {
+                    fences.push_back({header});
                 }
                 break;
             }

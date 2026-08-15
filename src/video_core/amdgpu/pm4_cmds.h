@@ -334,8 +334,13 @@ enum class InterruptSelect : u32 {
     None = 0,
     IrqOnly = 1,
     IrqWhenWriteConfirm = 2,
-    IrqUndocumented = 3,
+    DataAfterWriteConfirm = 3,
 };
+
+constexpr bool SelectsInterrupt(InterruptSelect select) {
+    return select == InterruptSelect::IrqOnly ||
+           select == InterruptSelect::IrqWhenWriteConfirm;
+}
 
 static u64 GetGpuClock64() {
     auto now = std::chrono::high_resolution_clock::now();
@@ -495,6 +500,11 @@ struct PM4CmdEventWriteEop {
         switch (int_sel.Value()) {
         case InterruptSelect::None: {
             // No interrupt
+            break;
+        }
+        case InterruptSelect::DataAfterWriteConfirm: {
+            // INT_SEL=3 orders the data write after write confirmation; it does
+            // not generate an interrupt.
             break;
         }
         case InterruptSelect::IrqOnly:
@@ -934,22 +944,25 @@ struct PM4CmdReleaseMem {
         return data_lo | u64(data_hi) << 32;
     }
 
-    void SignalFence(auto&& signal_irq, auto&& gds_to_mem) const {
+    void SignalFence(auto&& write_mem, auto&& signal_irq, auto&& gds_to_mem) const {
         switch (data_sel.Value()) {
+        case DataSelect::None: {
+            break;
+        }
         case DataSelect::Data32Low: {
-            *Address<u32*>() = DataDWord();
+            write_mem(Address<void*>(), DataDWord(), sizeof(u32));
             break;
         }
         case DataSelect::Data64: {
-            *Address<u64*>() = DataQWord();
+            write_mem(Address<void*>(), DataQWord(), sizeof(u64));
             break;
         }
         case DataSelect::GpuClock64: {
-            *Address<u64*>() = GetGpuClock64();
+            write_mem(Address<void*>(), GetGpuClock64(), sizeof(u64));
             break;
         }
         case DataSelect::PerfCounter: {
-            *Address<u64*>() = GetGpuPerfCounter();
+            write_mem(Address<void*>(), GetGpuPerfCounter(), sizeof(u64));
             break;
         }
         case DataSelect::GdsMemStore: {
@@ -966,7 +979,13 @@ struct PM4CmdReleaseMem {
             // No interrupt
             break;
         }
-        case InterruptSelect::IrqUndocumented:
+        case InterruptSelect::DataAfterWriteConfirm: {
+            // AMD names INT_SEL=3 SEND_DATA_AFTER_WR_CONFIRM. The data write
+            // above is the notification; no guest IRQ accompanies it.
+            break;
+        }
+        case InterruptSelect::IrqOnly:
+            ASSERT(data_sel == DataSelect::None);
             [[fallthrough]];
         case InterruptSelect::IrqWhenWriteConfirm: {
             signal_irq();

@@ -198,7 +198,15 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     }
 
     const auto& regs = liverpool->regs;
-    const GraphicsPipeline* pipeline = pipeline_cache.GetGraphicsPipeline();
+    const u64 expanded_quad_index_count = (u64{regs.num_indices} / 4) * 6;
+    const bool expand_quad_list =
+        !is_indexed && regs.num_indices >= 4 &&
+        regs.primitive_type == AmdGpu::PrimitiveType::QuadList &&
+        regs.stage_enable.raw == AmdGpu::ShaderStageEnable::VgtStages::Vs &&
+        expanded_quad_index_count <= buffer_cache.GetQuadIndexCount();
+    const u32 expanded_index_count =
+        expand_quad_list ? static_cast<u32>(expanded_quad_index_count) : 0;
+    const GraphicsPipeline* pipeline = pipeline_cache.GetGraphicsPipeline(expand_quad_list);
     if (!pipeline) {
         return;
     }
@@ -212,10 +220,13 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     buffer_cache.BindVertexBuffers(*pipeline, buffer_barriers);
     if (is_indexed) {
         buffer_cache.BindIndexBuffer(index_offset, buffer_barriers);
+    } else if (expand_quad_list) {
+        scheduler.CommandBuffer().bindIndexBuffer(buffer_cache.GetQuadIndexBuffer().Handle(), 0,
+                                                  vk::IndexType::eUint32);
     }
 
     pipeline->BindResources(set_writes, buffer_barriers, push_data);
-    UpdateDynamicState(pipeline, is_indexed);
+    UpdateDynamicState(pipeline, is_indexed || expand_quad_list, expand_quad_list);
     scheduler.BeginRendering(state);
 
     const auto& vs_info = pipeline->GetStage(Shader::LogicalStage::Vertex);
@@ -227,6 +238,9 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
 
     if (is_indexed) {
         cmdbuf.drawIndexed(regs.num_indices, regs.num_instances.NumInstances(), 0,
+                           s32(vertex_offset), instance_offset);
+    } else if (expand_quad_list) {
+        cmdbuf.drawIndexed(expanded_index_count, regs.num_instances.NumInstances(), 0,
                            s32(vertex_offset), instance_offset);
     } else {
         cmdbuf.draw(regs.num_indices, regs.num_instances.NumInstances(), vertex_offset,
@@ -287,7 +301,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     }
 
     pipeline->BindResources(set_writes, buffer_barriers, push_data);
-    UpdateDynamicState(pipeline, is_indexed);
+    UpdateDynamicState(pipeline, is_indexed, false);
     scheduler.BeginRendering(state);
 
     // We can safely ignore both SGPR UD indices and results of fetch shader parsing, as vertex and
@@ -320,7 +334,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     ResetBindings();
 }
 
-void Rasterizer::DispatchDirect() {
+void Rasterizer::DispatchDirect(bool async_compute) {
     RENDERER_TRACE;
     Core::PerfTelemetry::Increment(Core::PerfTelemetry::Counter::DispatchCalls);
     Core::PerfTelemetry::ScopedTimer telemetry_timer{Core::PerfTelemetry::TimeMetric::DispatchCpu};
@@ -333,9 +347,10 @@ void Rasterizer::DispatchDirect() {
     }
 
     const auto& cs = pipeline->GetStage(Shader::LogicalStage::Compute);
-    if (ExecuteShaderHLE(cs, liverpool->regs, cs_program, *this)) {
+    if (ExecuteShaderHLE(cs, liverpool->regs, cs_program, *this, async_compute)) {
         return;
     }
+    MarkLbp3NgNativeGpuWork();
 
     if (!BindResources(pipeline)) {
         return;
@@ -389,10 +404,67 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
 u64 Rasterizer::Flush() {
     Core::PerfTelemetry::ScopedTimer telemetry_timer{
         Core::PerfTelemetry::TimeMetric::RasterFlushCpu};
+    static_cast<void>(buffer_cache.CommitHostImportedWritesForCpu());
+    const u64 guest_fence_tick = HasPendingGuestFences() ? guest_fence_recording_tick : 0;
+    if (guest_fence_tick != 0) {
+        Core::PerfTelemetry::Increment(Core::PerfTelemetry::Counter::GuestFenceSubmits);
+    }
     const u64 current_tick = scheduler.CurrentTick();
     SubmitInfo info{};
     scheduler.Flush(info);
     return current_tick;
+}
+
+u64 Rasterizer::WriteGuestFence(VAddr address, u64 value, u32 num_bytes) {
+    if (!buffer_cache.WriteGuestFence(address, value, num_bytes)) {
+        return 0;
+    }
+    const bool recorded_visibility = buffer_cache.CommitHostImportedWritesForCpu();
+    ASSERT(recorded_visibility);
+    guest_fence_recording_tick = scheduler.CurrentTick();
+    Core::PerfTelemetry::Increment(Core::PerfTelemetry::Counter::OrderedGuestReleases);
+    return guest_fence_recording_tick;
+}
+
+bool Rasterizer::DeferGuestFence(Common::UniqueFunction<void>&& callback) {
+    const bool recorded_visibility = buffer_cache.CommitHostImportedWritesForCpu();
+    const u64 current_tick = scheduler.CurrentTick();
+    if (!recorded_visibility && guest_fence_recording_tick != current_tick) {
+        return false;
+    }
+    // One producer can publish a value followed by a separate IRQ-only
+    // RELEASE_MEM. Once a direct-backed write has associated this command
+    // buffer with a guest fence, every following external publication on the
+    // same tick must wait for that producer as well.
+    guest_fence_recording_tick = current_tick;
+    Core::PerfTelemetry::Increment(Core::PerfTelemetry::Counter::OrderedGuestReleases);
+    scheduler.DeferPriorityOperation(std::move(callback));
+    return true;
+}
+
+bool Rasterizer::HasPendingGuestFences() const noexcept {
+    return guest_fence_recording_tick != 0 &&
+           scheduler.CurrentTick() == guest_fence_recording_tick;
+}
+
+void Rasterizer::MarkLbp3NgCpuHleDispatch() noexcept {
+    if (!lbp3_ng_cpu_hle_phase_started) {
+        lbp3_ng_cpu_hle_phase_started = true;
+        lbp3_ng_cpu_hle_phase = true;
+    }
+}
+
+void Rasterizer::MarkLbp3NgNativeGpuWork() noexcept {
+    if (lbp3_ng_cpu_hle_phase_started) {
+        lbp3_ng_cpu_hle_phase = false;
+    }
+}
+
+bool Rasterizer::ConsumeLbp3NgCpuHlePhase() noexcept {
+    const bool cpu_only = lbp3_ng_cpu_hle_phase_started && lbp3_ng_cpu_hle_phase;
+    lbp3_ng_cpu_hle_phase_started = false;
+    lbp3_ng_cpu_hle_phase = false;
+    return cpu_only;
 }
 
 void Rasterizer::Finish() {
@@ -1122,10 +1194,11 @@ void Rasterizer::UnmapMemory(VAddr addr, u64 size) {
     }
 }
 
-void Rasterizer::UpdateDynamicState(const GraphicsPipeline* pipeline, const bool is_indexed) const {
+void Rasterizer::UpdateDynamicState(const GraphicsPipeline* pipeline, const bool is_indexed,
+                                    const bool force_disable_primitive_restart) const {
     UpdateViewportScissorState();
     UpdateDepthStencilState();
-    UpdatePrimitiveState(is_indexed);
+    UpdatePrimitiveState(is_indexed, force_disable_primitive_restart);
     UpdateRasterizationState();
     UpdateColorBlendingState(pipeline);
 
@@ -1322,7 +1395,8 @@ void Rasterizer::UpdateDepthStencilState() const {
     }
 }
 
-void Rasterizer::UpdatePrimitiveState(const bool is_indexed) const {
+void Rasterizer::UpdatePrimitiveState(const bool is_indexed,
+                                      const bool force_disable_primitive_restart) const {
     const auto& regs = liverpool->regs;
     auto& dynamic_state = scheduler.GetDynamicState();
 
@@ -1341,7 +1415,7 @@ void Rasterizer::UpdatePrimitiveState(const bool is_indexed) const {
     };
 
     const auto prim_restart =
-        (regs.enable_primitive_restart & 1) != 0 &&
+        !force_disable_primitive_restart && (regs.enable_primitive_restart & 1) != 0 &&
         (instance.IsListRestartSupported() || !is_list_topology(regs.primitive_type)) &&
         (instance.IsPatchListRestartSupported() || !is_patch_list_topology(regs.primitive_type));
     ASSERT_MSG(!is_indexed || !prim_restart || regs.primitive_restart_index == 0xFFFF ||
