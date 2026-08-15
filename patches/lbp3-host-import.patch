@@ -1,0 +1,126 @@
+diff --git a/src/kosmickrisp/vulkan/kk_buffer.c b/src/kosmickrisp/vulkan/kk_buffer.c
+index 54a6be25404..f119907d7fe 100644
+--- a/src/kosmickrisp/vulkan/kk_buffer.c
++++ b/src/kosmickrisp/vulkan/kk_buffer.c
+@@ -155,17 +155,20 @@ kk_bind_buffer_memory(struct kk_device *dev, const VkBindBufferMemoryInfo *info)
+    VK_FROM_HANDLE(kk_device_memory, mem, info->memory);
+    VK_FROM_HANDLE(kk_buffer, buffer, info->buffer);
+ 
+-   if (mem->bo->mtl_handle)
++   if (mem->bo->mtl_handle) {
+       buffer->mtl_handle = mtl_new_buffer_with_length(
+          mem->bo->mtl_handle, buffer->vk.size, info->memoryOffset);
+-   else {
++      buffer->offset = 0u;
++   } else {
+       /* If the memory is not heap backed, for example if we imported a host
+        * pointer, use the mapped buffer directly and retain a reference */
+       buffer->mtl_handle = mem->bo->map;
++      buffer->offset = info->memoryOffset;
+       mtl_retain(buffer->mtl_handle);
+    }
+ 
+-   buffer->vk.device_address = mtl_buffer_get_gpu_address(buffer->mtl_handle);
++   buffer->vk.device_address =
++      mtl_buffer_get_gpu_address(buffer->mtl_handle) + buffer->offset;
+    /* We need Metal to give us a CPU mapping so it correctly captures the
+     * data in the GPU debugger... */
+    mtl_get_contents(buffer->mtl_handle);
+diff --git a/src/kosmickrisp/vulkan/kk_buffer.h b/src/kosmickrisp/vulkan/kk_buffer.h
+index 1d9744678b6..59a7eec15fc 100644
+--- a/src/kosmickrisp/vulkan/kk_buffer.h
++++ b/src/kosmickrisp/vulkan/kk_buffer.h
+@@ -18,6 +18,8 @@
+ struct kk_buffer {
+    struct vk_buffer vk;
+    mtl_buffer *mtl_handle;
++   /* Offset within handle's base address */
++   uint64_t offset;
+ };
+ 
+ VK_DEFINE_NONDISP_HANDLE_CASTS(kk_buffer, vk.base, VkBuffer,
+@@ -36,6 +38,12 @@ kk_buffer_addr_range(const struct kk_buffer *buffer, uint64_t offset,
+    };
+ }
+ 
++static inline uint64_t
++kk_buffer_absolute_offset(const struct kk_buffer *buffer, uint64_t offset)
++{
++   return buffer->offset + offset;
++}
++
+ static inline mtl_resource *
+ kk_buffer_to_mtl_resource(const struct kk_buffer *buffer)
+ {
+diff --git a/src/kosmickrisp/vulkan/kk_buffer_view.c b/src/kosmickrisp/vulkan/kk_buffer_view.c
+index c67ac82ed15..70ff32ca62a 100644
+--- a/src/kosmickrisp/vulkan/kk_buffer_view.c
++++ b/src/kosmickrisp/vulkan/kk_buffer_view.c
+@@ -100,7 +100,8 @@ kk_CreateBufferView(VkDevice _device, const VkBufferViewCreateInfo *pCreateInfo,
+    struct kk_buffer *buffer =
+       container_of(view->vk.buffer, struct kk_buffer, vk);
+    view->mtl_texel_buffer_handle = mtl_new_texture_with_descriptor_linear(
+-      buffer->mtl_handle, &layout, view->vk.offset);
++      buffer->mtl_handle, &layout,
++      kk_buffer_absolute_offset(buffer, view->vk.offset));
+    if (!view->mtl_texel_buffer_handle) {
+       vk_buffer_view_destroy(&dev->vk, pAllocator, &view->vk);
+       return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+diff --git a/src/kosmickrisp/vulkan/kk_cmd_copy.c b/src/kosmickrisp/vulkan/kk_cmd_copy.c
+index 2e76d14cc61..a5fcf3768d0 100644
+--- a/src/kosmickrisp/vulkan/kk_cmd_copy.c
++++ b/src/kosmickrisp/vulkan/kk_cmd_copy.c
+@@ -29,9 +29,10 @@ kk_CmdCopyBuffer2(VkCommandBuffer commandBuffer,
+    mtl_compute_encoder *encoder = cs_get_compute(cmd, true);
+    for (uint32_t i = 0; i < pCopyBufferInfo->regionCount; i++) {
+       const VkBufferCopy2 *region = &pCopyBufferInfo->pRegions[i];
+-      mtl_copy_from_buffer_to_buffer(encoder, src->mtl_handle,
+-                                     region->srcOffset, dst->mtl_handle,
+-                                     region->dstOffset, region->size);
++      mtl_copy_from_buffer_to_buffer(
++         encoder, src->mtl_handle,
++         kk_buffer_absolute_offset(src, region->srcOffset), dst->mtl_handle,
++         kk_buffer_absolute_offset(dst, region->dstOffset), region->size);
+    }
+ }
+ 
+@@ -100,7 +101,8 @@ kk_CmdCopyBufferToImage2(VkCommandBuffer commandBuffer,
+          vk_buffer_image_copy_to_mtl_buffer_image_copy(region, plane);
+       info.mtl_data.buffer = buffer->mtl_handle;
+       info.mtl_data.image = plane->mtl_handle;
+-      size_t buffer_offset = region->bufferOffset;
++      size_t buffer_offset =
++         kk_buffer_absolute_offset(buffer, region->bufferOffset);
+ 
+       kk_foreach_slice(slice, image, imageSubresource)
+       {
+@@ -130,7 +132,8 @@ kk_CmdCopyImageToBuffer2(VkCommandBuffer commandBuffer,
+          vk_buffer_image_copy_to_mtl_buffer_image_copy(region, plane);
+       info.mtl_data.buffer = buffer->mtl_handle;
+       info.mtl_data.image = plane->mtl_handle;
+-      size_t buffer_offset = region->bufferOffset;
++      size_t buffer_offset =
++         kk_buffer_absolute_offset(buffer, region->bufferOffset);
+ 
+       kk_foreach_slice(slice, image, imageSubresource)
+       {
+diff --git a/src/kosmickrisp/vulkan/kk_device_memory.c b/src/kosmickrisp/vulkan/kk_device_memory.c
+index 0e11cc2479b..e2089bc69b7 100644
+--- a/src/kosmickrisp/vulkan/kk_device_memory.c
++++ b/src/kosmickrisp/vulkan/kk_device_memory.c
+@@ -134,6 +134,15 @@ kk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
+           * only be usable for buffers */
+          mem->bo->map = mtl_new_buffer_with_bytes_no_copy(
+             dev->mtl_handle, host_info->pHostPointer, mem->vk.size);
++         if (mem->bo->map == NULL) {
++            result = vk_errorf(&dev->vk.base, VK_ERROR_INVALID_EXTERNAL_HANDLE,
++                               "Metal rejected imported host pointer %p "
++                               "with size 0x%" PRIx64,
++                               host_info->pHostPointer, mem->vk.size);
++            FREE(mem->bo);
++            mem->bo = NULL;
++            goto fail_alloc;
++         }
+          mem->bo->size_B = mtl_buffer_get_length(mem->bo->map);
+          kk_device_add_buffer_to_residency_set(dev, mem->bo->map);
+       }

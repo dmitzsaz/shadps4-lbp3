@@ -49,7 +49,8 @@ set(MESA_BINARY_DIR ${CMAKE_CURRENT_BINARY_DIR}/externals/mesa)
 # developer checkout may already contain the same changes.
 set(MESA_LBP3_PATCHES
     ${CMAKE_CURRENT_SOURCE_DIR}/patches/lbp3-metal-fixes.patch
-    ${CMAKE_CURRENT_SOURCE_DIR}/patches/lbp3-native-effects.patch)
+    ${CMAKE_CURRENT_SOURCE_DIR}/patches/lbp3-native-effects.patch
+    ${CMAKE_CURRENT_SOURCE_DIR}/patches/lbp3-host-import.patch)
 find_program(KK_GIT_EXECUTABLE REQUIRED NAMES git)
 foreach(MESA_LBP3_PATCH IN LISTS MESA_LBP3_PATCHES)
     execute_process(
