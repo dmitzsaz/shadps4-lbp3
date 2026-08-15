@@ -68,6 +68,30 @@ enum class TimeMetric : u8 {
     Count,
 };
 
+enum class PhaseEventKind : u8 {
+    ReleaseQueued,
+    ReleaseFlushBegin,
+    ReleaseFlushEnd,
+    ReleaseVisible,
+    ComputeWait,
+};
+
+struct PhaseEvent {
+    PhaseEventKind kind{};
+    u32 queue_id{~0u};
+    u64 timestamp_ns{};
+    u64 start_ns{};
+    u64 sequence{};
+    u64 related_sequence{};
+    VAddr address{};
+    u64 value{};
+    u64 tick{};
+    u64 yields{};
+    u32 reference{};
+    u32 observed_begin{};
+    u32 observed_end{};
+};
+
 void Start();
 void Stop();
 
@@ -76,6 +100,9 @@ void SetStartRequested(bool requested) noexcept;
 
 [[nodiscard]] bool IsEnabled() noexcept;
 [[nodiscard]] u64 GetRecordedFrameCount() noexcept;
+
+[[nodiscard]] u64 TimestampNs() noexcept;
+void RecordPhaseEvent(const PhaseEvent& event) noexcept;
 
 void Increment(Counter counter, u64 amount = 1) noexcept;
 void AddTime(TimeMetric metric, std::chrono::nanoseconds duration) noexcept;

@@ -16,6 +16,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #ifndef _WIN32
@@ -47,6 +48,28 @@ using Clock = std::chrono::steady_clock;
 constexpr size_t CounterCount = static_cast<size_t>(Counter::Count);
 constexpr size_t TimeMetricCount = static_cast<size_t>(TimeMetric::Count);
 std::atomic_bool start_requested{};
+
+[[nodiscard]] u64 ClockTimestampNs() noexcept {
+    return static_cast<u64>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch())
+            .count());
+}
+
+[[nodiscard]] std::string_view PhaseEventName(PhaseEventKind kind) noexcept {
+    switch (kind) {
+    case PhaseEventKind::ReleaseQueued:
+        return "release_queued";
+    case PhaseEventKind::ReleaseFlushBegin:
+        return "release_flush_begin";
+    case PhaseEventKind::ReleaseFlushEnd:
+        return "release_flush_end";
+    case PhaseEventKind::ReleaseVisible:
+        return "release_visible";
+    case PhaseEventKind::ComputeWait:
+        return "compute_wait";
+    }
+    return "unknown";
+}
 
 struct ProcessSnapshot {
     u64 cpu_ns{};
@@ -161,14 +184,16 @@ public:
         frame_path = stem.string() + "_frames.csv";
         sample_path = stem.string() + "_samples.csv";
         thread_path = stem.string() + "_threads.csv";
+        phase_path = stem.string() + "_phases.csv";
         meta_path = stem.string() + "_meta.txt";
 
         frames.open(frame_path, std::ios::out | std::ios::trunc);
         samples.open(sample_path, std::ios::out | std::ios::trunc);
         threads.open(thread_path, std::ios::out | std::ios::trunc);
+        phases.open(phase_path, std::ios::out | std::ios::trunc);
         metadata.open(meta_path, std::ios::out | std::ios::trunc);
         if (!frames.is_open() || !samples.is_open() || !threads.is_open() ||
-            !metadata.is_open()) {
+            !phases.is_open() || !metadata.is_open()) {
             LOG_ERROR(Core, "Could not open performance telemetry files in {}",
                       telemetry_dir.string());
             return;
@@ -194,6 +219,9 @@ public:
         samples << "elapsed_ms,thread_id,thread_name,kind,pc,image,image_offset,symbol,"
                    "symbol_offset,samples\n";
         threads << "elapsed_ms,thread_id,thread_name,cpu_percent,run_state\n";
+        phases << "event,end_elapsed_us,start_elapsed_us,duration_us,frame,queue,sequence,"
+                  "related_sequence,address,value,reference,observed_begin,observed_end,tick,"
+                  "yields\n";
 
         metadata << "serial=" << Common::ElfInfo::Instance().GameSerial() << '\n';
         metadata << "eboot_base=0x" << std::hex << MemoryPatcher::g_eboot_address << '\n';
@@ -201,6 +229,7 @@ public:
         metadata << "frames=" << frame_path.string() << '\n';
         metadata << "samples=" << sample_path.string() << '\n';
         metadata << "threads=" << thread_path.string() << '\n';
+        metadata << "phases=" << phase_path.string() << '\n';
         metadata.flush();
 
         for (auto& counter : counters) {
@@ -211,7 +240,13 @@ public:
         }
 
         frame_number = 0;
+        {
+            std::scoped_lock phase_lock{phase_mutex};
+            pending_phase_events.clear();
+            dropped_phase_events = 0;
+        }
         start_time = Clock::now();
+        start_timestamp_ns = ClockTimestampNs();
         last_frame_time = start_time;
         last_frame_flush = start_time;
         last_process = GetProcessSnapshot();
@@ -240,6 +275,8 @@ public:
         frames.flush();
         samples.flush();
         threads.flush();
+        FlushPhaseEvents();
+        phases.flush();
         metadata.flush();
         LOG_INFO(Core, "Performance telemetry stopped after {} frames; log {}", frame_number,
                  frame_path.string());
@@ -266,6 +303,25 @@ public:
         }
         timings[static_cast<size_t>(metric)].fetch_add(duration.count(),
                                                        std::memory_order_relaxed);
+    }
+
+    void RecordPhaseEvent(const PhaseEvent& event) noexcept {
+        if (!IsEnabled()) {
+            return;
+        }
+        try {
+            std::scoped_lock lock{phase_mutex};
+            // Bound memory if video output is paused while a compute queue keeps producing
+            // diagnostics. At the normal once-per-second drain this is never approached.
+            if (pending_phase_events.size() >= 262'144) {
+                ++dropped_phase_events;
+                return;
+            }
+            pending_phase_events.push_back(
+                {.event = event, .frame = recorded_frames.load(std::memory_order_relaxed)});
+        } catch (...) {
+            ++dropped_phase_events;
+        }
     }
 
     void RecordFrame(u32 pending_flips, u32 request_depth, u32 game_width, u32 game_height,
@@ -369,11 +425,49 @@ public:
 
         if (now - last_frame_flush >= std::chrono::seconds(1)) {
             frames.flush();
+            FlushPhaseEvents();
             last_frame_flush = now;
         }
     }
 
 private:
+    struct PendingPhaseEvent {
+        PhaseEvent event{};
+        u64 frame{};
+    };
+
+    void FlushPhaseEvents() {
+        std::vector<PendingPhaseEvent> local_events;
+        u64 local_dropped{};
+        {
+            std::scoped_lock lock{phase_mutex};
+            local_events.swap(pending_phase_events);
+            local_dropped = std::exchange(dropped_phase_events, 0);
+        }
+        for (const auto& pending : local_events) {
+            const auto& event = pending.event;
+            const u64 end_us = event.timestamp_ns >= start_timestamp_ns
+                                   ? (event.timestamp_ns - start_timestamp_ns) / 1'000
+                                   : 0;
+            const u64 start_us = event.start_ns >= start_timestamp_ns
+                                     ? (event.start_ns - start_timestamp_ns) / 1'000
+                                     : end_us;
+            phases << PhaseEventName(event.kind) << ',' << end_us << ',' << start_us << ','
+                   << (end_us - std::min(end_us, start_us)) << ',' << pending.frame << ','
+                   << event.queue_id << ',' << event.sequence << ',' << event.related_sequence
+                   << ",0x" << std::hex << event.address << ",0x" << event.value << ",0x"
+                   << event.reference << ",0x" << event.observed_begin << ",0x"
+                   << event.observed_end << std::dec << ',' << event.tick << ',' << event.yields
+                   << '\n';
+        }
+        if (local_dropped != 0) {
+            metadata << "dropped_phase_events=" << local_dropped << '\n';
+        }
+        if (!local_events.empty()) {
+            phases.flush();
+        }
+    }
+
 #ifdef __APPLE__
     void FlushThreadSamples(
         const Clock::time_point now,
@@ -560,11 +654,17 @@ private:
     std::ofstream frames;
     std::ofstream samples;
     std::ofstream threads;
+    std::ofstream phases;
     std::ofstream metadata;
     std::filesystem::path frame_path;
     std::filesystem::path sample_path;
     std::filesystem::path thread_path;
+    std::filesystem::path phase_path;
     std::filesystem::path meta_path;
+    std::mutex phase_mutex;
+    std::vector<PendingPhaseEvent> pending_phase_events;
+    u64 dropped_phase_events{};
+    u64 start_timestamp_ns{};
     Clock::time_point start_time{};
     Clock::time_point last_frame_time{};
     Clock::time_point last_frame_flush{};
@@ -605,6 +705,14 @@ bool IsEnabled() noexcept {
 
 u64 GetRecordedFrameCount() noexcept {
     return GetRecorder().GetFrameCount();
+}
+
+u64 TimestampNs() noexcept {
+    return ClockTimestampNs();
+}
+
+void RecordPhaseEvent(const PhaseEvent& event) noexcept {
+    GetRecorder().RecordPhaseEvent(event);
 }
 
 void Increment(Counter counter, u64 amount) noexcept {

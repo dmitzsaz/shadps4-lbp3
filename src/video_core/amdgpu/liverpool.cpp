@@ -23,6 +23,127 @@
 
 namespace AmdGpu {
 
+namespace {
+
+struct TrackedGuestRelease {
+    u64 sequence{};
+    u64 queued_ns{};
+    u64 tick{};
+    VAddr address{};
+    u64 value{};
+    u32 queue_id{};
+    u32 num_bytes{};
+    u32 observed_queued{};
+    bool active{};
+};
+
+constexpr size_t MaxTrackedGuestReleases = 512;
+std::array<TrackedGuestRelease, MaxTrackedGuestReleases> tracked_guest_releases{};
+std::array<u64, Liverpool::NumComputeRings> latest_guest_release_sequence{};
+std::array<u64, Liverpool::NumComputeRings> latest_visible_release_sequence{};
+u64 next_guest_release_sequence{1};
+u64 last_guest_release_poll_ns{};
+
+[[nodiscard]] u32 LoadGuestLabel(VAddr address) noexcept {
+    return *reinterpret_cast<volatile const u32*>(address);
+}
+
+u64 TrackGuestRelease(u32 queue_id, VAddr address, u64 value, u32 num_bytes, u64 tick) {
+    if (!Core::PerfTelemetry::IsEnabled() || queue_id >= Liverpool::NumComputeRings) {
+        return 0;
+    }
+
+    auto slot = std::ranges::find(tracked_guest_releases, false,
+                                  &TrackedGuestRelease::active);
+    if (slot == tracked_guest_releases.end()) {
+        slot = std::ranges::min_element(tracked_guest_releases, {},
+                                        &TrackedGuestRelease::sequence);
+    }
+
+    const u64 sequence = next_guest_release_sequence++;
+    const u64 now_ns = Core::PerfTelemetry::TimestampNs();
+    const u32 observed = LoadGuestLabel(address);
+    *slot = {
+        .sequence = sequence,
+        .queued_ns = now_ns,
+        .tick = tick,
+        .address = address,
+        .value = value,
+        .queue_id = queue_id,
+        .num_bytes = num_bytes,
+        .observed_queued = observed,
+        .active = true,
+    };
+    latest_guest_release_sequence[queue_id] = sequence;
+    Core::PerfTelemetry::RecordPhaseEvent({
+        .kind = Core::PerfTelemetry::PhaseEventKind::ReleaseQueued,
+        .queue_id = queue_id,
+        .timestamp_ns = now_ns,
+        .start_ns = now_ns,
+        .sequence = sequence,
+        .address = address,
+        .value = value,
+        .tick = tick,
+        .observed_begin = observed,
+        .observed_end = observed,
+    });
+    return sequence;
+}
+
+void PollGuestReleaseVisibility(Vulkan::Rasterizer* rasterizer) {
+    if (!Core::PerfTelemetry::IsEnabled()) {
+        return;
+    }
+    const u64 now_ns = Core::PerfTelemetry::TimestampNs();
+    if (now_ns - last_guest_release_poll_ns < 5'000) {
+        return;
+    }
+    last_guest_release_poll_ns = now_ns;
+
+    auto* memory = Core::Memory::Instance();
+    for (auto& release : tracked_guest_releases) {
+        if (!release.active) {
+            continue;
+        }
+        if (!memory->IsValidMapping(release.address, release.num_bytes)) {
+            release.active = false;
+            continue;
+        }
+        const u32 observed = LoadGuestLabel(release.address);
+        const u32 expected = static_cast<u32>(release.value);
+        if (observed != expected ||
+            (release.observed_queued == expected &&
+             (!rasterizer || !rasterizer->IsGuestFenceTickFree(release.tick)))) {
+            continue;
+        }
+        release.active = false;
+        latest_visible_release_sequence[release.queue_id] =
+            std::max(latest_visible_release_sequence[release.queue_id], release.sequence);
+        Core::PerfTelemetry::RecordPhaseEvent({
+            .kind = Core::PerfTelemetry::PhaseEventKind::ReleaseVisible,
+            .queue_id = release.queue_id,
+            .timestamp_ns = now_ns,
+            .start_ns = release.queued_ns,
+            .sequence = release.sequence,
+            .address = release.address,
+            .value = release.value,
+            .tick = release.tick,
+            .observed_begin = release.observed_queued,
+            .observed_end = observed,
+        });
+    }
+}
+
+[[nodiscard]] u64 LatestGuestReleaseSequence(u32 queue_id) noexcept {
+    if (queue_id >= Liverpool::NumComputeRings) {
+        return 0;
+    }
+    return std::max(latest_visible_release_sequence[queue_id],
+                    latest_guest_release_sequence[queue_id]);
+}
+
+} // namespace
+
 static const char* dcb_task_name{"DCB_TASK"};
 static const char* ccb_task_name{"CCB_TASK"};
 
@@ -151,6 +272,7 @@ void Liverpool::Process(std::stop_token stoken) {
             if (!task.done() && rasterizer && rasterizer->HasPendingGuestFences()) {
                 rasterizer->Flush();
             }
+            PollGuestReleaseVisibility(rasterizer);
 
             if (task.done()) {
                 task.destroy();
@@ -1178,8 +1300,32 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         case PM4ItOpcode::WaitRegMem: {
             const auto* wait_reg_mem = reinterpret_cast<const PM4CmdWaitRegMem*>(header);
             ASSERT(wait_reg_mem->engine.Value() == PM4CmdWaitRegMem::Engine::Me);
+            const bool trace_wait = Core::PerfTelemetry::IsEnabled() &&
+                                    wait_reg_mem->mem_space.Value() ==
+                                        PM4CmdWaitRegMem::MemSpace::Memory;
+            const u64 wait_start_ns =
+                trace_wait ? Core::PerfTelemetry::TimestampNs() : 0;
+            const u32 observed_begin =
+                trace_wait ? LoadGuestLabel(wait_reg_mem->Address<VAddr>()) : 0;
+            const u64 related_sequence = trace_wait ? LatestGuestReleaseSequence(vqid) : 0;
+            u64 wait_yields{};
             while (!wait_reg_mem->Test(regs.reg_array)) {
+                ++wait_yields;
                 YIELD_ASC(vqid);
+            }
+            if (trace_wait && (wait_yields != 0 || related_sequence != 0)) {
+                Core::PerfTelemetry::RecordPhaseEvent({
+                    .kind = Core::PerfTelemetry::PhaseEventKind::ComputeWait,
+                    .queue_id = vqid,
+                    .timestamp_ns = Core::PerfTelemetry::TimestampNs(),
+                    .start_ns = wait_start_ns,
+                    .related_sequence = related_sequence,
+                    .address = wait_reg_mem->Address<VAddr>(),
+                    .yields = wait_yields,
+                    .reference = wait_reg_mem->ref,
+                    .observed_begin = observed_begin,
+                    .observed_end = LoadGuestLabel(wait_reg_mem->Address<VAddr>()),
+                });
             }
             break;
         }
@@ -1212,8 +1358,10 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                      packet.data_sel == DataSelect::Data64)) {
                     const u32 num_bytes = packet.data_sel == DataSelect::Data64 ? sizeof(u64)
                                                                                : sizeof(u32);
-                    if (rasterizer->WriteGuestFence(packet.Address<VAddr>(), packet.DataQWord(),
-                                                    num_bytes)) {
+                    if (const u64 tick = rasterizer->WriteGuestFence(
+                            packet.Address<VAddr>(), packet.DataQWord(), num_bytes)) {
+                        TrackGuestRelease(vqid, packet.Address<VAddr>(), packet.DataQWord(),
+                                          num_bytes, tick);
                         break;
                     }
                 }

@@ -404,24 +404,40 @@ u64 Rasterizer::Flush() {
     Core::PerfTelemetry::ScopedTimer telemetry_timer{
         Core::PerfTelemetry::TimeMetric::RasterFlushCpu};
     static_cast<void>(buffer_cache.CommitHostImportedWritesForCpu());
-    if (HasPendingGuestFences()) {
+    const u64 guest_fence_tick = HasPendingGuestFences() ? guest_fence_recording_tick : 0;
+    const u64 flush_start_ns = Core::PerfTelemetry::TimestampNs();
+    if (guest_fence_tick != 0) {
         Core::PerfTelemetry::Increment(Core::PerfTelemetry::Counter::GuestFenceSubmits);
+        Core::PerfTelemetry::RecordPhaseEvent({
+            .kind = Core::PerfTelemetry::PhaseEventKind::ReleaseFlushBegin,
+            .timestamp_ns = flush_start_ns,
+            .start_ns = flush_start_ns,
+            .tick = guest_fence_tick,
+        });
     }
     const u64 current_tick = scheduler.CurrentTick();
     SubmitInfo info{};
     scheduler.Flush(info);
+    if (guest_fence_tick != 0) {
+        Core::PerfTelemetry::RecordPhaseEvent({
+            .kind = Core::PerfTelemetry::PhaseEventKind::ReleaseFlushEnd,
+            .timestamp_ns = Core::PerfTelemetry::TimestampNs(),
+            .start_ns = flush_start_ns,
+            .tick = guest_fence_tick,
+        });
+    }
     return current_tick;
 }
 
-bool Rasterizer::WriteGuestFence(VAddr address, u64 value, u32 num_bytes) {
+u64 Rasterizer::WriteGuestFence(VAddr address, u64 value, u32 num_bytes) {
     if (!buffer_cache.WriteGuestFence(address, value, num_bytes)) {
-        return false;
+        return 0;
     }
     const bool recorded_visibility = buffer_cache.CommitHostImportedWritesForCpu();
     ASSERT(recorded_visibility);
     guest_fence_recording_tick = scheduler.CurrentTick();
     Core::PerfTelemetry::Increment(Core::PerfTelemetry::Counter::OrderedGuestReleases);
-    return true;
+    return guest_fence_recording_tick;
 }
 
 bool Rasterizer::DeferGuestFence(Common::UniqueFunction<void>&& callback) {
@@ -443,6 +459,10 @@ bool Rasterizer::DeferGuestFence(Common::UniqueFunction<void>&& callback) {
 bool Rasterizer::HasPendingGuestFences() const noexcept {
     return guest_fence_recording_tick != 0 &&
            scheduler.CurrentTick() == guest_fence_recording_tick;
+}
+
+bool Rasterizer::IsGuestFenceTickFree(u64 tick) noexcept {
+    return scheduler.IsFree(tick);
 }
 
 void Rasterizer::Finish() {
