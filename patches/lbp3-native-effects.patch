@@ -1,0 +1,531 @@
+diff --git a/src/kosmickrisp/libkk/kk_draws.cl b/src/kosmickrisp/libkk/kk_draws.cl
+index 2ebed45accc..89cbc865b16 100644
+--- a/src/kosmickrisp/libkk/kk_draws.cl
++++ b/src/kosmickrisp/libkk/kk_draws.cl
+@@ -77,14 +77,27 @@ libkk_unroll_geometry(
+    constant uint32_t *in_draw, global uint32_t *out_draw,
+    uint32_t in_draw_stride_el, uint32_t restart_index,
+    uint32_t index_buffer_size_el, uint32_t in_el_size_B,
+-   uint32_t out_el_size_B, uint32_t flatshade_first, uint32_t mode)
++   uint32_t out_el_size_B, uint32_t flatshade_first,
++   uint32_t restart_enabled, uint32_t mode)
+ {
+    uint gid = cl_group_id.x;
+    in_draw += gid * in_draw_stride_el;
+    out_draw += gid * 5;
+ 
+    POLY_DECL_UNROLL_RESTART_SCRATCH(scratch, 1024);
++   local uint fan_scan_scratch[32];
++   local uint fan_segment_start;
++   local uintptr_t fan_out_ptr;
++
++   if (mode == MESA_PRIM_TRIANGLE_FAN && restart_enabled) {
++      poly_unroll_triangle_fan_linear(
++         out_draw, heap, in_draw, index_buffer, index_buffer_size_el,
++         in_el_size_B, out_el_size_B, restart_index, flatshade_first, scratch,
++         fan_scan_scratch, &fan_segment_start, &fan_out_ptr);
++      return;
++   }
++
+    poly_unroll_geometry(out_draw, heap, in_draw, index_buffer,
+                         index_buffer_size_el, in_el_size_B, out_el_size_B,
+-                        restart_index, flatshade_first, mode, scratch);
++                        restart_index, flatshade_first, true, mode, scratch);
+ }
+diff --git a/src/kosmickrisp/vulkan/kk_cmd_draw.c b/src/kosmickrisp/vulkan/kk_cmd_draw.c
+index 828f8b56427..52c9882b057 100644
+--- a/src/kosmickrisp/vulkan/kk_cmd_draw.c
++++ b/src/kosmickrisp/vulkan/kk_cmd_draw.c
+@@ -1040,10 +1040,11 @@ struct kk_draw_command {
+    bool indirect;
+    bool indexed;
+    bool restart;
++   bool flatshade_first;
++   uint8_t pad_[3];
+    uint32_t predicate_count;
+    enum kk_predicate_op predicate_op[2];
+    uint32_t draw_count;
+-   uint32_t pad_;
+    uint64_t predicate_addr[2];
+ 
+    union {
+@@ -1467,7 +1468,8 @@ kk_unroll_geometry(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
+                        : 0u,
+       .in_el_size_B = data->index_buffer_el_size_B,
+       .out_el_size_B = 4u,
+-      .flatshade_first = true,
++      .flatshade_first = data->flatshade_first,
++      .restart_enabled = data->restart && data->indexed,
+       .mode = data->prim,
+    };
+ 
+@@ -1483,6 +1485,7 @@ kk_unroll_geometry(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
+    data->indirect = true;
+    data->indexed = true;
+    data->restart = false;
++   data->flatshade_first = true;
+    data->indirect_command.addr = out_draws.gpu;
+    data->indirect_command.stride = sizeof(VkDrawIndexedIndirectCommand);
+ 
+@@ -1596,7 +1599,7 @@ kk_dispatch_draw(struct kk_cmd_buffer *cmd, struct kk_draw_data data)
+ }
+ 
+ static bool
+-requires_index_promotion(const struct kk_draw_command *data)
++requires_unroll_index_promotion(const struct kk_draw_command *data)
+ {
+    if (!data->indexed)
+       return false;
+@@ -1705,6 +1708,38 @@ requires_unroll_restart(struct kk_cmd_buffer *cmd,
+    return data->restart_index != default_idx;
+ }
+ 
++static bool
++requires_unroll_flatshade(struct kk_cmd_buffer *cmd,
++                          struct kk_draw_command *data)
++{
++   struct kk_shader *fs = cmd->state.shaders[MESA_SHADER_FRAGMENT];
++
++   /* If the last vertex is provoking and the fragment shader uses flat inputs,
++    * we need to unroll to correct the vertex order */
++   return !data->flatshade_first && fs && fs->info.fs.uses_flat_varyings;
++}
++
++static bool
++requires_unroll(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
++{
++   /* No need to unroll for tessellation. Robustness is handled by tessellator,
++    * restart is not supported for patch lists, and flat-shading does not have a
++    * well-defined vertex used when tessellating. */
++   bool tess = cmd->state.shaders[MESA_SHADER_TESS_EVAL];
++   if (tess)
++      return false;
++
++   /* Metal does not support triangle fans */
++   if (data->prim == MESA_PRIM_TRIANGLE_FAN)
++      return true;
++
++   /* Check for remaining unroll conditions */
++   return requires_unroll_index_promotion(data) ||
++          requires_unroll_robustness(cmd, data) ||
++          requires_unroll_restart(cmd, data) ||
++          requires_unroll_flatshade(cmd, data);
++}
++
+ static uint64_t
+ upload_base_vertex(struct kk_cmd_buffer *cmd, const struct kk_draw_data *data)
+ {
+@@ -1912,11 +1947,14 @@ build_draw_data(struct kk_cmd_buffer *cmd, struct kk_draw_command *data,
+ static void
+ kk_draw(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
+ {
++   struct vk_dynamic_graphics_state *dyn = &cmd->vk.dynamic_graphics_state;
++
+    kk_flush_gfx_state(cmd);
+ 
+-   data->restart = cmd->vk.dynamic_graphics_state.ia.primitive_restart_enable;
+-   data->restart_index =
+-      cmd->vk.dynamic_graphics_state.ia.primitive_restart_index;
++   data->restart = dyn->ia.primitive_restart_enable;
++   data->restart_index = dyn->ia.primitive_restart_index;
++   data->flatshade_first =
++      dyn->rs.provoking_vertex == VK_PROVOKING_VERTEX_MODE_FIRST_VERTEX_EXT;
+ 
+    /* Convert to indirect and process predicates. Skip draw if we fail. */
+    if (data->predicate_count > 0 && !kk_predicate_draws(cmd, data))
+@@ -1924,13 +1962,8 @@ kk_draw(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
+ 
+    bool tess = cmd->state.shaders[MESA_SHADER_TESS_EVAL];
+ 
+-   /* Unroll geometry. Skip draw if we fail. No need to unroll if tessellation
+-    * is present since it also handles unrolling. */
+-   bool requires_unroll = !tess && (data->prim == MESA_PRIM_TRIANGLE_FAN ||
+-                                    requires_index_promotion(data) ||
+-                                    requires_unroll_robustness(cmd, data) ||
+-                                    requires_unroll_restart(cmd, data));
+-   if (requires_unroll && !kk_unroll_geometry(cmd, data))
++   /* Unroll geometry. Skip draw if we fail. */
++   if (requires_unroll(cmd, data) && !kk_unroll_geometry(cmd, data))
+       return;
+ 
+    for (uint32_t i = 0; i < data->draw_count; i++) {
+diff --git a/src/kosmickrisp/vulkan/kk_physical_device.c b/src/kosmickrisp/vulkan/kk_physical_device.c
+index f7da7bf5f32..87a6ca32d36 100644
+--- a/src/kosmickrisp/vulkan/kk_physical_device.c
++++ b/src/kosmickrisp/vulkan/kk_physical_device.c
+@@ -184,6 +184,7 @@ kk_get_device_extensions(const struct kk_instance *instance,
+       .EXT_post_depth_coverage = true,
+       .EXT_primitive_restart_index = true,
+       .EXT_primitive_topology_list_restart = true,
++      .EXT_provoking_vertex = true,
+       .EXT_robustness2 = true,
+       .EXT_sample_locations = true,
+       .EXT_shader_atomic_float = true,
+@@ -439,6 +440,7 @@ kk_get_device_features(
+       .extendedDynamicState3DepthClampEnable = true,
+       .extendedDynamicState3DepthClipNegativeOneToOne = true,
+       .extendedDynamicState3LineRasterizationMode = true,
++      .extendedDynamicState3ProvokingVertexMode = true,
+       .extendedDynamicState3SampleLocationsEnable = true,
+       .extendedDynamicState3TessellationDomainOrigin = true,
+ 
+@@ -461,6 +463,9 @@ kk_get_device_features(
+       .primitiveTopologyListRestart = true,
+       .primitiveTopologyPatchListRestart = false,
+ 
++      /* VK_EXT_provoking_vertex */
++      .provokingVertexLast = true,
++
+       /* VK_EXT_shader_replicated_composites */
+       .shaderReplicatedComposites = true,
+ 
+diff --git a/src/kosmickrisp/vulkan/kk_shader.c b/src/kosmickrisp/vulkan/kk_shader.c
+index 545448ea4db..0b23d1eb57f 100644
+--- a/src/kosmickrisp/vulkan/kk_shader.c
++++ b/src/kosmickrisp/vulkan/kk_shader.c
+@@ -676,6 +676,23 @@ gather_vs_inputs(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+    return false;
+ }
+ 
++static bool
++fs_uses_flat_varying(nir_shader *nir)
++{
++   nir_foreach_function_impl(impl, nir) {
++      nir_foreach_block_safe(block, impl) {
++         nir_foreach_instr_safe(instr, block) {
++            if (instr->type == nir_instr_type_intrinsic) {
++               nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
++               if (intr->intrinsic == nir_intrinsic_load_input)
++                  return true;
++            }
++         }
++      }
++   }
++   return false;
++}
++
+ static void
+ gather_shader_info(struct kk_shader *shader, nir_shader *nir,
+                    const struct vk_graphics_pipeline_state *state)
+@@ -692,6 +709,7 @@ gather_shader_info(struct kk_shader *shader, nir_shader *nir,
+        * which is not a valid Metal layout */
+       if (nir->info.fs.depth_layout == FRAG_DEPTH_LAYOUT_NONE)
+          nir->info.fs.depth_layout = FRAG_DEPTH_LAYOUT_ANY;
++      shader->info.fs.uses_flat_varyings = fs_uses_flat_varying(nir);
+    } else if (nir->info.stage == MESA_SHADER_COMPUTE) {
+       shader->info.cs.local_size.x = nir->info.workgroup_size[0];
+       shader->info.cs.local_size.y = nir->info.workgroup_size[1];
+diff --git a/src/kosmickrisp/vulkan/kk_shader.h b/src/kosmickrisp/vulkan/kk_shader.h
+index 123bf047913..3bbbc2e018f 100644
+--- a/src/kosmickrisp/vulkan/kk_shader.h
++++ b/src/kosmickrisp/vulkan/kk_shader.h
+@@ -99,6 +99,10 @@ struct kk_shader_info {
+          struct kk_tess_info info;
+       } tess;
+ 
++      struct {
++         bool uses_flat_varyings;
++      } fs;
++
+       struct {
+          struct mtl_size local_size;
+       } cs;
+diff --git a/src/poly/cl/restart.h b/src/poly/cl/restart.h
+index 995720da0ea..08a53260f15 100644
+--- a/src/poly/cl/restart.h
++++ b/src/poly/cl/restart.h
+@@ -126,6 +126,77 @@ poly_work_group_first_true(bool cond, local void *scratch)
+    return num_sg * sg_size;
+ }
+ 
++static inline uint
++poly_ballot_word(uint4 ballot, uint word)
++{
++   if (word == 0)
++      return ballot.x;
++   if (word == 1)
++      return ballot.y;
++   if (word == 2)
++      return ballot.z;
++   return ballot.w;
++}
++
++/* Return the last set lane at or below max_lane, or UINT32_MAX when empty. */
++static inline uint
++poly_ballot_find_msb_upto(uint4 ballot, uint max_lane)
++{
++   int word = max_lane >> 5;
++   uint bit = max_lane & 31;
++
++   for (; word >= 0; --word) {
++      uint value = poly_ballot_word(ballot, word);
++      if (bit != 31)
++         value &= (1u << (bit + 1)) - 1u;
++
++      if (value)
++         return (word * 32) + (31 - clz(value));
++
++      bit = 31;
++   }
++
++   return UINT32_MAX;
++}
++
++/*
++ * Return the first source position in the current restart-delimited segment.
++ * Unlike poly_work_group_first_true(), this performs a fixed amount of work
++ * for a whole tile. Restart-dense streams therefore cost O(input count), not
++ * O(restart count * workgroup size).
++ */
++static inline uint
++poly_work_group_segment_start(bool restart, uint tile_base,
++                              uint carried_segment_start,
++                              local void *scratch)
++{
++   const uint sg_size = get_sub_group_size();
++   const uint sg_id = get_sub_group_id();
++   const uint lane = get_sub_group_local_id();
++
++   uint4 ballot = sub_group_ballot(restart);
++
++   /* Do not overwrite ballot storage until every subgroup has finished the
++    * previous tile, then publish one complete ballot per subgroup. */
++   barrier(CLK_LOCAL_MEM_FENCE);
++   if (lane == 0)
++      poly_store_local_ballot_arr(scratch, sg_id, ballot);
++   barrier(CLK_LOCAL_MEM_FENCE);
++
++   int search_sg = sg_id;
++   uint latest_lane = poly_ballot_find_msb_upto(ballot, lane);
++   while (latest_lane == UINT32_MAX && search_sg > 0) {
++      --search_sg;
++      ballot = poly_load_local_ballot_arr(scratch, search_sg);
++      latest_lane = poly_ballot_find_msb_upto(ballot, sg_size - 1);
++   }
++
++   if (latest_lane == UINT32_MAX)
++      return carried_segment_start;
++
++   return tile_base + (search_sg * sg_size) + latest_lane + 1;
++}
++
+ /*
+  * When unrolling the index buffer for a draw, we translate the old indirect
+  * draws to new indirect draws. This routine allocates the new index buffer and
+@@ -163,6 +234,138 @@ poly_setup_unroll_for_draw(global struct poly_heap *heap,
+    return (global uchar *)heap->base + old_heap_bottom_B;
+ }
+ 
++/*
++ * Restart-aware TriangleFan conversion with cost bounded by input length.
++ *
++ * The first pass classifies each source index by the most recent restart,
++ * counts valid triangles, and allocates the exact output size. Empty streams
++ * publish a zero indirect count without consuming generated-geometry heap.
++ * The second pass repeats the classification and emits compact triangles.
++ */
++static inline void
++poly_unroll_triangle_fan_linear(global uint32_t *out_draw,
++                                global struct poly_heap *heap,
++                                constant uint *in_draw,
++                                uint64_t index_buffer,
++                                uint32_t index_buffer_range_el,
++                                uint32_t in_index_size_B,
++                                uint32_t out_index_size_B,
++                                uint32_t restart_index,
++                                uint32_t flatshade_first,
++                                local void *ballot_scratch,
++                                local uint *scan_scratch,
++                                local uint *shared_segment_start,
++                                local uintptr_t *shared_out_ptr)
++{
++   const uint tid = cl_local_id.x;
++   const uint wg_size = cl_local_size.x;
++   const uint count = in_draw[0];
++
++   const uintptr_t in_ptr = (uintptr_t)(poly_index_buffer(
++      index_buffer, index_buffer_range_el, in_draw[2], in_index_size_B));
++   const uint in_range_el = poly_index_buffer_range_el(
++      index_buffer_range_el, in_draw[2]);
++
++   if (tid == 0) {
++      const uint vertex_offset_idx = in_index_size_B > 0 ? 3 : 2;
++      out_draw[0] = 0;
++      out_draw[1] = in_draw[1];
++      out_draw[2] = 0;
++      out_draw[3] = in_draw[vertex_offset_idx];
++      out_draw[4] = in_draw[vertex_offset_idx + 1];
++      *shared_segment_start = 0;
++      *shared_out_ptr = 0;
++   }
++   barrier(CLK_LOCAL_MEM_FENCE);
++
++   uint carried_segment_start = 0;
++   uint triangle_count = 0;
++   for (uint tile_base = 0; tile_base < count; tile_base += wg_size) {
++      const uint source_pos = tile_base + tid;
++      const bool in_bounds = source_pos < count;
++      const uint value = in_bounds
++                            ? poly_load_index(in_ptr, in_range_el, source_pos,
++                                              in_index_size_B)
++                            : 0;
++      const bool restart = in_bounds && value == restart_index;
++      const uint segment_start = poly_work_group_segment_start(
++         restart, tile_base, carried_segment_start, ballot_scratch);
++      const bool valid = in_bounds && !restart &&
++                         source_pos >= segment_start &&
++                         source_pos - segment_start >= 2;
++
++      const uint2 scan = poly_work_group_scan_inclusive_add(valid, scan_scratch);
++      triangle_count += scan.y;
++
++      if (tid == wg_size - 1)
++         *shared_segment_start = segment_start;
++      barrier(CLK_LOCAL_MEM_FENCE);
++      carried_segment_start = *shared_segment_start;
++   }
++
++   if (tid == 0) {
++      out_draw[0] = triangle_count * 3;
++      if (triangle_count) {
++         const uint alloc_size = triangle_count * 3 * out_index_size_B;
++         const uint out_offset = poly_heap_alloc_offs(heap, alloc_size);
++         out_draw[2] = out_offset / out_index_size_B;
++         *shared_out_ptr = (uintptr_t)((global uchar *)heap->base + out_offset);
++      }
++      *shared_segment_start = 0;
++   }
++   barrier(CLK_LOCAL_MEM_FENCE);
++
++   if (triangle_count == 0)
++      return;
++
++   const uintptr_t out_ptr = *shared_out_ptr;
++   carried_segment_start = 0;
++   uint output_triangle_base = 0;
++   for (uint tile_base = 0; tile_base < count; tile_base += wg_size) {
++      const uint source_pos = tile_base + tid;
++      const bool in_bounds = source_pos < count;
++      const uint current = in_bounds
++                              ? poly_load_index(in_ptr, in_range_el, source_pos,
++                                                in_index_size_B)
++                              : 0;
++      const bool restart = in_bounds && current == restart_index;
++      const uint segment_start = poly_work_group_segment_start(
++         restart, tile_base, carried_segment_start, ballot_scratch);
++      const bool valid = in_bounds && !restart &&
++                         source_pos >= segment_start &&
++                         source_pos - segment_start >= 2;
++
++      const uint2 scan = poly_work_group_scan_inclusive_add(valid, scan_scratch);
++      if (valid) {
++         const uint anchor = poly_load_index(in_ptr, in_range_el, segment_start,
++                                             in_index_size_B);
++         const uint previous = poly_load_index(in_ptr, in_range_el, source_pos - 1,
++                                               in_index_size_B);
++         const uint output = (output_triangle_base + scan.x - 1) * 3;
++
++         if (flatshade_first) {
++            /* Vulkan first-provoking fan: (previous, current, anchor). */
++            poly_store_index(out_ptr, out_index_size_B, output + 0, previous);
++            poly_store_index(out_ptr, out_index_size_B, output + 1, current);
++            poly_store_index(out_ptr, out_index_size_B, output + 2, anchor);
++         } else {
++            /* Metal is first-provoking. Rotate (anchor, previous, current) to
++             * (current, anchor, previous), preserving winding while making the
++             * original last vertex provoking. */
++            poly_store_index(out_ptr, out_index_size_B, output + 0, current);
++            poly_store_index(out_ptr, out_index_size_B, output + 1, anchor);
++            poly_store_index(out_ptr, out_index_size_B, output + 2, previous);
++         }
++      }
++
++      output_triangle_base += scan.y;
++      if (tid == wg_size - 1)
++         *shared_segment_start = segment_start;
++      barrier(CLK_LOCAL_MEM_FENCE);
++      carried_segment_start = *shared_segment_start;
++   }
++}
++
+ static inline void
+ poly_unroll_geometry(global uint32_t *out_draw,
+                      global struct poly_heap *heap,
+@@ -173,6 +376,7 @@ poly_unroll_geometry(global uint32_t *out_draw,
+                      uint32_t out_index_size_B,
+                      uint32_t restart_index,
+                      uint32_t flatshade_first,
++                     uint32_t emulate_flatshade_last,
+                      enum mesa_prim mode,
+                      local void *scratch)
+ {
+@@ -229,7 +433,9 @@ poly_unroll_geometry(global uint32_t *out_draw,
+                                                   vtx, subprims);
+             uint offset = needle + id;
+ 
+-            uint x = ((out_prims_base + i) * per_prim) + vtx;
++            uint vtx_out = poly_output_vertex_id_for_topology(
++               mode, flatshade_first, emulate_flatshade_last, vtx);
++            uint x = ((out_prims_base + i) * per_prim) + vtx_out;
+             uint y = poly_load_index(in_ptr, in_range_el, offset,
+                                      in_index_size_B);
+ 
+@@ -259,7 +465,7 @@ poly_unroll_restart(global uint32_t *out_draw,
+ {
+    poly_unroll_geometry(out_draw, heap, in_draw, index_buffer,
+                         index_buffer_range_el, index_size_B, index_size_B,
+-                        restart_index, flatshade_first, mode, scratch);
++                        restart_index, flatshade_first, false, mode, scratch);
+ }
+ 
+ static inline uint32_t
+diff --git a/src/poly/prim.h b/src/poly/prim.h
+index 1eeb126b59e..17d9bbdcf9c 100644
+--- a/src/poly/prim.h
++++ b/src/poly/prim.h
+@@ -145,3 +145,45 @@ poly_vertex_id_for_topology(enum mesa_prim mode, bool flatshade_first,
+       return 0;
+    }
+ }
++
++static inline uint32_t
++poly_output_vertex_id_for_topology(enum mesa_prim mode, bool flatshade_first,
++                                   bool emulate_flatshade_last, uint vtx)
++{
++   /* No need to adjust vertex ID if not emulating last-vertex provoking */
++   if (flatshade_first || !emulate_flatshade_last)
++      return vtx;
++
++   /* Note that the output vertices are for the decomposed primitive type, so we
++    * don't differentiate between lists, strips, fans, etc. */
++   switch (mode) {
++   case MESA_PRIM_POINTS:
++      return vtx;
++
++   case MESA_PRIM_LINES:
++   case MESA_PRIM_LINE_LOOP:
++   case MESA_PRIM_LINE_STRIP:
++      /* Don't need to worry about winding, just invert vertex order */
++      return 1 - vtx;
++
++   case MESA_PRIM_TRIANGLES:
++   case MESA_PRIM_TRIANGLE_STRIP:
++   case MESA_PRIM_TRIANGLE_FAN:
++      /* Rotate from [a, b, c] to [c, a, b] to move last vertex to be provoking
++       * while preserving the winding order */
++      return (vtx == 2) ? 0 : vtx + 1;
++
++   case MESA_PRIM_LINES_ADJACENCY:
++   case MESA_PRIM_LINE_STRIP_ADJACENCY:
++      /* Same as regular lines, but accounting for adjacency vertices */
++      return 3 - vtx;
++
++   case MESA_PRIM_TRIANGLES_ADJACENCY:
++   case MESA_PRIM_TRIANGLE_STRIP_ADJACENCY:
++      /* Same as regular triangles, but accounting for adjacency vertices */
++      return (vtx > 3) ? vtx & 1 : vtx + 2;
++
++   default:
++      return 0;
++   }
++}
