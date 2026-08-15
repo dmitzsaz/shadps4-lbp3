@@ -32,6 +32,17 @@ enum class Counter : u8 {
     GuestWriteFaults,
     GuestReadFaults,
     PresentCalls,
+    DirectImportAttempts,
+    DirectImportSuccesses,
+    DirectImportFailures,
+    DirectBufferBinds,
+    DirectReadbackBytes,
+    DirectUploadBytes,
+    DirectFaultSubmits,
+    DirectFaultFinishes,
+    DirectVisibilityBarriers,
+    OrderedGuestReleases,
+    GuestFenceSubmits,
     Count,
 };
 

@@ -186,6 +186,10 @@ public:
                   "gpu_frames,gfx_submits,asc_submits,gfx_dwords,asc_dwords,"
                   "gfx_pipeline_compiles,compute_pipeline_compiles,guest_shader_compiles,"
                   "host_shader_compiles,guest_write_faults,guest_read_faults,present_calls,"
+                  "direct_import_attempts,direct_import_successes,direct_import_failures,"
+                  "direct_buffer_binds,direct_readback_bytes,direct_upload_bytes,"
+                  "direct_fault_submits,direct_fault_finishes,direct_visibility_barriers,"
+                  "ordered_guest_releases,guest_fence_submits,"
                   "guest_stall_ms,guest_stall_active\n";
         samples << "elapsed_ms,thread_id,thread_name,kind,pc,image,image_offset,symbol,"
                    "symbol_offset,samples\n";
@@ -349,6 +353,17 @@ public:
                << counter(Counter::HostShaderCompiles) << ','
                << counter(Counter::GuestWriteFaults) << ','
                << counter(Counter::GuestReadFaults) << ',' << counter(Counter::PresentCalls) << ','
+               << counter(Counter::DirectImportAttempts) << ','
+               << counter(Counter::DirectImportSuccesses) << ','
+               << counter(Counter::DirectImportFailures) << ','
+               << counter(Counter::DirectBufferBinds) << ','
+               << counter(Counter::DirectReadbackBytes) << ','
+               << counter(Counter::DirectUploadBytes) << ','
+               << counter(Counter::DirectFaultSubmits) << ','
+               << counter(Counter::DirectFaultFinishes) << ','
+               << counter(Counter::DirectVisibilityBarriers) << ','
+               << counter(Counter::OrderedGuestReleases) << ','
+               << counter(Counter::GuestFenceSubmits) << ','
                << std::chrono::duration<double, std::milli>(guest_stall_delta).count() << ','
                << (guest_stall.active ? 1 : 0) << '\n';
 

@@ -355,6 +355,35 @@ struct PageManager::Impl {
         release_pending();
     }
 
+    void RelaxPageProtection(VAddr addr, u64 size) {
+        RENDERER_TRACE;
+        const u64 page = addr >> PM_PAGE_BITS;
+        const u64 page_end = Common::DivCeil(addr + size, PM_PAGE_SIZE);
+        const auto lock_start = locks.begin() + (page / PAGES_PER_LOCK);
+        const auto lock_end = locks.begin() + Common::DivCeil(page_end, PAGES_PER_LOCK);
+        Common::RangeLockGuard lk(lock_start, lock_end);
+        Protect(page << PM_PAGE_BITS, (page_end - page) << PM_PAGE_BITS,
+                Core::MemoryPermission::ReadWrite);
+    }
+
+    void RefreshPageProtection(VAddr addr, u64 size) {
+        RENDERER_TRACE;
+        u64 page = addr >> PM_PAGE_BITS;
+        const u64 page_end = Common::DivCeil(addr + size, PM_PAGE_SIZE);
+        const auto lock_start = locks.begin() + (page / PAGES_PER_LOCK);
+        const auto lock_end = locks.begin() + Common::DivCeil(page_end, PAGES_PER_LOCK);
+        Common::RangeLockGuard lk(lock_start, lock_end);
+
+        while (page != page_end) {
+            const auto perms = cached_pages[page].Perms();
+            const u64 range_begin = page++;
+            while (page != page_end && cached_pages[page].Perms() == perms) {
+                ++page;
+            }
+            Protect(range_begin << PM_PAGE_BITS, (page - range_begin) << PM_PAGE_BITS, perms);
+        }
+    }
+
     std::array<PageState, NUM_ADDRESS_PAGES> cached_pages{};
 #ifdef PTHREAD_ADAPTIVE_MUTEX_INITIALIZER_NP
     using LockType = Common::AdaptiveMutex;
@@ -375,6 +404,14 @@ void PageManager::OnGpuMap(VAddr address, size_t size) {
 
 void PageManager::OnGpuUnmap(VAddr address, size_t size) {
     impl->OnUnmap(address, size);
+}
+
+void PageManager::RelaxPageProtection(VAddr addr, u64 size) const {
+    impl->RelaxPageProtection(addr, size);
+}
+
+void PageManager::RefreshPageProtection(VAddr addr, u64 size) const {
+    impl->RefreshPageProtection(addr, size);
 }
 
 template <bool track>

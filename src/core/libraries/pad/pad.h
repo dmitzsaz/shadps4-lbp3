@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <filesystem>
+
 #include <core/libraries/system/userservice.h>
 #include "common/enum.h"
 #include "common/types.h"
@@ -12,6 +14,11 @@ class SymbolsResolver;
 }
 
 namespace Libraries::Pad {
+
+// Diagnostic controller traces are recorded and replayed at the libScePad boundary, so the trace
+// contains exactly the button/axis samples observed by the guest rather than host SDL events.
+bool ConfigureInputTrace(const std::filesystem::path& record_path,
+                         const std::filesystem::path& replay_path);
 
 constexpr int ORBIS_PAD_MAX_TOUCH_NUM = 2;
 constexpr int ORBIS_PAD_MAX_DEVICE_UNIQUE_DATA_SIZE = 12;

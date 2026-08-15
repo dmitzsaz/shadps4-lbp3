@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Patch>
+  <Metadata Title="LittleBigPlanet 3" Name="A/B disable gas graphics emissions" Note="Diagnostic only; preserves gas submit, wait and label flow" Author="Codex" PatchVer="0.1" AppVer="01.26" AppElf="eboot.bin" isEnabled="true">
+    <PatchList>
+      <Line Type="mask" Address="55 48 89 e5 41 57 41 56 41 55 41 54 53 48 83 ec 28 41 89 d6 89 fb 48 8b 05 93 7a c7 00" Value="9090909090" Offset="+250"/>
+      <Line Type="mask" Address="55 48 89 e5 41 57 41 56 41 54 53 48 83 ec 50 4c 8b 3d 9a 67 c7 00 49 8b 07 48 89 45 d8 48 8d 3d 87 fb a2 00 e8 c7 77 c0 ff 48 8d 05 10 5d ee 00 48 8b 00 48 8b 40 10 83 b8 d8 00 00 00 00 0f 84 b0 02 00 00" Value="9090909090" Offset="+696"/>
+    </PatchList>
+  </Metadata>
+</Patch>

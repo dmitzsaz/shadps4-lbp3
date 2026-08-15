@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Patch>
+  <Metadata Title="LittleBigPlanet 3" Name="A/B disable active particle renderer" Note="Diagnostic only" Author="Codex" PatchVer="0.1" AppVer="01.26" AppElf="eboot.bin" isEnabled="true">
+    <PatchList>
+      <Line Type="mask" Address="55 48 89 e5 41 57 41 56 41 55 41 54 53 48 81 ec 38 01 00 00 4c 8b 3d 75 c1 ca 00" Value="c3" Offset="+0"/>
+    </PatchList>
+  </Metadata>
+</Patch>

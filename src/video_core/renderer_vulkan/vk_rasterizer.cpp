@@ -334,7 +334,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     ResetBindings();
 }
 
-void Rasterizer::DispatchDirect() {
+void Rasterizer::DispatchDirect(bool async_compute) {
     RENDERER_TRACE;
     Core::PerfTelemetry::Increment(Core::PerfTelemetry::Counter::DispatchCalls);
     Core::PerfTelemetry::ScopedTimer telemetry_timer{Core::PerfTelemetry::TimeMetric::DispatchCpu};
@@ -347,7 +347,7 @@ void Rasterizer::DispatchDirect() {
     }
 
     const auto& cs = pipeline->GetStage(Shader::LogicalStage::Compute);
-    if (ExecuteShaderHLE(cs, liverpool->regs, cs_program, *this)) {
+    if (ExecuteShaderHLE(cs, liverpool->regs, cs_program, *this, async_compute)) {
         return;
     }
 
@@ -403,10 +403,35 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
 u64 Rasterizer::Flush() {
     Core::PerfTelemetry::ScopedTimer telemetry_timer{
         Core::PerfTelemetry::TimeMetric::RasterFlushCpu};
+    static_cast<void>(buffer_cache.CommitHostImportedWritesForCpu());
+    if (HasPendingGuestFences()) {
+        Core::PerfTelemetry::Increment(Core::PerfTelemetry::Counter::GuestFenceSubmits);
+    }
     const u64 current_tick = scheduler.CurrentTick();
     SubmitInfo info{};
     scheduler.Flush(info);
     return current_tick;
+}
+
+bool Rasterizer::DeferGuestFence(Common::UniqueFunction<void>&& callback) {
+    const bool recorded_visibility = buffer_cache.CommitHostImportedWritesForCpu();
+    const u64 current_tick = scheduler.CurrentTick();
+    if (!recorded_visibility && guest_fence_recording_tick != current_tick) {
+        return false;
+    }
+    // One producer can publish a value followed by a separate IRQ-only
+    // RELEASE_MEM. Once a direct-backed write has associated this command
+    // buffer with a guest fence, every following external publication on the
+    // same tick must wait for that producer as well.
+    guest_fence_recording_tick = current_tick;
+    Core::PerfTelemetry::Increment(Core::PerfTelemetry::Counter::OrderedGuestReleases);
+    scheduler.DeferPriorityOperation(std::move(callback));
+    return true;
+}
+
+bool Rasterizer::HasPendingGuestFences() const noexcept {
+    return guest_fence_recording_tick != 0 &&
+           scheduler.CurrentTick() == guest_fence_recording_tick;
 }
 
 void Rasterizer::Finish() {

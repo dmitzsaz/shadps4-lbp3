@@ -20,6 +20,7 @@
 #include "core/file_sys/fs.h"
 #include "core/ipc/ipc.h"
 #include "core/lbp3_online.h"
+#include "core/libraries/pad/pad.h"
 #include "core/performance_telemetry.h"
 #include "core/user_settings.h"
 #include "emulator.h"
@@ -69,6 +70,8 @@ int main(int argc, char* argv[]) {
 
     std::optional<std::filesystem::path> addGameFolder;
     std::optional<std::filesystem::path> setAddonFolder;
+    std::optional<std::filesystem::path> padRecord;
+    std::optional<std::filesystem::path> padReplay;
     std::optional<std::string> patchFile;
 
     // ---- Options ----
@@ -95,6 +98,10 @@ int main(int argc, char* argv[]) {
                  "Record detailed per-frame performance telemetry CSV files");
     app.add_flag("--lbp3-online", lbp3Online,
                  "Enable the local LBP3 helper backend and P2P transport");
+    app.add_option("--pad-record", padRecord,
+                   "Record guest-visible libScePad calls to a deterministic trace");
+    app.add_option("--pad-replay", padReplay,
+                   "Replay guest-visible libScePad calls from a deterministic trace");
 
     app.add_option("--add-game-folder", addGameFolder)->check(CLI::ExistingDirectory);
     app.add_option("--set-addon-folder", setAddonFolder)->check(CLI::ExistingDirectory);
@@ -131,6 +138,15 @@ int main(int argc, char* argv[]) {
 
     // Initialize main log with default config
     Common::Log::Setup("shadps4.log");
+
+    if (padRecord && padReplay) {
+        LOG_CRITICAL(Debug, "--pad-record and --pad-replay are mutually exclusive");
+        return 1;
+    }
+    if (!Libraries::Pad::ConfigureInputTrace(padRecord.value_or(std::filesystem::path{}),
+                                              padReplay.value_or(std::filesystem::path{}))) {
+        return 1;
+    }
 
     Core::Lbp3Online::SetEnabled(lbp3Online);
     if (lbp3Online) {

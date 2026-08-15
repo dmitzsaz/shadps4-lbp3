@@ -5,6 +5,7 @@
 
 #include "common/assert.h"
 #include "common/debug.h"
+#include "common/elf_info.h"
 #include "common/polyfill_thread.h"
 #include "common/thread.h"
 #include "core/debug_state.h"
@@ -14,6 +15,7 @@
 #include "core/memory.h"
 #include "core/platform.h"
 #include "core/performance_telemetry.h"
+#include "video_core/amdgpu/fence_detector.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/amdgpu/pm4_cmds.h"
 #include "video_core/renderdoc.h"
@@ -141,6 +143,15 @@ void Liverpool::Process(std::stop_token stoken) {
             }
             task.resume();
 
+            // An externally visible compute fence can be followed by a
+            // WAIT_REG_MEM whose producer is the guest CPU. Submit the work
+            // accumulated before that fence only when the task actually
+            // yields, so several labels in one runnable batch still share a
+            // single Vulkan submission.
+            if (!task.done() && rasterizer && rasterizer->HasPendingGuestFences()) {
+                rasterizer->Flush();
+            }
+
             if (task.done()) {
                 task.destroy();
 
@@ -167,6 +178,10 @@ void Liverpool::Process(std::stop_token stoken) {
                         std::chrono::steady_clock::now() - gpu_frame_start));
             }
             submit_done = false;
+        } else if (rasterizer && rasterizer->HasPendingGuestFences()) {
+            // Compute-only work has no graphics frame boundary to perform the
+            // normal flush.
+            rasterizer->Flush();
         }
 
         Platform::IrqC::Instance()->Signal(Platform::InterruptId::GpuIdle);
@@ -638,10 +653,10 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     if (host_markers_enabled) {
                         rasterizer->ScopeMarkerBegin(
                             fmt::format("gfx:{}:DispatchDirect", cmd_address));
-                        rasterizer->DispatchDirect();
+                        rasterizer->DispatchDirect(false);
                         rasterizer->ScopeMarkerEnd();
                     } else {
-                        rasterizer->DispatchDirect();
+                        rasterizer->DispatchDirect(false);
                     }
                 }
                 break;
@@ -930,6 +945,9 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
     FIBER_ENTER(acb_task_name[vqid]);
     auto& queue = asc_queues[{vqid}];
     const bool host_markers_enabled = rasterizer && EmulatorSettings.IsVkHostMarkersEnabled();
+    const bool ordered_guest_fences =
+        rasterizer && Common::ElfInfo::Instance().GameSerial() == "CUSA00063";
+    const FenceDetector fence_detector{acb, ordered_guest_fences};
 
     struct IndirectPatch {
         const PM4Header* header;
@@ -1103,10 +1121,10 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 if (host_markers_enabled) {
                     rasterizer->ScopeMarkerBegin(
                         fmt::format("asc[{}]:{}:DispatchDirect", vqid, cmd_address));
-                    rasterizer->DispatchDirect();
+                    rasterizer->DispatchDirect(true);
                     rasterizer->ScopeMarkerEnd();
                 } else {
-                    rasterizer->DispatchDirect();
+                    rasterizer->DispatchDirect(true);
                 }
             }
             break;
@@ -1170,10 +1188,56 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             if (rasterizer) {
                 rasterizer->ProcessDownloadImages();
             }
+
+            const auto write_guest = [](void* address, u64 data, u32 num_bytes) {
+                auto* memory = Core::Memory::Instance();
+                if (!memory->TryWriteBacking(address, &data, num_bytes)) {
+                    std::memcpy(address, &data, num_bytes);
+                }
+            };
+            const auto pipe_id = queue.pipe_id;
+            const auto signal_irq = [pipe_id] {
+                Platform::IrqC::Instance()->Signal(static_cast<Platform::InterruptId>(pipe_id));
+            };
+
+            if (rasterizer && fence_detector.IsFence(header)) {
+                const PM4CmdReleaseMem packet = *release_mem;
+                if (packet.data_sel == DataSelect::GdsMemStore) {
+                    // The GDS transfer itself remains a GPU command. Only its
+                    // externally visible interrupt is published after the
+                    // producer submission completes.
+                    rasterizer->CopyBuffer(packet.Address<VAddr>(), packet.gds_index,
+                                           packet.num_dw * sizeof(u32), false, true);
+                    if (rasterizer->DeferGuestFence([packet, pipe_id, write_guest] {
+                            packet.SignalFence(
+                                write_guest,
+                                [pipe_id] {
+                                    Platform::IrqC::Instance()->Signal(
+                                        static_cast<Platform::InterruptId>(pipe_id));
+                                },
+                                [](VAddr, u16, u16) {});
+                        })) {
+                        break;
+                    }
+                    packet.SignalFence(write_guest, signal_irq, [](VAddr, u16, u16) {});
+                    break;
+                }
+
+                if (rasterizer->DeferGuestFence([packet, pipe_id, write_guest] {
+                        packet.SignalFence(
+                            write_guest,
+                            [pipe_id] {
+                                Platform::IrqC::Instance()->Signal(
+                                    static_cast<Platform::InterruptId>(pipe_id));
+                            },
+                            [](VAddr, u16, u16) { UNREACHABLE(); });
+                    })) {
+                    break;
+                }
+            }
+
             release_mem->SignalFence(
-                [pipe_id = queue.pipe_id] {
-                    Platform::IrqC::Instance()->Signal(static_cast<Platform::InterruptId>(pipe_id));
-                },
+                write_guest, signal_irq,
                 [this](VAddr dst, u16 gds_index, u16 num_dwords) {
                     rasterizer->CopyBuffer(dst, gds_index, num_dwords * sizeof(u32), false, true);
                 });

@@ -171,6 +171,10 @@ public:
     /// Synchronizes all buffers neede for DMA.
     void SynchronizeDmaBuffers();
 
+    /// Makes writes to direct host-imported buffers visible to the guest CPU.
+    /// Returns true when a GPU-to-host barrier was recorded.
+    [[nodiscard]] bool CommitHostImportedWritesForCpu();
+
     /// Runs the garbage collector.
     void RunGarbageCollector();
 
@@ -216,6 +220,10 @@ private:
 
     void WriteDataBuffer(Buffer& buffer, VAddr address, const void* value, u32 num_bytes);
 
+    void TrackHostImportedWrite(const Buffer& buffer, VAddr device_addr, u64 size);
+
+    [[nodiscard]] bool IsHostImportedRange(VAddr device_addr, u64 size);
+
     void TouchBuffer(const Buffer& buffer);
 
     void DeleteBuffer(BufferId buffer_id);
@@ -243,6 +251,13 @@ private:
     RangeSet gpu_modified_ranges;
     SplitRangeMap<BufferId> buffer_ranges;
     PageTable page_table;
+
+    struct HostImportedWriteRange {
+        vk::Buffer buffer{};
+        u64 begin{};
+        u64 end{};
+    };
+    boost::container::small_vector<HostImportedWriteRange, 4> pending_host_imported_writes;
 };
 
 } // namespace VideoCore

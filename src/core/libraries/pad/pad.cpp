@@ -5,6 +5,7 @@
 #include "common/logging/log.h"
 #include "common/singleton.h"
 #include "core/emulator_settings.h"
+#include "core/libraries/kernel/time.h"
 #include "core/libraries/libs.h"
 #include "core/libraries/pad/pad_errors.h"
 #include "core/user_settings.h"
@@ -13,6 +14,13 @@
 #include "pad.h"
 
 #include <algorithm>
+#include <array>
+#include <bit>
+#include <cstdlib>
+#include <cstring>
+#include <fstream>
+#include <limits>
+#include <mutex>
 #include <optional>
 
 namespace Libraries::Pad {
@@ -41,6 +49,231 @@ static bool g_initialized = false;
 static u64 pad_handle_counter = 1;
 static std::unordered_map<HandleKey, s32, HandleKeyHash> pad_handle_map{};
 static std::unordered_map<s32, GameController*> handle_to_controller_map{};
+
+namespace {
+
+enum class InputTraceMode : u32 {
+    Disabled,
+    Record,
+    Replay,
+};
+
+enum class InputTraceCallKind : u32 {
+    Read = 1,
+    ReadState = 2,
+};
+
+constexpr std::array<char, 8> InputTraceMagic{'S', '4', 'P', 'A', 'D', 'T', 'R', '1'};
+constexpr u32 InputTraceVersion = 1;
+
+struct InputTraceHeader {
+    std::array<char, 8> magic{};
+    u32 version{};
+    u32 pad_data_size{};
+};
+
+struct InputTraceCall {
+    u32 kind{};
+    s32 handle{};
+    s32 requested_count{};
+    s32 return_value{};
+    u32 data_count{};
+    u32 reserved{};
+    u64 sequence{};
+    u64 process_time_us{};
+};
+
+void FlushInputTraceAtQuickExit();
+
+class InputTrace {
+public:
+    bool Configure(const std::filesystem::path& record_path,
+                   const std::filesystem::path& replay_path) {
+        std::scoped_lock lock{mutex};
+        if (!record_path.empty() && !replay_path.empty()) {
+            LOG_CRITICAL(Lib_Pad, "Only one of --pad-record and --pad-replay may be used");
+            return false;
+        }
+
+        mode = InputTraceMode::Disabled;
+        sequence = 0;
+        replay_failed = false;
+        record.close();
+        replay.close();
+
+        if (record_path.empty() && replay_path.empty()) {
+            return true;
+        }
+
+        if (!record_path.empty()) {
+            std::error_code ec;
+            const auto parent = record_path.parent_path();
+            if (!parent.empty()) {
+                std::filesystem::create_directories(parent, ec);
+            }
+            if (ec) {
+                LOG_CRITICAL(Lib_Pad, "Failed to create pad-trace directory {}: {}",
+                             parent.string(), ec.message());
+                return false;
+            }
+            record.open(record_path, std::ios::binary | std::ios::trunc);
+            if (!record) {
+                LOG_CRITICAL(Lib_Pad, "Failed to open pad trace for recording: {}",
+                             record_path.string());
+                return false;
+            }
+            const InputTraceHeader header{
+                .magic = InputTraceMagic,
+                .version = InputTraceVersion,
+                .pad_data_size = sizeof(OrbisPadData),
+            };
+            record.write(reinterpret_cast<const char*>(&header), sizeof(header));
+            record.flush();
+            if (!record) {
+                LOG_CRITICAL(Lib_Pad, "Failed to write pad-trace header: {}",
+                             record_path.string());
+                return false;
+            }
+            mode = InputTraceMode::Record;
+            LOG_CRITICAL(Lib_Pad, "Recording guest pad calls to {}", record_path.string());
+        } else {
+            replay.open(replay_path, std::ios::binary);
+            InputTraceHeader header{};
+            replay.read(reinterpret_cast<char*>(&header), sizeof(header));
+            if (!replay || header.magic != InputTraceMagic || header.version != InputTraceVersion ||
+                header.pad_data_size != sizeof(OrbisPadData)) {
+                LOG_CRITICAL(Lib_Pad, "Invalid or incompatible pad trace: {}",
+                             replay_path.string());
+                replay.close();
+                return false;
+            }
+            mode = InputTraceMode::Replay;
+            LOG_CRITICAL(Lib_Pad, "Replaying guest pad calls from {}", replay_path.string());
+        }
+
+        static const bool registered = [] {
+            std::at_quick_exit(FlushInputTraceAtQuickExit);
+            return true;
+        }();
+        (void)registered;
+        return true;
+    }
+
+    void Record(InputTraceCallKind kind, s32 handle, s32 requested_count, s32 return_value,
+                const OrbisPadData* data, u32 data_count) {
+        std::scoped_lock lock{mutex};
+        if (mode != InputTraceMode::Record) {
+            return;
+        }
+        const InputTraceCall call{
+            .kind = static_cast<u32>(kind),
+            .handle = handle,
+            .requested_count = requested_count,
+            .return_value = return_value,
+            .data_count = data_count,
+            .sequence = ++sequence,
+            .process_time_us = Kernel::sceKernelGetProcessTime(),
+        };
+        record.write(reinterpret_cast<const char*>(&call), sizeof(call));
+        if (data_count != 0) {
+            record.write(reinterpret_cast<const char*>(data), sizeof(OrbisPadData) * data_count);
+        }
+        if ((sequence & 0xff) == 0) {
+            record.flush();
+        }
+        if (!record) {
+            LOG_CRITICAL(Lib_Pad, "Pad trace write failed at call {}", sequence);
+            mode = InputTraceMode::Disabled;
+        }
+    }
+
+    std::optional<s32> Replay(InputTraceCallKind kind, s32 handle, s32 requested_count,
+                              OrbisPadData* data) {
+        std::scoped_lock lock{mutex};
+        if (mode != InputTraceMode::Replay) {
+            return std::nullopt;
+        }
+
+        InputTraceCall call{};
+        replay.read(reinterpret_cast<char*>(&call), sizeof(call));
+        if (!replay) {
+            if (!replay_failed) {
+                LOG_CRITICAL(Lib_Pad, "Pad trace ended after {} calls; returning to live input",
+                             sequence);
+            }
+            replay_failed = true;
+            mode = InputTraceMode::Disabled;
+            return std::nullopt;
+        }
+
+        std::vector<OrbisPadData> samples(call.data_count);
+        if (call.data_count != 0) {
+            replay.read(reinterpret_cast<char*>(samples.data()),
+                        sizeof(OrbisPadData) * call.data_count);
+        }
+        const u64 expected_sequence = sequence + 1;
+        const bool valid = replay && call.sequence == expected_sequence &&
+                           call.kind == static_cast<u32>(kind) && call.handle == handle &&
+                           call.requested_count == requested_count && call.data_count <=
+                               static_cast<u32>(std::max(requested_count, 0));
+        if (!valid) {
+            LOG_CRITICAL(Lib_Pad,
+                         "Pad trace mismatch at call {}: got kind={} handle={} requested={} "
+                         "samples={}, expected kind={} handle={} requested={}; returning to live "
+                         "input",
+                         expected_sequence, call.kind, call.handle, call.requested_count,
+                         call.data_count, static_cast<u32>(kind), handle, requested_count);
+            replay_failed = true;
+            mode = InputTraceMode::Disabled;
+            return std::nullopt;
+        }
+
+        const u64 now = Kernel::sceKernelGetProcessTime();
+        for (auto& sample : samples) {
+            const u64 age = call.process_time_us >= sample.timestamp
+                                ? call.process_time_us - sample.timestamp
+                                : 0;
+            sample.timestamp = now >= age ? now - age : 0;
+        }
+        if (!samples.empty()) {
+            std::memcpy(data, samples.data(), sizeof(OrbisPadData) * samples.size());
+        }
+        sequence = call.sequence;
+        if (sequence <= 4 || std::has_single_bit(sequence)) {
+            LOG_INFO(Lib_Pad, "Replayed pad call #{} kind={} samples={}", sequence, call.kind,
+                     call.data_count);
+        }
+        return call.return_value;
+    }
+
+    void Flush() {
+        std::scoped_lock lock{mutex};
+        if (record.is_open()) {
+            record.flush();
+        }
+    }
+
+private:
+    InputTraceMode mode{InputTraceMode::Disabled};
+    u64 sequence{};
+    bool replay_failed{};
+    std::ofstream record;
+    std::ifstream replay;
+    std::mutex mutex;
+};
+
+InputTrace input_trace;
+
+void FlushInputTraceAtQuickExit() {
+    input_trace.Flush();
+}
+
+} // namespace
+
+bool ConfigureInputTrace(const std::filesystem::path& record_path,
+                         const std::filesystem::path& replay_path) {
+    return input_trace.Configure(record_path, replay_path);
+}
 
 int PS4_SYSV_ABI scePadClose(s32 handle) {
     LOG_WARNING(Lib_Pad, "called, handle: {}", handle);
@@ -492,6 +725,9 @@ int ProcessStates(s32 handle, OrbisPadData* pData, Input::GameController& contro
 
 int PS4_SYSV_ABI scePadRead(s32 handle, OrbisPadData* pData, s32 num) {
     LOG_TRACE(Lib_Pad, "called");
+    if (const auto replayed = input_trace.Replay(InputTraceCallKind::Read, handle, num, pData)) {
+        return *replayed;
+    }
     int connected_count = 0;
     bool connected = false;
     std::vector<Input::State> states(64);
@@ -501,8 +737,11 @@ int PS4_SYSV_ABI scePadRead(s32 handle, OrbisPadData* pData, s32 num) {
     }
     auto& controller = *it->second;
     int ret_num = controller.ReadStates(states.data(), num, &connected, &connected_count);
-    return ProcessStates(handle, pData, controller, states.data(), ret_num, connected,
-                         connected_count);
+    const int result = ProcessStates(handle, pData, controller, states.data(), ret_num, connected,
+                                     connected_count);
+    input_trace.Record(InputTraceCallKind::Read, handle, num, result, pData,
+                       result > 0 ? static_cast<u32>(result) : 0);
+    return result;
 }
 
 int PS4_SYSV_ABI scePadReadBlasterForTracker() {
@@ -527,6 +766,10 @@ int PS4_SYSV_ABI scePadReadHistory() {
 
 int PS4_SYSV_ABI scePadReadState(s32 handle, OrbisPadData* pData) {
     LOG_TRACE(Lib_Pad, "handle: {}", handle);
+    if (const auto replayed =
+            input_trace.Replay(InputTraceCallKind::ReadState, handle, 1, pData)) {
+        return *replayed;
+    }
     auto it = handle_to_controller_map.find(handle);
     if (it == handle_to_controller_map.end()) {
         return ORBIS_PAD_ERROR_INVALID_HANDLE;
@@ -537,6 +780,7 @@ int PS4_SYSV_ABI scePadReadState(s32 handle, OrbisPadData* pData) {
     Input::State state;
     controller.ReadState(&state, &connected, &connected_count);
     ProcessStates(handle, pData, controller, &state, 1, connected, connected_count);
+    input_trace.Record(InputTraceCallKind::ReadState, handle, 1, ORBIS_OK, pData, 1);
     return ORBIS_OK;
 }
 

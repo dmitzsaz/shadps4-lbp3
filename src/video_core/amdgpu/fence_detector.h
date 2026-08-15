@@ -96,6 +96,13 @@ private:
                     fences.push_back({header,
                                       reinterpret_cast<VAddr>(release_mem->Address<void*>()),
                                       release_mem->DataQWord()});
+                } else if (release_mem->data_sel == DataSelect::GpuClock64 ||
+                           release_mem->data_sel == DataSelect::PerfCounter ||
+                           release_mem->data_sel == DataSelect::GdsMemStore) {
+                    fences.push_back({header});
+                } else if (release_mem->data_sel == DataSelect::None &&
+                           release_mem->int_sel == InterruptSelect::IrqOnly) {
+                    fences.push_back({header});
                 }
                 break;
             }
