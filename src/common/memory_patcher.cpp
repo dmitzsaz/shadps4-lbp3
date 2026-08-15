@@ -162,6 +162,28 @@ static void ApplyBuiltInLbp3PerformancePatches() {
     static constexpr std::string_view DepthOfFieldSignature =
         "55 48 89 e5 41 57 41 56 41 55 41 54 53 48 81 ec b8 03 00 00 41 89 fc 48 8b 1d "
         "72 e6 c8 00";
+    // Diagnostic hotfix: suppress both particle render paths and the NG compute producer. The
+    // markers embedded in v1.26 identify the first two functions as
+    // CParticleEffect::RenderActiveParticleEffects and NGParticlesRender respectively.
+    static constexpr std::string_view ActiveParticleEffectsSignature =
+        "55 48 89 e5 41 57 41 56 41 55 41 54 53 48 81 ec 38 01 00 00 4c 8b 3d 75 c1 "
+        "ca 00";
+    static constexpr std::string_view NgParticlesRenderSignature =
+        "55 48 89 e5 41 57 41 56 41 55 41 54 53 48 83 ec 58 41 89 d4 48 89 f3 48 89 "
+        "5d b8 49 89 ff";
+    static constexpr std::string_view NgParticleComputeSubmitSignature =
+        "55 48 89 e5 41 57 41 56 41 55 41 54 53 48 81 ec 48 01 00 00 49 89 fc";
+    // The gas-cloud path must keep its full begin/end, submit and completion-label flow. Skipping
+    // WaitGasClouds, DrawGasClouds or CompGasClouds starves two command-ring consumers. Suppress
+    // only the two proven graphics emissions instead: the indexed volume draw in the gas-only
+    // helper and the fullscreen composite draw in CompGasClouds.
+    static constexpr std::string_view GasCloudIndexedDrawSignature =
+        "55 48 89 e5 41 57 41 56 41 55 41 54 53 48 83 ec 28 41 89 d6 89 fb 48 8b 05 "
+        "93 7a c7 00";
+    static constexpr std::string_view CompGasCloudsSignature =
+        "55 48 89 e5 41 57 41 56 41 54 53 48 83 ec 50 4c 8b 3d 9a 67 c7 00 49 8b 07 "
+        "48 89 45 d8 48 8d 3d 87 fb a2 00 e8 c7 77 c0 ff 48 8d 05 10 5d ee 00 48 8b "
+        "00 48 8b 40 10 83 b8 d8 00 00 00 00 0f 84 b0 02 00 00";
 
     // Require every exact v1.26 code signature before changing anything. A different executable
     // is left untouched rather than receiving a partial graphics profile.
@@ -171,7 +193,12 @@ static void ApplyBuiltInLbp3PerformancePatches() {
         PatternScan(std::string{SpriteLightsSignature}) == 0 ||
         PatternScan(std::string{ToneMapSpriteLightsSignature}) == 0 ||
         PatternScan(std::string{DynamicAoPreBlurSignature}) == 0 ||
-        PatternScan(std::string{DepthOfFieldSignature}) == 0) {
+        PatternScan(std::string{DepthOfFieldSignature}) == 0 ||
+        PatternScan(std::string{ActiveParticleEffectsSignature}) == 0 ||
+        PatternScan(std::string{NgParticlesRenderSignature}) == 0 ||
+        PatternScan(std::string{NgParticleComputeSubmitSignature}) == 0 ||
+        PatternScan(std::string{GasCloudIndexedDrawSignature}) == 0 ||
+        PatternScan(std::string{CompGasCloudsSignature}) == 0) {
         LOG_ERROR(Loader,
                   "LBP3 built-in performance patches skipped: v1.26 signatures did not match");
         return;
@@ -247,6 +274,56 @@ static void ApplyBuiltInLbp3PerformancePatches() {
             .littleEndian = false,
             .patchMask = PatchMask::Mask,
             .maskOffset = 0,
+        },
+        patchInfo{
+            .gameSerial = "CUSA00063",
+            .modNameStr = "LBP3 A/B disable active particle effects",
+            .offsetStr = std::string{ActiveParticleEffectsSignature},
+            .valueStr = "c3",
+            .isOffset = false,
+            .littleEndian = false,
+            .patchMask = PatchMask::Mask,
+            .maskOffset = 0,
+        },
+        patchInfo{
+            .gameSerial = "CUSA00063",
+            .modNameStr = "LBP3 A/B disable NG particle rendering",
+            .offsetStr = std::string{NgParticlesRenderSignature},
+            .valueStr = "c3",
+            .isOffset = false,
+            .littleEndian = false,
+            .patchMask = PatchMask::Mask,
+            .maskOffset = 0,
+        },
+        patchInfo{
+            .gameSerial = "CUSA00063",
+            .modNameStr = "LBP3 A/B disable NG particle compute producer",
+            .offsetStr = std::string{NgParticleComputeSubmitSignature},
+            .valueStr = "c3",
+            .isOffset = false,
+            .littleEndian = false,
+            .patchMask = PatchMask::Mask,
+            .maskOffset = 0,
+        },
+        patchInfo{
+            .gameSerial = "CUSA00063",
+            .modNameStr = "LBP3 hotfix suppress gas-cloud indexed draw only",
+            .offsetStr = std::string{GasCloudIndexedDrawSignature},
+            .valueStr = "9090909090",
+            .isOffset = false,
+            .littleEndian = false,
+            .patchMask = PatchMask::Mask,
+            .maskOffset = 0xfa,
+        },
+        patchInfo{
+            .gameSerial = "CUSA00063",
+            .modNameStr = "LBP3 hotfix suppress gas-cloud composite draw only",
+            .offsetStr = std::string{CompGasCloudsSignature},
+            .valueStr = "9090909090",
+            .isOffset = false,
+            .littleEndian = false,
+            .patchMask = PatchMask::Mask,
+            .maskOffset = 0x2b8,
         },
     };
 
