@@ -1013,23 +1013,27 @@ static u64 g_np_state_sequence{};
 static bool g_lbp3_legacy_signed_in_deferred_logged{};
 
 // CUSA00063 v1.26 records the first state delivered to its legacy NP callback before checking
-// whether its online-presentation owner is ready.  A SignedIn delivered immediately after
+// whether its online-presentation owner is ready. A SignedIn delivered immediately after
 // sceNpRegisterStateCallback is therefore remembered as state 2 but cannot create the EULA task;
-// every later sticky replay is discarded by the title as a duplicate.  Real NP callback delivery
-// is asynchronous, so hold only this title's legacy SignedIn until the exact three guards used by
-// its callback at 0x33f62c-0x33f663 are satisfied.  Other registered callbacks and reachability
-// notifications retain their normal timing.
+// every later sticky replay is discarded by the title as a duplicate.
+//
+// The local helper can already be connected before the callback is registered, so there is no
+// preceding SignedOut edge. By the time the presentation owner reaches state 3, its transition
+// latch at +0x338 has been asserted. The title's SignedOut branch normally clears that latch, and
+// its SignedIn branch refuses to run while it remains set. Hold this title's sticky SignedIn until
+// the owner is ready. The stale pre-registration latch is hidden only for the duration of the
+// callback below; it is also the online manager's success flag and must remain asserted otherwise.
+// Other registered callbacks and reachability notifications retain their normal timing.
 static bool IsLbp3LegacySignedInReady(const LegacyNpStateCallback& callback) {
-    if (!Net::Lbp3OnlineBridge::IsSupportedTitle() ||
-        MemoryPatcher::g_eboot_address == 0 || callback.func == nullptr) {
+    if (!Net::Lbp3OnlineBridge::IsSupportedTitle() || MemoryPatcher::g_eboot_address == 0 ||
+        callback.func == nullptr) {
         return true;
     }
 
     constexpr uintptr_t LegacyCallbackOffset = 0x0033f1e0;
     constexpr uintptr_t LegacyCallbackUserdataOffset = 0x0130e248;
     constexpr uintptr_t PresentationOwnerStateOffset = 0x0130d9a4; // owner + 0x2ec
-    constexpr uintptr_t PresentationResetFlagOffset = 0x0130d9f0; // owner + 0x338
-    constexpr uintptr_t CallbackReadyFlagOffset = 0x0130e409;     // userdata + 0x1c1
+    constexpr uintptr_t CallbackReadyFlagOffset = 0x0130e409;      // userdata + 0x1c1
 
     const uintptr_t base = MemoryPatcher::g_eboot_address;
     if (reinterpret_cast<uintptr_t>(callback.func) != base + LegacyCallbackOffset ||
@@ -1039,28 +1043,27 @@ static bool IsLbp3LegacySignedInReady(const LegacyNpStateCallback& callback) {
 
     const auto* owner_state =
         reinterpret_cast<const volatile u32*>(base + PresentationOwnerStateOffset);
-    const auto* reset_flag =
-        reinterpret_cast<const volatile u8*>(base + PresentationResetFlagOffset);
     const auto* callback_ready =
         reinterpret_cast<const volatile u8*>(base + CallbackReadyFlagOffset);
-    const u32 current_owner_state = *owner_state;
-    const u8 current_callback_ready = *callback_ready;
-    const u8 current_reset_flag = *reset_flag;
-    static u32 previous_owner_state = ~u32{0};
-    static u8 previous_callback_ready = ~u8{0};
-    static u8 previous_reset_flag = ~u8{0};
-    if (current_owner_state != previous_owner_state ||
-        current_callback_ready != previous_callback_ready ||
-        current_reset_flag != previous_reset_flag) {
-        LOG_CRITICAL(Lib_NpManager,
-                     "LBP3 legacy SignedIn guards: presentation_state={} callback_ready={} "
-                     "reset_flag={}",
-                     current_owner_state, current_callback_ready, current_reset_flag);
-        previous_owner_state = current_owner_state;
-        previous_callback_ready = current_callback_ready;
-        previous_reset_flag = current_reset_flag;
+    return *owner_state == 3 && *callback_ready != 0;
+}
+
+static volatile u8* GetLbp3LegacyPresentationTransitionLatch(
+    const LegacyNpStateCallback& callback) {
+    if (!Net::Lbp3OnlineBridge::IsSupportedTitle() || MemoryPatcher::g_eboot_address == 0 ||
+        callback.func == nullptr) {
+        return nullptr;
     }
-    return current_owner_state == 3 && current_callback_ready != 0 && current_reset_flag == 0;
+
+    constexpr uintptr_t LegacyCallbackOffset = 0x0033f1e0;
+    constexpr uintptr_t LegacyCallbackUserdataOffset = 0x0130e248;
+    constexpr uintptr_t PresentationTransitionLatchOffset = 0x0130d9f0;
+    const uintptr_t base = MemoryPatcher::g_eboot_address;
+    if (reinterpret_cast<uintptr_t>(callback.func) != base + LegacyCallbackOffset ||
+        reinterpret_cast<uintptr_t>(callback.userdata) != base + LegacyCallbackUserdataOffset) {
+        return nullptr;
+    }
+    return reinterpret_cast<volatile u8*>(base + PresentationTransitionLatchOffset);
 }
 
 static void QueueNpStateEvent(Libraries::UserService::OrbisUserServiceUserId user_id,
@@ -1330,9 +1333,26 @@ static void DispatchPendingNpStateCallbacks() {
         }
 
         if (dispatch.legacy) {
+            volatile u8* transition_latch = nullptr;
+            u8 saved_transition_latch = 0;
+            bool transition_latch_masked = false;
+            if (event.state == OrbisNpState::SignedIn) {
+                transition_latch =
+                    GetLbp3LegacyPresentationTransitionLatch(legacy_callback);
+                if (transition_latch != nullptr) {
+                    saved_transition_latch = *transition_latch;
+                    if (saved_transition_latch != 0) {
+                        *transition_latch = 0;
+                        transition_latch_masked = true;
+                    }
+                }
+            }
             legacy_callback.func(event.user_id, event.state,
                                  event.has_np_id ? &event.np_id : nullptr,
                                  legacy_callback.userdata);
+            if (transition_latch_masked) {
+                *transition_latch = saved_transition_latch;
+            }
         }
 
         for (size_t i = 0; i < callbacks.size(); ++i) {

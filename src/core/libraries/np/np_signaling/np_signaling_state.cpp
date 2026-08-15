@@ -688,15 +688,11 @@ void DispatchPeerActivatedEvent(s32 conn_id) {
     }
     const s32 owner_ctx = conn_it->second.ctx_id;
     const auto owner_it = g_contexts.find(owner_ctx);
-    const OrbisNpId local_npid =
-        owner_it != g_contexts.end() ? owner_it->second.owner_npid : OrbisNpId{};
-    for (auto& [cid, ctx] : g_contexts) {
-        if (cid == owner_ctx || !ctx.active) {
-            continue;
-        }
-        if (std::memcmp(&ctx.owner_npid, &local_npid, sizeof(local_npid)) == 0) {
-            StageBasicCallbackLocked(ctx, cid, conn_id, ORBIS_NP_SIGNALING_EVENT_PEER_ACTIVATED, 0);
-        }
+    if (owner_it != g_contexts.end() && owner_it->second.active) {
+        LOG_INFO(Lib_NpSignaling, "Connection {} -> PEER_ACTIVATED (ctxId={})", conn_id,
+                 owner_ctx);
+        StageBasicCallbackLocked(owner_it->second, owner_ctx, conn_id,
+                                 ORBIS_NP_SIGNALING_EVENT_PEER_ACTIVATED, 0);
     }
 }
 

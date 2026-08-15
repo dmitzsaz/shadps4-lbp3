@@ -10,6 +10,8 @@
 #include <arpa/inet.h>
 #endif
 
+#include <chrono>
+
 #include <core/libraries/kernel/kernel.h>
 #include <magic_enum/magic_enum.hpp>
 #include "common/assert.h"
@@ -822,21 +824,58 @@ int PS4_SYSV_ABI sceNetEpollWait(OrbisNetId epollid, OrbisNetEpollEvent* events,
     LOG_DEBUG(Lib_Net, "called, epollid = {} ({}), maxevents = {}, timeout = {}", epollid,
               epoll->name, maxevents, timeout);
 
-    int sockets_waited_on = (epoll->events.size() - epoll->async_resolutions.size()) > 0;
-    const bool emulated_socket_ready = std::ranges::any_of(epoll->events, [](const auto& entry) {
+    const bool sockets_waited_on =
+        (epoll->events.size() - epoll->async_resolutions.size()) > 0;
+    const auto is_emulated_socket = [](const auto& entry) {
         auto socket_file = FDTable::Instance()->GetFile(entry.first);
         if (!socket_file || socket_file->type != Core::FileSys::FileType::Socket) {
             return false;
         }
         const auto socket = socket_file->socket;
-        return socket && !socket->Native() &&
-               socket->GetPendingEvents(entry.second.events) != 0;
-    });
-    const int wait_timeout = emulated_socket_ready ? 0 : timeout;
+        return socket && !socket->Native();
+    };
+    const bool has_emulated_sockets =
+        std::ranges::any_of(epoll->events, is_emulated_socket);
+    const auto emulated_socket_ready = [&] {
+        return std::ranges::any_of(epoll->events, [&](const auto& entry) {
+            if (!is_emulated_socket(entry)) {
+                return false;
+            }
+            const auto socket = FDTable::Instance()->GetFile(entry.first)->socket;
+            return socket->GetPendingEvents(entry.second.events) != 0;
+        });
+    };
 
     std::vector<epoll_event> native_events{static_cast<size_t>(maxevents)};
     int result = ORBIS_OK;
-    if (sockets_waited_on) {
+    bool emulated_ready = false;
+    constexpr int EmulatedSocketPollIntervalUs = 1000;
+    const auto deadline = timeout < 0
+                              ? std::chrono::steady_clock::time_point::max()
+                              : std::chrono::steady_clock::now() +
+                                    std::chrono::microseconds(timeout);
+    do {
+        emulated_ready = has_emulated_sockets && emulated_socket_ready();
+        int wait_timeout = timeout;
+        if (emulated_ready) {
+            wait_timeout = 0;
+        } else if (has_emulated_sockets) {
+            if (timeout < 0) {
+                wait_timeout = EmulatedSocketPollIntervalUs;
+            } else {
+                const auto remaining = std::chrono::duration_cast<std::chrono::microseconds>(
+                                           deadline - std::chrono::steady_clock::now())
+                                           .count();
+                wait_timeout =
+                    remaining <= 0
+                        ? 0
+                        : static_cast<int>(std::min<s64>(remaining, EmulatedSocketPollIntervalUs));
+            }
+        }
+
+        if (!sockets_waited_on) {
+            break;
+        }
 #ifdef __linux__
         const timespec epoll_timeout{.tv_sec = wait_timeout / 1000000,
                                      .tv_nsec = (wait_timeout % 1000000) * 1000};
@@ -846,7 +885,8 @@ int PS4_SYSV_ABI sceNetEpollWait(OrbisNetId epollid, OrbisNetEpollEvent* events,
         result = epoll_wait(epoll->epoll_fd, native_events.data(), maxevents,
                             wait_timeout < 0 ? wait_timeout : wait_timeout / 1000);
 #endif
-    }
+    } while (result == 0 && !emulated_ready && has_emulated_sockets && timeout != 0 &&
+             (timeout < 0 || std::chrono::steady_clock::now() < deadline));
 
     int i = 0;
     if (result < 0) {
