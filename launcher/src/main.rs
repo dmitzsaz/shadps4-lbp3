@@ -502,9 +502,10 @@ impl eframe::App for LauncherApp {
                     .clicked()
                     && self.launch()
                 {
-                    // The core is an independent process. Close the GUI so macOS keeps only the
-                    // running game in the Dock; launch failures intentionally leave it open.
-                    context.send_viewport_cmd(egui::ViewportCommand::Close);
+                    // Closing the last viewport does not quit a macOS application. The core is an
+                    // independent process and the configuration was saved before it was spawned,
+                    // so terminate the launcher explicitly and leave only the game in the Dock.
+                    std::process::exit(0);
                 }
                 if !eboot_valid {
                     ui.label(
