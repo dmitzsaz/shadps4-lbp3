@@ -54,10 +54,7 @@ trap 'rm -rf -- "$STAGE_ROOT"' EXIT
 STAGED_BUNDLE="$STAGE_ROOT/shadPS4-lbp3.app"
 STAGED_MACOS="$STAGED_BUNDLE/Contents/MacOS"
 STAGED_RESOURCES="$STAGED_BUNDLE/Contents/Resources"
-STAGED_CORE_BUNDLE="$STAGED_BUNDLE/Contents/Helpers/shadPS4-lbp3.app"
-STAGED_CORE_MACOS="$STAGED_CORE_BUNDLE/Contents/MacOS"
-mkdir -p "$STAGED_MACOS" "$STAGED_CORE_MACOS" "$STAGED_RESOURCES/Game" \
-    "$STAGED_RESOURCES/Addons"
+mkdir -p "$STAGED_MACOS" "$STAGED_RESOURCES/Game" "$STAGED_RESOURCES/Addons"
 
 PARTYCHAT_SOURCE=${SHADPS4_PARTYCHAT_BIN:-}
 if [[ -z "$PARTYCHAT_SOURCE" && -f "$BUNDLE_PATH/Contents/MacOS/partychat" ]]; then
@@ -73,14 +70,13 @@ if [[ -n "$PARTYCHAT_SOURCE" ]]; then
 fi
 
 cp "$LAUNCHER_BINARY" "$STAGED_MACOS/shadps4"
-cp "$CORE_BINARY" "$STAGED_CORE_MACOS/shadps4-core"
-cp "$BUILD_DIR/libvulkan.dylib" "$STAGED_CORE_MACOS/libvulkan.dylib"
-cp "$BUILD_DIR/libvulkan_kosmickrisp.dylib" "$STAGED_CORE_MACOS/libvulkan_kosmickrisp.dylib"
-cp "$BUILD_DIR/kosmickrisp_mesa_icd.json" "$STAGED_CORE_MACOS/kosmickrisp_mesa_icd.json"
+cp "$CORE_BINARY" "$STAGED_MACOS/shadps4-core"
+cp "$BUILD_DIR/libvulkan.dylib" "$STAGED_MACOS/libvulkan.dylib"
+cp "$BUILD_DIR/libvulkan_kosmickrisp.dylib" "$STAGED_MACOS/libvulkan_kosmickrisp.dylib"
+cp "$BUILD_DIR/kosmickrisp_mesa_icd.json" "$STAGED_MACOS/kosmickrisp_mesa_icd.json"
 cp "$PROJECT_ROOT/launcher/Info.plist" "$STAGED_BUNDLE/Contents/Info.plist"
-cp "$PROJECT_ROOT/launcher/GameInfo.plist" "$STAGED_CORE_BUNDLE/Contents/Info.plist"
 cp "$PROJECT_ROOT/LICENSE" "$STAGED_RESOURCES/LICENSE-shadPS4.txt"
-chmod 755 "$STAGED_MACOS/shadps4" "$STAGED_CORE_MACOS/shadps4-core"
+chmod 755 "$STAGED_MACOS/shadps4" "$STAGED_MACOS/shadps4-core"
 
 if [[ -f "$BUNDLE_PATH/Contents/Resources/LICENSE-PartyChat.txt" ]]; then
     cp "$BUNDLE_PATH/Contents/Resources/LICENSE-PartyChat.txt" \
@@ -112,8 +108,6 @@ if [[ -n ${SHADPS4_BUNDLED_ADDONS_DIR:-} ]]; then
 fi
 
 /usr/bin/plutil -lint "$STAGED_BUNDLE/Contents/Info.plist"
-/usr/bin/plutil -lint "$STAGED_CORE_BUNDLE/Contents/Info.plist"
-/usr/bin/codesign --force --deep --sign - "$STAGED_CORE_BUNDLE"
 /usr/bin/codesign --force --deep --sign - "$STAGED_BUNDLE"
 /usr/bin/codesign --verify --deep --strict "$STAGED_BUNDLE"
 

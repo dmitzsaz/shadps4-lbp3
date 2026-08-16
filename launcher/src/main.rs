@@ -17,7 +17,6 @@ use serde::{Deserialize, Serialize};
 
 const APP_NAME: &str = "shadPS4 LBP3";
 const CORE_EXECUTABLE: &str = "shadps4-core";
-const CORE_BUNDLE: &str = "shadPS4-lbp3.app";
 const PARTYCHAT_ADDRESS: &str = "127.0.0.1:18063";
 const RESOLUTIONS: &[&str] = &[
     "1280x720",
@@ -599,14 +598,6 @@ fn bundle_contents_dir() -> Option<PathBuf> {
 }
 
 fn core_executable_path() -> PathBuf {
-    if let Some(contents) = bundle_contents_dir() {
-        return contents
-            .join("Helpers")
-            .join(CORE_BUNDLE)
-            .join("Contents")
-            .join("MacOS")
-            .join(CORE_EXECUTABLE);
-    }
     std::env::current_exe()
         .ok()
         .and_then(|path| path.parent().map(|parent| parent.join(CORE_EXECUTABLE)))

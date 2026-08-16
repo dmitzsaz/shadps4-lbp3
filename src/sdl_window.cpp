@@ -109,14 +109,14 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, Input::GameControllers* controller
                                     native_application_name.c_str())) {
         UNREACHABLE_MSG("Failed to set SDL application name: {}", SDL_GetError());
     }
-#ifdef __APPLE__
-    // Set this before SDL creates NSApplication so the Dock and app switcher receive the title
-    // loaded from the game's param.sfo instead of the emulator executable name.
-    SetMacOSProcessName(native_application_name);
-#endif
     if (!SDL_Init(SDL_INIT_VIDEO)) {
         UNREACHABLE_MSG("Failed to initialize SDL video subsystem: {}", SDL_GetError());
     }
+#ifdef __APPLE__
+    // LaunchServices assigns an application serial number while SDL initializes NSApplication.
+    // Update the registered display name only after that has happened.
+    SetMacOSProcessName(native_application_name);
+#endif
     if (!SDL_Init(SDL_INIT_CAMERA)) {
         LOG_ERROR(Input, "Failed to initialize SDL camera subsystem: {}", SDL_GetError());
     }
