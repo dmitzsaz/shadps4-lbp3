@@ -36,6 +36,16 @@ static s32 addcont_count = 0;
 static std::string title_id;
 static bool is_initialized = false;
 
+static bool HasExtraData(const std::filesystem::path& addon_path) {
+    for (const auto& entry : std::filesystem::directory_iterator(addon_path)) {
+        const auto filename = entry.path().filename();
+        if (filename != "sce_sys" && filename != ".DS_Store") {
+            return true;
+        }
+    }
+    return false;
+}
+
 int PS4_SYSV_ABI _Z5dummyv() {
     LOG_ERROR(Lib_AppContent, "(STUBBED) called");
     return ORBIS_OK;
@@ -343,7 +353,11 @@ int PS4_SYSV_ABI sceAppContentInitialize(const OrbisAppContentInitParam* initPar
                 // Save the additional content info in addcont_info.
                 auto& info = addcont_info[addcont_count++];
                 entitlement_id.copy(info.entitlement_label, entitlement_id.length());
-                info.status = OrbisAppContentAddcontDownloadStatus::Installed;
+                // Entitlement-only add-ons have no downloadable payload outside sce_sys.
+                // Report NoExtraData for them; Installed describes add-ons with mounted data.
+                info.status = HasExtraData(entry.path())
+                                  ? OrbisAppContentAddcontDownloadStatus::Installed
+                                  : OrbisAppContentAddcontDownloadStatus::NoExtraData;
             } else {
                 LOG_WARNING(Lib_AppContent, "Additonal content folder {} is not additional content",
                             entry.path().filename().string());
