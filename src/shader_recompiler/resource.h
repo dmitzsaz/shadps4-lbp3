@@ -146,6 +146,7 @@ struct PushData {
     static constexpr u32 YScaleIndex = 3;
     static constexpr u32 UdRegsIndex = 4;
     static constexpr u32 BufOffsetIndex = UdRegsIndex + NUM_USER_DATA_REGS / 4;
+    static constexpr u32 RenderTargetLayerIndex = BufOffsetIndex + 3;
 
     float xoffset;
     float yoffset;
@@ -153,6 +154,7 @@ struct PushData {
     float yscale;
     std::array<u32, NUM_USER_DATA_REGS> ud_regs;
     std::array<u8, NUM_BUFFERS> buf_offsets;
+    u32 render_target_layer;
 
     void AddOffset(u32 binding, u32 offset) {
         ASSERT(offset < 256 && binding < buf_offsets.size());

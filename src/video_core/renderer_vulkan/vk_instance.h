@@ -85,6 +85,11 @@ public:
   /// Returns true if 8-bit ints are supported in shaders
   bool IsShaderInt8Supported() const { return vk12_features.shaderInt8; }
 
+  /// Returns true if pre-rasterization shaders can select a render-target layer.
+  bool IsShaderOutputLayerSupported() const {
+    return vk12_features.shaderOutputLayer;
+  }
+
   /// Returns true if VK_KHR_maintenance8 is supported
   bool IsMaintenance8Supported() const { return maintenance_8; }
 

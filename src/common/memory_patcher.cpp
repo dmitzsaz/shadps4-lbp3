@@ -145,21 +145,12 @@ static void ApplyBuiltInLbp3CompatibilityPatches() {
         return;
     }
 
-    // Keep the long-standing prize-bubble and sprite-light controls while the
-    // native graphics fix is validated. Boss particles, gas, MLAA, AO and DoF
-    // deliberately remain enabled in this branch.
+    // Keep only the long-standing prize-bubble control. Sprite lights and their original
+    // normalize/tone-map passes remain enabled for the native layered-rendering experiment.
     static constexpr std::string_view PickupSignature =
         "48 8d 1d 92 3a c5 00 80 3b 00 0f 84 c6 01 00 00";
-    static constexpr std::string_view SpriteLightsSignature =
-        "55 48 89 e5 41 57 41 56 41 55 41 54 53 48 81 ec b8 03 00 00 48 89 fb 48 89 9d "
-        "98 fc ff ff";
-    static constexpr std::string_view ToneMapSpriteLightsSignature =
-        "55 48 89 e5 41 57 41 56 41 55 41 54 53 48 81 ec 68 01 00 00 48 8b 05 d5 2a c9 "
-        "00";
 
-    if (PatternScan(std::string{PickupSignature}) == 0 ||
-        PatternScan(std::string{SpriteLightsSignature}) == 0 ||
-        PatternScan(std::string{ToneMapSpriteLightsSignature}) == 0) {
+    if (PatternScan(std::string{PickupSignature}) == 0) {
         LOG_ERROR(Loader,
                   "LBP3 built-in compatibility patches skipped: v1.26 signatures did not match");
         return;
@@ -176,29 +167,9 @@ static void ApplyBuiltInLbp3CompatibilityPatches() {
             .patchMask = PatchMask::Mask,
             .maskOffset = 10,
         },
-        patchInfo{
-            .gameSerial = "CUSA00063",
-            .modNameStr = "LBP3 built-in disable sprite lights",
-            .offsetStr = std::string{SpriteLightsSignature},
-            .valueStr = "c3",
-            .isOffset = false,
-            .littleEndian = false,
-            .patchMask = PatchMask::Mask,
-            .maskOffset = 0,
-        },
-        patchInfo{
-            .gameSerial = "CUSA00063",
-            .modNameStr = "LBP3 built-in disable sprite-light tone map",
-            .offsetStr = std::string{ToneMapSpriteLightsSignature},
-            .valueStr = "c3",
-            .isOffset = false,
-            .littleEndian = false,
-            .patchMask = PatchMask::Mask,
-            .maskOffset = 0,
-        },
     };
 
-    LOG_INFO(Loader, "Applying built-in LBP3 bubble/sprite-light compatibility patches");
+    LOG_INFO(Loader, "Applying built-in LBP3 prize-bubble compatibility patch");
     for (const auto& patch : patches) {
         PatchMemory(patch);
     }

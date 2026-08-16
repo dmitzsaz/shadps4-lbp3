@@ -91,6 +91,7 @@ u64 StableProfileHash(const Shader::Profile& profile) {
     HASH_PROFILE_FIELD(needs_unorm_fixup);
     HASH_PROFILE_FIELD(needs_clip_distance_emulation);
     HASH_PROFILE_FIELD(supports_shader_stencil_export);
+    HASH_PROFILE_FIELD(supports_shader_output_layer);
 #undef HASH_PROFILE_FIELD
     return hash;
 }

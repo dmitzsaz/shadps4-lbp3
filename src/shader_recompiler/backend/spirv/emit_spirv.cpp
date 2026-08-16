@@ -193,6 +193,13 @@ void Traverse(EmitContext& ctx, const IR::Program& program) {
             break;
         }
         case IR::AbstractSyntaxNode::Type::Return:
+            if (ctx.l_stage == LogicalStage::Vertex &&
+                ctx.runtime_info.vs_info.force_host_layer_output) {
+                const Id push_u32 = ctx.TypePointer(spv::StorageClass::PushConstant, ctx.U32[1]);
+                const Id layer_ptr = ctx.OpAccessChain(
+                    push_u32, ctx.push_data_block, ctx.ConstU32(PushData::RenderTargetLayerIndex));
+                ctx.OpStore(ctx.output_layer, ctx.OpLoad(ctx.U32[1], layer_ptr));
+            }
             ctx.OpReturn();
             break;
         case IR::AbstractSyntaxNode::Type::Unreachable:
@@ -326,7 +333,8 @@ void SetupCapabilities(const Info& info, const Profile& profile, const RuntimeIn
     }
     if (stage == LogicalStage::Vertex || stage == LogicalStage::TessellationControl ||
         stage == LogicalStage::TessellationEval) {
-        if (info.stores.GetAny(IR::Attribute::RenderTargetIndex)) {
+        if (info.stores.GetAny(IR::Attribute::RenderTargetIndex) ||
+            (stage == LogicalStage::Vertex && runtime_info.vs_info.force_host_layer_output)) {
             ctx.AddCapability(spv::Capability::ShaderLayer);
         }
         if (info.stores.GetAny(IR::Attribute::ViewportIndex)) {

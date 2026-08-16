@@ -101,6 +101,7 @@ struct VertexRuntimeInfo : protected CommonEsVsRuntimeInfo {
     bool tess_emulated_primitive{};
     bool emulate_depth_negative_one_to_one{};
     bool clip_disable{};
+    bool force_host_layer_output{};
     u32 step_rate_0;
     u32 step_rate_1;
 

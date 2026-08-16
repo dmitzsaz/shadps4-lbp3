@@ -15,11 +15,58 @@
 #include "video_core/texture_cache/image_view.h"
 #include "video_core/texture_cache/texture_cache.h"
 
+#include <mutex>
+
 #ifdef MemoryBarrier
 #undef MemoryBarrier
 #endif
 
 namespace Vulkan {
+
+namespace {
+
+constexpr u64 Lbp3SpriteLightVertexHash = 0xd44ad72f3a6cfdcaULL;
+constexpr u64 Lbp3SpriteLightNormalizeHash = 0xd02859f9905c939eULL;
+constexpr u64 Lbp3SpriteLightToneMapHash = 0xc79fdb84db57fd1eULL;
+constexpr u32 Lbp3SpriteLightLayers = 64;
+
+u32 Lbp3SpriteLightLayerCount(const Instance& instance, const GraphicsPipeline& pipeline,
+                              const VideoCore::Image& image, const VideoCore::ImageView& guest_view,
+                              bool is_clear, bool has_depth_target) {
+    if (instance.GetDriverID() != vk::DriverId::eMesaKosmickrisp ||
+        !instance.IsShaderOutputLayerSupported() || is_clear || has_depth_target ||
+        image.binding.is_bound || image.info.num_samples != 1 ||
+        guest_view.info.range.base.level != 0 || guest_view.info.range.extent.levels != 1 ||
+        guest_view.info.range.extent.layers != 1 ||
+        guest_view.info.format != vk::Format::eR8G8B8A8Unorm || image.info.size.width != 256 ||
+        image.info.size.height != 128) {
+        return 0;
+    }
+
+    const auto& key = pipeline.GetGraphicsKey();
+    if (key.mrt_mask != 1 || key.num_color_attachments != 1 ||
+        key.prim_type != AmdGpu::PrimitiveType::QuadList || !key.expand_quad_list ||
+        pipeline.GetStage(Shader::LogicalStage::Vertex).pgm_hash != Lbp3SpriteLightVertexHash) {
+        return 0;
+    }
+
+    const u64 fragment_hash = pipeline.GetStage(Shader::LogicalStage::Fragment).pgm_hash;
+    if (fragment_hash != Lbp3SpriteLightNormalizeHash &&
+        fragment_hash != Lbp3SpriteLightToneMapHash) {
+        return 0;
+    }
+
+    const u32 available_layers =
+        image.info.props.is_volume ? image.info.size.depth : image.info.resources.layers;
+    if (available_layers < Lbp3SpriteLightLayers ||
+        guest_view.info.range.base.layer >= Lbp3SpriteLightLayers ||
+        (image.info.props.is_volume && !instance.Is2dViewOf3dSupported())) {
+        return 0;
+    }
+    return Lbp3SpriteLightLayers;
+}
+
+} // namespace
 
 static Shader::PushData MakeUserData(const AmdGpu::Regs& regs) {
     // TODO(roamic): Add support for multiple viewports and geometry shaders when ViewportIndex
@@ -939,13 +986,37 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
         }
         texture_cache.UpdateImage(image_id);
         image->SetBackingSamples(key.color_samples[cb]);
-        const auto& image_view = texture_cache.FindRenderTarget(image_id, desc);
-        const auto slice = image_view.info.range.base.layer;
-        const auto mip = image_view.info.range.base.level;
+        const auto& guest_view = texture_cache.FindRenderTarget(image_id, desc);
+        const auto slice = guest_view.info.range.base.layer;
+        const auto mip = guest_view.info.range.base.level;
 
         const auto& col_buf = regs.color_buffers[cb];
         const bool is_clear = texture_cache.IsMetaCleared(col_buf.CmaskAddress(), slice);
         texture_cache.TouchMeta(col_buf.CmaskAddress(), slice, false);
+
+        const u32 layered_count = Lbp3SpriteLightLayerCount(
+            instance, *pipeline, *image, guest_view, is_clear, static_cast<bool>(db_desc.first));
+        VideoCore::SubresourceRange attachment_range = desc.view_info.range;
+        vk::ImageView attachment_view = *guest_view.image_view;
+        u32 attachment_layers = guest_view.info.range.extent.layers;
+        if (layered_count != 0) {
+            VideoCore::ImageViewInfo layered_info = guest_view.info;
+            layered_info.type = AmdGpu::ImageType::Color2DArray;
+            layered_info.range.base.layer = 0;
+            layered_info.range.extent.layers = layered_count;
+            const auto& layered_view = image->FindView(layered_info, false);
+            attachment_range = layered_info.range;
+            attachment_view = *layered_view.image_view;
+            attachment_layers = layered_count;
+            push_data.render_target_layer = slice;
+
+            static std::once_flag logged_layered_sprite_lights;
+            std::call_once(logged_layered_sprite_lights, [&] {
+                LOG_INFO(Render_Vulkan,
+                         "LBP3 sprite-light layered attachment enabled: {}x{}x{} slice {}",
+                         image->info.size.width, image->info.size.height, layered_count, slice);
+            });
+        }
 
         if (image->binding.is_bound) {
             ASSERT_MSG(!image->binding.force_general,
@@ -959,17 +1030,17 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
             image->Transit(vk::ImageLayout::eColorAttachmentOptimal,
                            vk::AccessFlagBits2::eColorAttachmentWrite |
                                vk::AccessFlagBits2::eColorAttachmentRead,
-                           desc.view_info.range);
+                           attachment_range);
         }
 
         state.width = std::min<u32>(state.width, std::max(image->info.size.width >> mip, 1u));
         state.height = std::min<u32>(state.height, std::max(image->info.size.height >> mip, 1u));
-        state.num_layers = std::min<u32>(state.num_layers, image_view.info.range.extent.layers);
+        state.num_layers = std::min<u32>(state.num_layers, attachment_layers);
 
         const auto clear_value =
             is_clear ? LiverpoolToVK::ColorBufferClearValue(col_buf) : vk::ClearValue{};
         auto& attachment = state.color_attachments[cb];
-        attachment.image_view = *image_view.image_view;
+        attachment.image_view = attachment_view;
         attachment.image_layout = image->backing->state.layout;
         attachment.clear_value = clear_value.color.uint32;
         attachment.is_clear = is_clear;

@@ -345,6 +345,7 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         .needs_unorm_fixup = instance.GetDriverID() == vk::DriverId::eMesaKosmickrisp,
         .needs_clip_distance_emulation = instance.GetDriverID() == vk::DriverId::eNvidiaProprietary,
         .supports_shader_stencil_export = instance_.IsShaderStencilExportSupported(),
+        .supports_shader_output_layer = instance_.IsShaderOutputLayerSupported(),
     };
     auto [cache_result, cache] = instance.GetDevice().createPipelineCacheUnique({});
     ASSERT_MSG(cache_result == vk::Result::eSuccess, "Failed to create pipeline cache: {}",
@@ -712,6 +713,23 @@ PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stag
                                                 const Shader::ShaderParams& params,
                                                 Shader::Backend::Bindings& binding) {
     auto runtime_info = BuildRuntimeInfo(stage, l_stage);
+    // LBP3's sprite-light normalize/tone-map vertex shader renders one 2D-array slice per draw.
+    // This otherwise-generic fullscreen VS is reused by pipelines with other primitive topologies,
+    // so writing Layer must be specialized on the two proven fragment shaders and their expanded
+    // QuadList topology rather than on the VS hash alone.
+    static constexpr u64 Lbp3SpriteLightVertexHash = 0xd44ad72f3a6cfdcaULL;
+    static constexpr u64 Lbp3SpriteLightNormalizeHash = 0xd02859f9905c939eULL;
+    static constexpr u64 Lbp3SpriteLightToneMapHash = 0xc79fdb84db57fd1eULL;
+    const auto* fs_info = infos[static_cast<u32>(LogicalStage::Fragment)];
+    const bool is_lbp3_sprite_light_fs =
+        fs_info && (fs_info->pgm_hash == Lbp3SpriteLightNormalizeHash ||
+                    fs_info->pgm_hash == Lbp3SpriteLightToneMapHash);
+    if (stage == Stage::Vertex && l_stage == LogicalStage::Vertex &&
+        params.hash == Lbp3SpriteLightVertexHash && is_lbp3_sprite_light_fs &&
+        graphics_key.prim_type == AmdGpu::PrimitiveType::QuadList &&
+        graphics_key.expand_quad_list && profile.supports_shader_output_layer) {
+        runtime_info.vs_info.force_host_layer_output = true;
+    }
     auto [it_pgm, new_program] = program_cache.try_emplace(params.hash);
     if (new_program) {
         it_pgm.value() = std::make_unique<Program>(stage, l_stage, params);
