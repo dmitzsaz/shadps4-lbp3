@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
-#include <array>
 #include <codecvt>
 #include <fstream>
 #include <sstream>
@@ -24,6 +23,9 @@ EXPORT uintptr_t g_eboot_address;
 uint64_t g_eboot_image_size;
 std::string g_game_serial;
 std::string patch_file;
+bool g_lbp3_patch_prize_bubbles = true;
+bool g_lbp3_disable_sprite_lights = false;
+bool g_lbp3_disable_tone_map = false;
 bool patches_applied = false;
 std::vector<patchInfo> pending_patches;
 
@@ -145,34 +147,52 @@ static void ApplyBuiltInLbp3CompatibilityPatches() {
         return;
     }
 
-    // Keep only the long-standing prize-bubble control. Sprite lights and their original
-    // normalize/tone-map passes remain enabled for the native layered-rendering experiment.
+    // These exact v1.26 signatures expose the small set of compatibility controls used by the
+    // dedicated LBP3 launcher. Native sprite lights and tone mapping stay enabled by default.
     static constexpr std::string_view PickupSignature =
         "48 8d 1d 92 3a c5 00 80 3b 00 0f 84 c6 01 00 00";
+    static constexpr std::string_view SpriteLightsSignature =
+        "55 48 89 e5 41 57 41 56 41 55 41 54 53 48 81 ec b8 03 00 00 48 89 fb 48 89 9d "
+        "98 fc ff ff";
+    static constexpr std::string_view ToneMapSpriteLightsSignature =
+        "55 48 89 e5 41 57 41 56 41 55 41 54 53 48 81 ec 68 01 00 00 48 8b 05 d5 2a c9 "
+        "00";
 
-    if (PatternScan(std::string{PickupSignature}) == 0) {
-        LOG_ERROR(Loader,
-                  "LBP3 built-in compatibility patches skipped: v1.26 signatures did not match");
-        return;
-    }
-
-    const std::array patches = {
-        patchInfo{
+    const auto apply_mask_patch = [](std::string_view signature, std::string_view name,
+                                     std::string_view value, int mask_offset) {
+        if (PatternScan(std::string{signature}) == 0) {
+            LOG_ERROR(Loader,
+                      "LBP3 compatibility patch '{}' skipped: v1.26 signature did not match", name);
+            return;
+        }
+        PatchMemory(patchInfo{
             .gameSerial = "CUSA00063",
-            .modNameStr = "LBP3 built-in disable pickup resource blob",
-            .offsetStr = std::string{PickupSignature},
-            .valueStr = "e9c701000090",
+            .modNameStr = std::string{name},
+            .offsetStr = std::string{signature},
+            .valueStr = std::string{value},
             .isOffset = false,
             .littleEndian = false,
             .patchMask = PatchMask::Mask,
-            .maskOffset = 10,
-        },
+            .maskOffset = mask_offset,
+        });
     };
 
-    LOG_INFO(Loader, "Applying built-in LBP3 prize-bubble compatibility patch");
-    for (const auto& patch : patches) {
-        PatchMemory(patch);
+    if (g_lbp3_patch_prize_bubbles) {
+        apply_mask_patch(PickupSignature, "LBP3 built-in disable pickup resource blob",
+                         "e9c701000090", 10);
     }
+    if (g_lbp3_disable_sprite_lights) {
+        apply_mask_patch(SpriteLightsSignature, "LBP3 built-in disable sprite lights", "c3", 0);
+    }
+    if (g_lbp3_disable_tone_map) {
+        apply_mask_patch(ToneMapSpriteLightsSignature,
+                         "LBP3 built-in disable sprite-light tone map", "c3", 0);
+    }
+
+    LOG_INFO(Loader,
+             "LBP3 compatibility profile: prize_bubbles={}, disable_sprite_lights={}, "
+             "disable_tone_map={}",
+             g_lbp3_patch_prize_bubbles, g_lbp3_disable_sprite_lights, g_lbp3_disable_tone_map);
 }
 
 void ApplyPatchesFromXML(std::filesystem::path path) {

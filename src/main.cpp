@@ -1,10 +1,13 @@
 // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <charconv>
 #include <filesystem>
 #include <iostream>
 #include <memory>
 #include <optional>
+#include <string_view>
+#include <utility>
 #include <vector>
 #include <CLI/CLI.hpp>
 #include <SDL3/SDL_messagebox.h>
@@ -30,6 +33,39 @@
 #elif defined(__APPLE__)
 #include <sys/sysctl.h>
 #endif
+
+namespace {
+
+std::optional<bool> ParseBoolean(std::string_view value) {
+    if (value == "true") {
+        return true;
+    }
+    if (value == "false") {
+        return false;
+    }
+    return std::nullopt;
+}
+
+std::optional<std::pair<uint32_t, uint32_t>> ParseResolution(std::string_view value) {
+    const auto separator = value.find_first_of("xX");
+    if (separator == std::string_view::npos || separator == 0 || separator + 1 == value.size()) {
+        return std::nullopt;
+    }
+
+    uint32_t width = 0;
+    uint32_t height = 0;
+    const auto width_result = std::from_chars(value.data(), value.data() + separator, width, 10);
+    const auto height_result =
+        std::from_chars(value.data() + separator + 1, value.data() + value.size(), height, 10);
+    if (width_result.ec != std::errc{} || width_result.ptr != value.data() + separator ||
+        height_result.ec != std::errc{} || height_result.ptr != value.data() + value.size() ||
+        width < 640 || height < 360 || width > 7680 || height > 4320) {
+        return std::nullopt;
+    }
+    return std::pair{width, height};
+}
+
+} // namespace
 
 int main(int argc, char* argv[]) {
 #ifdef _WIN32
@@ -59,8 +95,13 @@ int main(int argc, char* argv[]) {
     bool waitForDebugger = false;
 
     std::optional<std::string> fullscreenStr;
+    std::optional<std::string> resolutionStr;
+    std::optional<std::string> lbp3PatchBubblesStr;
+    std::optional<std::string> lbp3DisableSpriteLightsStr;
+    std::optional<std::string> lbp3DisableToneMapStr;
     bool ignoreGamePatch = false;
     bool showFps = false;
+    bool hideFps = false;
     bool configClean = false;
     bool configGlobal = false;
     bool bigPicture = false;
@@ -81,6 +122,8 @@ int main(int argc, char* argv[]) {
 
     // FULLSCREEN: behavior-identical
     app.add_option("-f,--fullscreen", fullscreenStr, "Fullscreen mode (true|false)");
+    app.add_option("--resolution", resolutionStr,
+                   "Internal render and output window resolution (for example 1920x1080)");
 
     app.add_option("--override-root", overrideRoot)->check(CLI::ExistingDirectory);
 
@@ -88,6 +131,7 @@ int main(int argc, char* argv[]) {
     app.add_option("--wait-for-pid", waitPid);
 
     app.add_flag("--show-fps", showFps);
+    app.add_flag("--hide-fps", hideFps);
     app.add_flag("--config-clean", configClean);
     app.add_flag("--config-global", configGlobal);
     app.add_flag("--log-append", Common::Log::g_should_append);
@@ -95,6 +139,12 @@ int main(int argc, char* argv[]) {
                  "Record detailed per-frame performance telemetry CSV files");
     app.add_flag("--lbp3-online", lbp3Online,
                  "Enable the local LBP3 helper backend and P2P transport");
+    app.add_option("--lbp3-patch-bubbles", lbp3PatchBubblesStr,
+                   "Enable the LBP3 prize-bubble compatibility patch (true|false)");
+    app.add_option("--lbp3-disable-sprite-lights", lbp3DisableSpriteLightsStr,
+                   "Disable LBP3 sprite lights (true|false)");
+    app.add_option("--lbp3-disable-tone-map", lbp3DisableToneMapStr,
+                   "Disable the LBP3 sprite-light tone-map pass (true|false)");
 
     app.add_option("--add-game-folder", addGameFolder)->check(CLI::ExistingDirectory);
     app.add_option("--set-addon-folder", setAddonFolder)->check(CLI::ExistingDirectory);
@@ -174,7 +224,9 @@ int main(int argc, char* argv[]) {
         EmulatorSettings.SetAddonInstallDir(*setAddonFolder);
         EmulatorSettings.Save();
         LOG_INFO(Config, "Addon folder successfully saved.");
-        return 0;
+        if (!gamePath.has_value() && gameArgs.empty()) {
+            return 0;
+        }
     }
 
     if (!gamePath.has_value()) {
@@ -202,19 +254,62 @@ int main(int argc, char* argv[]) {
     if (ignoreGamePatch)
         Core::FileSys::MntPoints::ignore_game_patches = true;
 
+    std::optional<bool> fullscreenOverride;
     if (fullscreenStr) {
-        if (*fullscreenStr == "true") {
-            EmulatorSettings.SetFullScreen(true);
-        } else if (*fullscreenStr == "false") {
-            EmulatorSettings.SetFullScreen(false);
-        } else {
+        fullscreenOverride = ParseBoolean(*fullscreenStr);
+        if (!fullscreenOverride.has_value()) {
             LOG_ERROR(Debug, "Invalid argument for --fullscreen (use true|false)");
             return 1;
         }
+        EmulatorSettings.SetFullScreen(*fullscreenOverride);
     }
 
-    if (showFps)
-        EmulatorSettings.SetShowFpsCounter(true);
+    std::optional<std::pair<uint32_t, uint32_t>> resolutionOverride;
+    if (resolutionStr) {
+        resolutionOverride = ParseResolution(*resolutionStr);
+        if (!resolutionOverride.has_value()) {
+            LOG_ERROR(Debug,
+                      "Invalid argument for --resolution (use WIDTHxHEIGHT, 640x360..7680x4320)");
+            return 1;
+        }
+        const auto [width, height] = *resolutionOverride;
+        EmulatorSettings.SetInternalScreenWidth(width);
+        EmulatorSettings.SetInternalScreenHeight(height);
+        EmulatorSettings.SetWindowWidth(width);
+        EmulatorSettings.SetWindowHeight(height);
+    }
+
+    const auto apply_boolean_option = [](const std::optional<std::string>& option,
+                                         std::string_view option_name, bool& destination) {
+        if (!option.has_value()) {
+            return true;
+        }
+        const auto value = ParseBoolean(*option);
+        if (!value.has_value()) {
+            LOG_ERROR(Debug, "Invalid argument for {} (use true|false)", option_name);
+            return false;
+        }
+        destination = *value;
+        return true;
+    };
+    if (!apply_boolean_option(lbp3PatchBubblesStr, "--lbp3-patch-bubbles",
+                              MemoryPatcher::g_lbp3_patch_prize_bubbles) ||
+        !apply_boolean_option(lbp3DisableSpriteLightsStr, "--lbp3-disable-sprite-lights",
+                              MemoryPatcher::g_lbp3_disable_sprite_lights) ||
+        !apply_boolean_option(lbp3DisableToneMapStr, "--lbp3-disable-tone-map",
+                              MemoryPatcher::g_lbp3_disable_tone_map)) {
+        return 1;
+    }
+
+    std::optional<bool> showFpsOverride;
+    if (showFps && hideFps) {
+        LOG_ERROR(Debug, "--show-fps and --hide-fps cannot be used together");
+        return 1;
+    }
+    if (showFps || hideFps) {
+        showFpsOverride = showFps;
+        EmulatorSettings.SetShowFpsCounter(*showFpsOverride);
+    }
 
     if (configClean)
         EmulatorSettings.SetConfigMode(ConfigMode::Clean);
@@ -243,6 +338,9 @@ int main(int argc, char* argv[]) {
     auto* emulator = Common::Singleton<Core::Emulator>::Instance();
     emulator->executableName = argv[0];
     emulator->waitForDebuggerBeforeRun = waitForDebugger;
+    emulator->fullscreenOverride = fullscreenOverride;
+    emulator->showFpsOverride = showFpsOverride;
+    emulator->resolutionOverride = resolutionOverride;
     emulator->Run(ebootPath, gameArgs, overrideRoot);
 
     return 0;

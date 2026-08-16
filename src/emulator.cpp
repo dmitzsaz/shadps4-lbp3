@@ -32,13 +32,13 @@
 #include "core/file_format/psf.h"
 #include "core/file_format/trp.h"
 #include "core/file_sys/fs.h"
+#include "core/lbp3_online.h"
 #include "core/libraries/kernel/kernel.h"
 #include "core/libraries/libs.h"
 #include "core/libraries/network/lbp3_online_bridge.h"
 #include "core/libraries/np/np_trophy.h"
 #include "core/libraries/save_data/save_backup.h"
 #include "core/linker.h"
-#include "core/lbp3_online.h"
 #include "core/memory.h"
 #include "core/performance_telemetry.h"
 #include "core/user_settings.h"
@@ -281,6 +281,21 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     }
 
     EmulatorSettings.Load(id);
+    // CLI/launcher choices are per-run overrides. Apply them after the title-specific profile so
+    // a saved CUSA00063 config cannot silently replace the launcher's requested output mode.
+    if (fullscreenOverride.has_value()) {
+        EmulatorSettings.SetFullScreen(*fullscreenOverride, true);
+    }
+    if (showFpsOverride.has_value()) {
+        EmulatorSettings.SetShowFpsCounter(*showFpsOverride, true);
+    }
+    if (resolutionOverride.has_value()) {
+        const auto [width, height] = *resolutionOverride;
+        EmulatorSettings.SetInternalScreenWidth(width, true);
+        EmulatorSettings.SetInternalScreenHeight(height, true);
+        EmulatorSettings.SetWindowWidth(width, true);
+        EmulatorSettings.SetWindowHeight(height, true);
+    }
     // Switch to configured log
     Common::Log::Switch((!id.empty() && EmulatorSettings.IsLogSeparate()) ? id + ".log"
                                                                           : "shad_log.txt");
@@ -590,6 +605,28 @@ void Emulator::Restart(std::filesystem::path eboot_path,
     if (Lbp3Online::IsEnabled()) {
         args.push_back("--lbp3-online");
     }
+
+    if (fullscreenOverride.has_value()) {
+        args.push_back("--fullscreen");
+        args.push_back(*fullscreenOverride ? "true" : "false");
+    }
+
+    if (showFpsOverride.has_value()) {
+        args.push_back(*showFpsOverride ? "--show-fps" : "--hide-fps");
+    }
+
+    if (resolutionOverride.has_value()) {
+        const auto [width, height] = *resolutionOverride;
+        args.push_back("--resolution");
+        args.push_back(std::to_string(width) + "x" + std::to_string(height));
+    }
+
+    args.push_back("--lbp3-patch-bubbles");
+    args.push_back(MemoryPatcher::g_lbp3_patch_prize_bubbles ? "true" : "false");
+    args.push_back("--lbp3-disable-sprite-lights");
+    args.push_back(MemoryPatcher::g_lbp3_disable_sprite_lights ? "true" : "false");
+    args.push_back("--lbp3-disable-tone-map");
+    args.push_back(MemoryPatcher::g_lbp3_disable_tone_map ? "true" : "false");
 
     if (guest_args.size() > 0) {
         args.push_back("--");

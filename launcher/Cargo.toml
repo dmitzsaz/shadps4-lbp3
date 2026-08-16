@@ -1,0 +1,23 @@
+# SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+[package]
+name = "shadps4-lbp3-launcher"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-2.0-or-later"
+publish = false
+
+[[bin]]
+name = "shadps4-launcher"
+path = "src/main.rs"
+
+[dependencies]
+eframe = { version = "0.33.3", default-features = false, features = ["default_fonts", "glow"] }
+rfd = { version = "0.15.4", default-features = false }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[profile.release]
+lto = "thin"
+strip = true

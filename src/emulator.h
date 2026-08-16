@@ -3,9 +3,11 @@
 
 #pragma once
 
+#include <cstdint>
 #include <filesystem>
 #include <optional>
 #include <thread>
+#include <utility>
 
 #include "common/singleton.h"
 #include "core/linker.h"
@@ -39,6 +41,9 @@ public:
 
     const char* executableName;
     bool waitForDebuggerBeforeRun{false};
+    std::optional<bool> fullscreenOverride;
+    std::optional<bool> showFpsOverride;
+    std::optional<std::pair<std::uint32_t, std::uint32_t>> resolutionOverride;
 
 private:
     void LoadSystemModules(const std::string& game_serial);

@@ -18,6 +18,9 @@ extern EXPORT uintptr_t g_eboot_address;
 extern uint64_t g_eboot_image_size;
 extern std::string g_game_serial;
 extern std::string patch_file;
+extern bool g_lbp3_patch_prize_bubbles;
+extern bool g_lbp3_disable_sprite_lights;
+extern bool g_lbp3_disable_tone_map;
 
 enum PatchMask : uint8_t {
     None,
