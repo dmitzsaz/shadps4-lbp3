@@ -9,6 +9,12 @@ an invocation without arguments opens the launcher window. After a successful GU
 launcher exits and leaves only the game in the Dock. The core changes its LaunchServices display
 name to the title loaded from the game's `param.sfo` after SDL registers the application.
 
+macOS keeps the Dock label of executables inside an `.app` pinned to that bundle's on-disk display
+name. To make the label genuinely follow `param.sfo`, the launcher creates hard links for the signed
+core and its Vulkan runtime under `~/Library/Caches/shadPS4/lbp3-runtime`, names the executable after
+the game, and launches it there. This does not duplicate the large binaries or modify the app's
+signature; copying is used only when the cache and the app are on different filesystems.
+
 An optional bundled game is discovered at:
 
 ```text

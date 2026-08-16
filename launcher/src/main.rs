@@ -3,7 +3,7 @@
 
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -17,6 +17,11 @@ use serde::{Deserialize, Serialize};
 
 const APP_NAME: &str = "shadPS4 LBP3";
 const CORE_EXECUTABLE: &str = "shadps4-core";
+const CORE_RUNTIME_DEPENDENCIES: &[&str] = &[
+    "libvulkan.dylib",
+    "libvulkan_kosmickrisp.dylib",
+    "kosmickrisp_mesa_icd.json",
+];
 const PARTYCHAT_ADDRESS: &str = "127.0.0.1:18063";
 const RESOLUTIONS: &[&str] = &[
     "1280x720",
@@ -244,9 +249,17 @@ impl LauncherApp {
             return false;
         }
 
-        let mut command = Command::new(&core);
+        let named_core = match prepare_named_core(&core, &eboot) {
+            Ok(path) => path,
+            Err(error) => {
+                self.error = Some(format!("Не удалось подготовить процесс игры: {error}"));
+                return false;
+            }
+        };
+
+        let mut command = Command::new(&named_core);
         command.args(build_core_args(&self.config, &eboot, addon_root.as_deref()));
-        if let Some(parent) = core.parent() {
+        if let Some(parent) = named_core.parent() {
             command.current_dir(parent);
         }
 
@@ -604,6 +617,158 @@ fn core_executable_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(CORE_EXECUTABLE))
 }
 
+fn launcher_runtime_dir() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+        .join("Library")
+        .join("Caches")
+        .join("shadPS4")
+        .join("lbp3-runtime")
+}
+
+fn prepare_named_core(core: &Path, eboot: &Path) -> io::Result<PathBuf> {
+    let title = read_game_title(eboot).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "TITLE не найден в {}/sce_sys/param.sfo",
+                eboot.parent().unwrap_or(eboot).display()
+            ),
+        )
+    })?;
+    let process_name = sanitize_process_file_name(&title);
+    let runtime_dir = launcher_runtime_dir();
+    fs::create_dir_all(&runtime_dir)?;
+
+    let core_dir = core.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "у core отсутствует родительская папка",
+        )
+    })?;
+    for dependency in CORE_RUNTIME_DEPENDENCIES {
+        install_runtime_file(&core_dir.join(dependency), &runtime_dir.join(dependency))?;
+    }
+
+    let named_core = runtime_dir.join(process_name);
+    install_runtime_file(core, &named_core)?;
+    Ok(named_core)
+}
+
+fn install_runtime_file(source: &Path, destination: &Path) -> io::Result<()> {
+    if !source.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("не найден {}", source.display()),
+        ));
+    }
+
+    let file_name = destination
+        .file_name()
+        .and_then(OsStr::to_str)
+        .unwrap_or("runtime-file");
+    let temporary = destination.with_file_name(format!(".{file_name}.{}.tmp", std::process::id()));
+    if temporary.symlink_metadata().is_ok() {
+        fs::remove_file(&temporary)?;
+    }
+
+    if fs::hard_link(source, &temporary).is_err() {
+        fs::copy(source, &temporary)?;
+    }
+    if let Err(error) = fs::rename(&temporary, destination) {
+        let _ = fs::remove_file(&temporary);
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn read_game_title(eboot: &Path) -> Option<String> {
+    let param_sfo = eboot.parent()?.join("sce_sys").join("param.sfo");
+    parse_param_sfo_title(&fs::read(param_sfo).ok()?)
+}
+
+fn parse_param_sfo_title(bytes: &[u8]) -> Option<String> {
+    const HEADER_SIZE: usize = 20;
+    const ENTRY_SIZE: usize = 16;
+    const PSF_MAGIC: u32 = 0x4653_5000;
+
+    if read_u32(bytes, 0)? != PSF_MAGIC {
+        return None;
+    }
+    let key_table = read_u32(bytes, 8)? as usize;
+    let data_table = read_u32(bytes, 12)? as usize;
+    let entry_count = read_u32(bytes, 16)? as usize;
+    let index_end = HEADER_SIZE.checked_add(entry_count.checked_mul(ENTRY_SIZE)?)?;
+    if index_end > bytes.len() || key_table > bytes.len() || data_table > bytes.len() {
+        return None;
+    }
+
+    for index in 0..entry_count {
+        let entry = HEADER_SIZE.checked_add(index.checked_mul(ENTRY_SIZE)?)?;
+        let key_offset = read_u16(bytes, entry)? as usize;
+        let value_length = read_u32(bytes, entry + 4)? as usize;
+        let value_offset = read_u32(bytes, entry + 12)? as usize;
+        let key_start = key_table.checked_add(key_offset)?;
+        let key_tail = bytes.get(key_start..)?;
+        let key_end = key_start.checked_add(key_tail.iter().position(|byte| *byte == 0)?)?;
+        if bytes.get(key_start..key_end)? != b"TITLE" {
+            continue;
+        }
+
+        let value_start = data_table.checked_add(value_offset)?;
+        let value_end = value_start.checked_add(value_length)?;
+        let value = bytes.get(value_start..value_end)?;
+        let text_end = value
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(value.len());
+        let title = std::str::from_utf8(value.get(..text_end)?).ok()?.trim();
+        return (!title.is_empty()).then(|| title.to_owned());
+    }
+    None
+}
+
+fn read_u16(bytes: &[u8], offset: usize) -> Option<u16> {
+    Some(u16::from_le_bytes(
+        bytes.get(offset..offset.checked_add(2)?)?.try_into().ok()?,
+    ))
+}
+
+fn read_u32(bytes: &[u8], offset: usize) -> Option<u32> {
+    Some(u32::from_le_bytes(
+        bytes.get(offset..offset.checked_add(4)?)?.try_into().ok()?,
+    ))
+}
+
+fn sanitize_process_file_name(title: &str) -> String {
+    const MAX_BYTES: usize = 200;
+    let mut name = String::new();
+    for character in title.trim().chars() {
+        let character = if character == '/' || character == ':' || character.is_control() {
+            '_'
+        } else {
+            character
+        };
+        if name.len() + character.len_utf8() > MAX_BYTES {
+            break;
+        }
+        name.push(character);
+    }
+    if name.is_empty() || name == "." || name == ".." {
+        "shadPS4 game".to_owned()
+    } else {
+        name
+    }
+}
+
+fn game_path_from_arguments(arguments: &[OsString]) -> Option<PathBuf> {
+    arguments
+        .windows(2)
+        .find(|pair| pair[0] == OsStr::new("-g") || pair[0] == OsStr::new("--game"))
+        .map(|pair| PathBuf::from(&pair[1]))
+}
+
 fn default_external_eboot() -> Option<PathBuf> {
     let home = std::env::var_os("HOME").map(PathBuf::from)?;
     let candidate = home
@@ -752,8 +917,21 @@ fn forward_to_core(arguments: &[OsString]) -> i32 {
         eprintln!("{APP_NAME}: missing {}", core.display());
         return 1;
     }
-    let mut command = Command::new(core);
+    let named_core = match game_path_from_arguments(arguments) {
+        Some(eboot) => match prepare_named_core(&core, &eboot) {
+            Ok(path) => path,
+            Err(error) => {
+                eprintln!("{APP_NAME}: failed to prepare named game process: {error}");
+                return 1;
+            }
+        },
+        None => core,
+    };
+    let mut command = Command::new(&named_core);
     command.args(arguments);
+    if let Some(parent) = named_core.parent() {
+        command.current_dir(parent);
+    }
     match command.status() {
         Ok(status) => status.code().unwrap_or(1),
         Err(error) => {
@@ -820,5 +998,45 @@ mod tests {
         assert!(args.contains(&OsString::from("--lbp3-patch-bubbles")));
         assert!(args.contains(&OsString::from("--lbp3-disable-sprite-lights")));
         assert!(args.contains(&OsString::from("--lbp3-disable-tone-map")));
+    }
+
+    #[test]
+    fn parses_and_sanitizes_param_sfo_title() {
+        let title = "LittleBigPlanet™3 (EU)";
+        let key_table = 20 + 16;
+        let data_table = key_table + b"TITLE\0".len();
+        let mut sfo = Vec::new();
+        sfo.extend_from_slice(&0x4653_5000_u32.to_le_bytes());
+        sfo.extend_from_slice(&0x0000_0101_u32.to_le_bytes());
+        sfo.extend_from_slice(&(key_table as u32).to_le_bytes());
+        sfo.extend_from_slice(&(data_table as u32).to_le_bytes());
+        sfo.extend_from_slice(&1_u32.to_le_bytes());
+        sfo.extend_from_slice(&0_u16.to_le_bytes());
+        sfo.extend_from_slice(&0x0204_u16.to_le_bytes());
+        sfo.extend_from_slice(&((title.len() + 1) as u32).to_le_bytes());
+        sfo.extend_from_slice(&((title.len() + 1) as u32).to_le_bytes());
+        sfo.extend_from_slice(&0_u32.to_le_bytes());
+        sfo.extend_from_slice(b"TITLE\0");
+        sfo.extend_from_slice(title.as_bytes());
+        sfo.push(0);
+
+        assert_eq!(parse_param_sfo_title(&sfo).as_deref(), Some(title));
+        assert_eq!(
+            sanitize_process_file_name(" bad/name:here "),
+            "bad_name_here"
+        );
+    }
+
+    #[test]
+    fn finds_game_argument_for_named_process() {
+        let arguments = vec![
+            OsString::from("--show-fps"),
+            OsString::from("-g"),
+            OsString::from("/game/eboot.bin"),
+        ];
+        assert_eq!(
+            game_path_from_arguments(&arguments),
+            Some(PathBuf::from("/game/eboot.bin"))
+        );
     }
 }
