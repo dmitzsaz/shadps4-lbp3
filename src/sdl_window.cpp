@@ -42,6 +42,10 @@ namespace Frontend {
 
 using namespace Libraries::Pad;
 
+#ifdef __APPLE__
+void SetMacOSProcessName(std::string_view application_name);
+#endif
+
 static OrbisPadButtonDataOffset SDLGamepadToOrbisButton(u8 button) {
     using OPBDO = OrbisPadButtonDataOffset;
 
@@ -97,11 +101,19 @@ static Uint32 SDLCALL PollControllerLightColour(void* userdata, SDL_TimerID time
 }
 
 WindowSDL::WindowSDL(s32 width_, s32 height_, Input::GameControllers* controllers_,
-                     std::string_view window_title)
+                     std::string_view application_name, std::string_view window_title)
     : width{width_}, height{height_}, controllers{*controllers_} {
-    if (!SDL_SetHint(SDL_HINT_APP_NAME, "shadPS4")) {
-        UNREACHABLE_MSG("Failed to set SDL window hint: {}", SDL_GetError());
+    const std::string native_application_name =
+        application_name.empty() ? "shadPS4" : std::string{application_name};
+    if (!SDL_SetAppMetadataProperty(SDL_PROP_APP_METADATA_NAME_STRING,
+                                    native_application_name.c_str())) {
+        UNREACHABLE_MSG("Failed to set SDL application name: {}", SDL_GetError());
     }
+#ifdef __APPLE__
+    // Set this before SDL creates NSApplication so the Dock and app switcher receive the title
+    // loaded from the game's param.sfo instead of the emulator executable name.
+    SetMacOSProcessName(native_application_name);
+#endif
     if (!SDL_Init(SDL_INIT_VIDEO)) {
         UNREACHABLE_MSG("Failed to initialize SDL video subsystem: {}", SDL_GetError());
     }

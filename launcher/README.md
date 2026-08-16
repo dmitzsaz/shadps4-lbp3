@@ -3,9 +3,11 @@
 
 # shadPS4 LBP3 launcher
 
-The macOS bundle uses the Rust launcher as `Contents/MacOS/shadps4` and keeps the emulator core as
-`Contents/MacOS/shadps4-core`. Invocations with command-line arguments are forwarded to the core;
-an invocation without arguments opens the launcher window.
+The macOS bundle uses the Rust launcher as `Contents/MacOS/shadps4`. The emulator core lives in the
+signed `Contents/Helpers/shadPS4-lbp3.app` helper bundle so macOS presents the running game as
+`LittleBigPlanet™3 (EU)` in the Dock. Invocations with command-line arguments are forwarded to the
+core; an invocation without arguments opens the launcher window. After a successful GUI launch,
+the launcher exits and leaves only the game in the Dock.
 
 An optional bundled game is discovered at:
 

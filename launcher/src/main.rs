@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 
 const APP_NAME: &str = "shadPS4 LBP3";
 const CORE_EXECUTABLE: &str = "shadps4-core";
+const CORE_BUNDLE: &str = "shadPS4-lbp3.app";
 const PARTYCHAT_ADDRESS: &str = "127.0.0.1:18063";
 const RESOLUTIONS: &[&str] = &[
     "1280x720",
@@ -211,37 +212,37 @@ impl LauncherApp {
         }
     }
 
-    fn launch(&mut self) {
+    fn launch(&mut self) -> bool {
         self.error = None;
         if self.child.is_some() {
-            return;
+            return false;
         }
 
         let Some(eboot) = self.selected_eboot() else {
             self.error = Some("Укажи существующий eboot.bin".to_owned());
-            return;
+            return false;
         };
         if !is_eboot(&eboot) {
             self.error = Some(format!("eboot.bin не найден: {}", eboot.display()));
-            return;
+            return false;
         }
         let addon_root = self.addon_root();
         if let Some(path) = &addon_root
             && !path.is_dir()
         {
             self.error = Some(format!("Папка DLC не найдена: {}", path.display()));
-            return;
+            return false;
         }
 
         let core = core_executable_path();
         if !core.is_file() {
             self.error = Some(format!("Внутри .app не найден {CORE_EXECUTABLE}"));
-            return;
+            return false;
         }
 
         if let Err(error) = save_config(&self.config_path, &self.config) {
             self.error = Some(format!("Не удалось сохранить настройки: {error}"));
-            return;
+            return false;
         }
 
         let mut command = Command::new(&core);
@@ -267,9 +268,11 @@ impl LauncherApp {
             Ok(child) => {
                 self.child = Some(child);
                 self.run_status = "Игра запускается…".to_owned();
+                true
             }
             Err(error) => {
                 self.error = Some(format!("Не удалось запустить эмулятор: {error}"));
+                false
             }
         }
     }
@@ -497,8 +500,11 @@ impl eframe::App for LauncherApp {
                             .min_size([ui.available_width(), 42.0].into()),
                     )
                     .clicked()
+                    && self.launch()
                 {
-                    self.launch();
+                    // The core is an independent process. Close the GUI so macOS keeps only the
+                    // running game in the Dock; launch failures intentionally leave it open.
+                    context.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
                 if !eboot_valid {
                     ui.label(
@@ -592,6 +598,14 @@ fn bundle_contents_dir() -> Option<PathBuf> {
 }
 
 fn core_executable_path() -> PathBuf {
+    if let Some(contents) = bundle_contents_dir() {
+        return contents
+            .join("Helpers")
+            .join(CORE_BUNDLE)
+            .join("Contents")
+            .join("MacOS")
+            .join(CORE_EXECUTABLE);
+    }
     std::env::current_exe()
         .ok()
         .and_then(|path| path.parent().map(|parent| parent.join(CORE_EXECUTABLE)))

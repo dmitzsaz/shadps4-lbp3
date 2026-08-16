@@ -9,6 +9,17 @@
 
 namespace Frontend {
 
+void SetMacOSProcessName(std::string_view application_name) {
+    @autoreleasepool {
+        NSString* name = [[[NSString alloc] initWithBytes:application_name.data()
+                                                   length:application_name.size()
+                                                 encoding:NSUTF8StringEncoding] autorelease];
+        if (name.length != 0) {
+            [NSProcessInfo.processInfo setProcessName:name];
+        }
+    }
+}
+
 void SetWindowIcon(SDL_Window* window, const std::vector<u8>& png) {
     @autoreleasepool {
         NSData* pngData = [NSData dataWithBytes:png.data() length:png.size()];
