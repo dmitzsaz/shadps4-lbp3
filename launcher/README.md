@@ -5,9 +5,17 @@
 
 The macOS bundle uses the Rust launcher as `Contents/MacOS/shadps4` and keeps the emulator core as
 `Contents/MacOS/shadps4-core`. Invocations with command-line arguments are forwarded to the core;
-an invocation without arguments opens the launcher window. After a successful GUI launch, the
-launcher exits and leaves only the game in the Dock. The core changes its LaunchServices display
-name to the title loaded from the game's `param.sfo` after SDL registers the application.
+an invocation without arguments opens the launcher window. `--launcher-ui -g <eboot.bin>` is the
+internal testing form that opens the UI and preselects the given game instead of forwarding the
+arguments. After a successful GUI launch, the launcher exits and leaves only the game in the Dock.
+The core changes its LaunchServices display name to the title loaded from the game's `param.sfo`
+after SDL registers the application.
+
+The built-in compatibility patches target `APP_VER 01.26`. If selected patches do not match the
+chosen game's `param.sfo`, the launcher warns before starting and passes all patch switches as
+disabled for that run without overwriting the saved choices. LBP Online performs the same
+pre-launch warning when PartyChat is unavailable. PartyChat is probed synchronously again when the
+user continues, so starting it while the warning is open is picked up by the game launch.
 
 macOS keeps the Dock label of executables inside an `.app` pinned to that bundle's on-disk display
 name. To make the label genuinely follow `param.sfo`, the launcher creates hard links for the signed

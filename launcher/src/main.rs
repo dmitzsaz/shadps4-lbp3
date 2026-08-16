@@ -15,8 +15,10 @@ use std::time::Duration;
 use eframe::egui::{self, Color32, RichText};
 use serde::{Deserialize, Serialize};
 
-const APP_NAME: &str = "shadPS4 LBP3";
+const APP_NAME: &str = "LittleBigPlanet™ 3 Launcher";
 const CORE_EXECUTABLE: &str = "shadps4-core";
+const LAUNCHER_UI_ARGUMENT: &str = "--launcher-ui";
+const SUPPORTED_PATCH_APP_VERSION: &str = "01.26";
 const CORE_RUNTIME_DEPENDENCIES: &[&str] = &[
     "libvulkan.dylib",
     "libvulkan_kosmickrisp.dylib",
@@ -63,6 +65,20 @@ impl Default for LauncherConfig {
     }
 }
 
+impl LauncherConfig {
+    fn has_selected_patches(&self) -> bool {
+        self.patch_prize_bubbles || self.disable_sprite_lights || self.disable_tone_map
+    }
+
+    fn with_patches_disabled(&self) -> Self {
+        let mut config = self.clone();
+        config.patch_prize_bubbles = false;
+        config.disable_sprite_lights = false;
+        config.disable_tone_map = false;
+        config
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 enum PartyChatState {
     #[default]
@@ -72,6 +88,38 @@ enum PartyChatState {
         online_id: Option<String>,
         emulator_attached: bool,
     },
+}
+
+impl PartyChatState {
+    fn is_running(&self) -> bool {
+        matches!(self, Self::Running { .. })
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct LaunchWarning {
+    patch_version_mismatch: bool,
+    detected_app_version: Option<String>,
+    partychat_offline: bool,
+}
+
+impl LaunchWarning {
+    fn is_empty(&self) -> bool {
+        !self.patch_version_mismatch && !self.partychat_offline
+    }
+}
+
+fn derive_launch_warning(
+    config: &LauncherConfig,
+    detected_app_version: Option<String>,
+    partychat_running: bool,
+) -> LaunchWarning {
+    LaunchWarning {
+        patch_version_mismatch: config.has_selected_patches()
+            && detected_app_version.as_deref() != Some(SUPPORTED_PATCH_APP_VERSION),
+        detected_app_version,
+        partychat_offline: config.lbp3_online && !partychat_running,
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -119,6 +167,12 @@ impl PartyChatMonitor {
             .map(|state| state.clone())
             .unwrap_or_default()
     }
+
+    fn set_state(&self, state: PartyChatState) {
+        if let Ok(mut current) = self.state.lock() {
+            *current = state;
+        }
+    }
 }
 
 impl Drop for PartyChatMonitor {
@@ -136,10 +190,11 @@ struct LauncherApp {
     child: Option<Child>,
     run_status: String,
     error: Option<String>,
+    pending_warning: Option<LaunchWarning>,
 }
 
 impl LauncherApp {
-    fn new(context: &eframe::CreationContext<'_>) -> Self {
+    fn new(context: &eframe::CreationContext<'_>, initial_eboot: Option<PathBuf>) -> Self {
         configure_style(&context.egui_ctx);
         let config_path = launcher_config_path();
         let mut config = load_config(&config_path);
@@ -163,6 +218,10 @@ impl LauncherApp {
         if !RESOLUTIONS.contains(&config.resolution.as_str()) {
             config.resolution = "1920x1080".to_owned();
         }
+        if let Some(eboot) = initial_eboot {
+            config.external_eboot = eboot.to_string_lossy().into_owned();
+            config.prefer_bundled_game = false;
+        }
 
         Self {
             config,
@@ -171,8 +230,9 @@ impl LauncherApp {
             bundled_addons,
             partychat: PartyChatMonitor::new(context.egui_ctx.clone()),
             child: None,
-            run_status: "Эмулятор не запущен".to_owned(),
+            run_status: "Emulator is not running".to_owned(),
             error: None,
+            pending_warning: None,
         }
     }
 
@@ -201,64 +261,105 @@ impl LauncherApp {
         match child.try_wait() {
             Ok(Some(status)) => {
                 self.run_status = match status.code() {
-                    Some(0) => "Эмулятор завершил работу".to_owned(),
-                    Some(code) => format!("Эмулятор завершился с кодом {code}"),
-                    None => "Эмулятор аварийно завершился".to_owned(),
+                    Some(0) => "Emulator stopped".to_owned(),
+                    Some(code) => format!("Emulator exited with code {code}"),
+                    None => "Emulator crashed".to_owned(),
                 };
                 self.child = None;
             }
-            Ok(None) => self.run_status = "Игра запущена".to_owned(),
+            Ok(None) => self.run_status = "Game is running".to_owned(),
             Err(error) => {
-                self.run_status = "Не удалось проверить процесс".to_owned();
+                self.run_status = "Could not check the emulator process".to_owned();
                 self.error = Some(error.to_string());
                 self.child = None;
             }
         }
     }
 
-    fn launch(&mut self) -> bool {
-        self.error = None;
+    fn launch_inputs(&self) -> Result<(PathBuf, Option<PathBuf>, PathBuf), String> {
         if self.child.is_some() {
-            return false;
+            return Err("The game is already running".to_owned());
         }
-
-        let Some(eboot) = self.selected_eboot() else {
-            self.error = Some("Укажи существующий eboot.bin".to_owned());
-            return false;
-        };
+        let eboot = self
+            .selected_eboot()
+            .ok_or_else(|| "Choose an existing eboot.bin".to_owned())?;
         if !is_eboot(&eboot) {
-            self.error = Some(format!("eboot.bin не найден: {}", eboot.display()));
-            return false;
+            return Err(format!("eboot.bin was not found: {}", eboot.display()));
         }
         let addon_root = self.addon_root();
         if let Some(path) = &addon_root
             && !path.is_dir()
         {
-            self.error = Some(format!("Папка DLC не найдена: {}", path.display()));
-            return false;
+            return Err(format!("DLC folder was not found: {}", path.display()));
         }
-
         let core = core_executable_path();
         if !core.is_file() {
-            self.error = Some(format!("Внутри .app не найден {CORE_EXECUTABLE}"));
+            return Err(format!("{CORE_EXECUTABLE} is missing from the .app"));
+        }
+        Ok((eboot, addon_root, core))
+    }
+
+    fn refresh_partychat(&self) -> PartyChatState {
+        let state = probe_partychat();
+        self.partychat.set_state(state.clone());
+        state
+    }
+
+    fn request_launch(&mut self) -> bool {
+        self.error = None;
+        let (eboot, _, _) = match self.launch_inputs() {
+            Ok(inputs) => inputs,
+            Err(error) => {
+                self.error = Some(error);
+                return false;
+            }
+        };
+
+        let partychat_running = !self.config.lbp3_online || self.refresh_partychat().is_running();
+        let warning = derive_launch_warning(
+            &self.config,
+            read_game_param(&eboot, "APP_VER"),
+            partychat_running,
+        );
+        if !warning.is_empty() {
+            self.pending_warning = Some(warning);
             return false;
         }
+        self.launch_now(false)
+    }
 
+    fn launch_now(&mut self, disable_patches: bool) -> bool {
+        self.error = None;
+        let (eboot, addon_root, core) = match self.launch_inputs() {
+            Ok(inputs) => inputs,
+            Err(error) => {
+                self.error = Some(error);
+                return false;
+            }
+        };
         if let Err(error) = save_config(&self.config_path, &self.config) {
-            self.error = Some(format!("Не удалось сохранить настройки: {error}"));
+            self.error = Some(format!("Could not save launcher settings: {error}"));
             return false;
         }
 
         let named_core = match prepare_named_core(&core, &eboot) {
             Ok(path) => path,
             Err(error) => {
-                self.error = Some(format!("Не удалось подготовить процесс игры: {error}"));
+                self.error = Some(format!("Could not prepare the game process: {error}"));
                 return false;
             }
         };
-
+        let effective_config = if disable_patches {
+            self.config.with_patches_disabled()
+        } else {
+            self.config.clone()
+        };
         let mut command = Command::new(&named_core);
-        command.args(build_core_args(&self.config, &eboot, addon_root.as_deref()));
+        command.args(build_core_args(
+            &effective_config,
+            &eboot,
+            addon_root.as_deref(),
+        ));
         if let Some(parent) = named_core.parent() {
             command.current_dir(parent);
         }
@@ -279,46 +380,45 @@ impl LauncherApp {
         match command.spawn() {
             Ok(child) => {
                 self.child = Some(child);
-                self.run_status = "Игра запускается…".to_owned();
+                self.run_status = "Launching game…".to_owned();
                 true
             }
             Err(error) => {
-                self.error = Some(format!("Не удалось запустить эмулятор: {error}"));
+                self.error = Some(format!("Could not start the emulator: {error}"));
                 false
             }
         }
     }
 
-    fn draw_game_section(&mut self, ui: &mut egui::Ui) -> bool {
+    fn draw_game_paths(&mut self, ui: &mut egui::Ui) -> bool {
         let mut changed = false;
-        ui.heading("Игра");
-        if let Some(path) = &self.bundled_eboot {
-            changed |= ui
-                .radio_value(
-                    &mut self.config.prefer_bundled_game,
-                    true,
-                    "Игра внутри .app",
-                )
-                .changed();
-            ui.label(RichText::new(path.display().to_string()).small().weak());
-        } else {
-            ui.label(RichText::new("Встроенный eboot.bin не найден").weak());
-        }
-        changed |= ui
-            .radio_value(
-                &mut self.config.prefer_bundled_game,
-                false,
-                "Внешний eboot.bin",
-            )
-            .changed();
+        ui.label(RichText::new("eboot.bin").size(19.0).strong());
+        ui.add_space(4.0);
+        let bundled_game_active = self.config.prefer_bundled_game && self.bundled_eboot.is_some();
         ui.horizontal(|ui| {
-            let field = ui.add_sized(
-                [ui.available_width() - 92.0, 26.0],
-                egui::TextEdit::singleline(&mut self.config.external_eboot)
-                    .hint_text("/путь/к/CUSA00063/eboot.bin"),
-            );
-            changed |= field.changed();
-            if ui.button("Выбрать…").clicked()
+            let field_width = (ui.available_width() - 48.0).max(120.0);
+            if bundled_game_active {
+                let mut bundled_label = "Using bundled game".to_owned();
+                ui.add_sized(
+                    [field_width, 38.0],
+                    egui::TextEdit::singleline(&mut bundled_label).interactive(false),
+                );
+            } else {
+                changed |= ui
+                    .add_sized(
+                        [field_width, 38.0],
+                        egui::TextEdit::singleline(&mut self.config.external_eboot)
+                            .hint_text("/path/to/CUSA00063/eboot.bin"),
+                    )
+                    .changed();
+            }
+            if ui
+                .add_sized(
+                    [40.0, 38.0],
+                    egui::Button::new(RichText::new("…").size(19.0)),
+                )
+                .on_hover_text("Choose an external eboot.bin")
+                .clicked()
                 && let Some(path) = rfd::FileDialog::new()
                     .add_filter("PlayStation executable", &["bin"])
                     .set_file_name("eboot.bin")
@@ -329,45 +429,134 @@ impl LauncherApp {
                 changed = true;
             }
         });
+        if let Some(path) = &self.bundled_eboot {
+            ui.horizontal(|ui| {
+                if !bundled_game_active && ui.small_button("Use bundled game").clicked() {
+                    self.config.prefer_bundled_game = true;
+                    changed = true;
+                }
+                if bundled_game_active {
+                    ui.label(RichText::new(path.display().to_string()).small().weak());
+                }
+            });
+        }
 
-        ui.add_space(10.0);
-        ui.label(RichText::new("DLC / Add-ons").strong());
+        ui.add_space(15.0);
+        ui.label(RichText::new("DLC Path").size(19.0).strong());
+        ui.add_space(4.0);
+        let bundled_addons_active = self.bundled_addons.as_ref().is_some_and(|path| {
+            Path::new(&self.config.addon_root) == path && !self.config.addon_root.is_empty()
+        });
         ui.horizontal(|ui| {
-            let field = ui.add_sized(
-                [ui.available_width() - 92.0, 26.0],
-                egui::TextEdit::singleline(&mut self.config.addon_root)
-                    .hint_text("Необязательно: корень addcont"),
-            );
-            changed |= field.changed();
-            if ui.button("Выбрать…").clicked()
+            let field_width = (ui.available_width() - 48.0).max(120.0);
+            if bundled_addons_active {
+                let mut bundled_label = "Using bundled DLC".to_owned();
+                ui.add_sized(
+                    [field_width, 38.0],
+                    egui::TextEdit::singleline(&mut bundled_label).interactive(false),
+                );
+            } else {
+                changed |= ui
+                    .add_sized(
+                        [field_width, 38.0],
+                        egui::TextEdit::singleline(&mut self.config.addon_root)
+                            .hint_text("Optional add-on root"),
+                    )
+                    .changed();
+            }
+            if ui
+                .add_sized(
+                    [40.0, 38.0],
+                    egui::Button::new(RichText::new("…").size(19.0)),
+                )
+                .on_hover_text("Choose an external DLC folder")
+                .clicked()
                 && let Some(path) = rfd::FileDialog::new().pick_folder()
             {
                 self.config.addon_root = path.to_string_lossy().into_owned();
                 changed = true;
             }
         });
-        ui.label(
-            RichText::new("Ожидаемая структура: <корень>/CUSA00063/<DLC>/sce_sys/param.sfo")
-                .small()
-                .weak(),
-        );
-        if let Some(path) = &self.bundled_addons
-            && ui.small_button("Использовать DLC из .app").clicked()
-        {
-            self.config.addon_root = path.to_string_lossy().into_owned();
-            changed = true;
-        }
+        ui.horizontal(|ui| {
+            if let Some(path) = &self.bundled_addons
+                && !bundled_addons_active
+                && ui.small_button("Use bundled DLC").clicked()
+            {
+                self.config.addon_root = path.to_string_lossy().into_owned();
+                changed = true;
+            }
+            if !self.config.addon_root.is_empty()
+                && !bundled_addons_active
+                && ui.small_button("No DLC").clicked()
+            {
+                self.config.addon_root.clear();
+                changed = true;
+            }
+        });
         changed
     }
 
-    fn draw_video_section(&mut self, ui: &mut egui::Ui) -> bool {
+    fn patch_summary(&self) -> String {
+        let labels = [
+            (self.config.patch_prize_bubbles, "Prize bubbles"),
+            (self.config.disable_sprite_lights, "Disable sprite lights"),
+            (self.config.disable_tone_map, "Disable tone map"),
+        ];
+        let selected = labels
+            .into_iter()
+            .filter_map(|(enabled, label)| enabled.then_some(label))
+            .collect::<Vec<_>>();
+        match selected.as_slice() {
+            [] => "No patches".to_owned(),
+            [label] => (*label).to_owned(),
+            labels => format!("{} patches enabled", labels.len()),
+        }
+    }
+
+    fn draw_patch_and_video_options(&mut self, ui: &mut egui::Ui) -> bool {
         let mut changed = false;
-        ui.heading("Видео");
-        ui.horizontal(|ui| {
-            ui.label("Разрешение рендера и окна:");
+        ui.columns(2, |columns| {
+            columns[0].label(RichText::new("Patches").size(17.0).strong());
+            columns[0].add_space(3.0);
+            let patch_summary = self.patch_summary();
+            egui::ComboBox::from_id_salt("lbp3-patches")
+                .selected_text(patch_summary)
+                .width(columns[0].available_width())
+                .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                .show_ui(&mut columns[0], |ui| {
+                    ui.set_min_width(315.0);
+                    changed |= ui
+                        .checkbox(
+                            &mut self.config.patch_prize_bubbles,
+                            "Prize bubbles (recommended)",
+                        )
+                        .changed();
+                    changed |= ui
+                        .checkbox(
+                            &mut self.config.disable_sprite_lights,
+                            "Disable sprite lights",
+                        )
+                        .changed();
+                    changed |= ui
+                        .checkbox(
+                            &mut self.config.disable_tone_map,
+                            "Disable sprite-light tone map",
+                        )
+                        .changed();
+                    ui.separator();
+                    ui.label(
+                        RichText::new(format!("Prepared for LBP3 {SUPPORTED_PATCH_APP_VERSION}"))
+                            .small()
+                            .weak(),
+                    );
+                });
+
+            columns[1].label(RichText::new("Resolution").size(17.0).strong());
+            columns[1].add_space(3.0);
             egui::ComboBox::from_id_salt("resolution")
                 .selected_text(&self.config.resolution)
-                .show_ui(ui, |ui| {
+                .width(columns[1].available_width())
+                .show_ui(&mut columns[1], |ui| {
                     for resolution in RESOLUTIONS {
                         changed |= ui
                             .selectable_value(
@@ -379,81 +568,191 @@ impl LauncherApp {
                     }
                 });
         });
-        changed |= ui
-            .checkbox(&mut self.config.fullscreen, "Fullscreen")
-            .changed();
-        changed |= ui
-            .checkbox(&mut self.config.show_fps, "Показывать FPS")
-            .changed();
         changed
     }
 
-    fn draw_online_section(&mut self, ui: &mut egui::Ui) -> bool {
+    fn draw_online_and_display_options(&mut self, ui: &mut egui::Ui) -> bool {
         let mut changed = false;
-        ui.heading("LBP3 Online");
-        changed |= ui
-            .checkbox(&mut self.config.lbp3_online, "Включить LBP3 Online")
-            .changed();
-        match self.partychat.state() {
-            PartyChatState::Checking => {
-                ui.colored_label(Color32::from_rgb(235, 185, 70), "● Проверяю PartyChat…");
-            }
-            PartyChatState::Offline => {
-                ui.colored_label(Color32::from_rgb(230, 95, 95), "● PartyChat не запущен");
-            }
-            PartyChatState::Running {
-                online_id,
-                emulator_attached,
-            } => {
-                let suffix = online_id.map(|id| format!(" — {id}")).unwrap_or_default();
-                ui.colored_label(
-                    Color32::from_rgb(95, 215, 135),
-                    format!("● PartyChat запущен{suffix}"),
-                );
-                if emulator_attached {
-                    ui.label(RichText::new("Эмулятор подключён к bridge").small().weak());
-                }
-            }
+        ui.horizontal(|ui| {
+            changed |= ui
+                .checkbox(
+                    &mut self.config.lbp3_online,
+                    RichText::new("LBP Online").size(17.0),
+                )
+                .changed();
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                draw_partychat_status(ui, self.partychat.state());
+            });
+        });
+        ui.label(
+            RichText::new("Enable LittleBigPlanet™ 3 online features")
+                .small()
+                .weak(),
+        );
+        ui.add_space(10.0);
+        ui.horizontal(|ui| {
+            changed |= ui
+                .checkbox(&mut self.config.fullscreen, "Fullscreen")
+                .changed();
+            ui.add_space(18.0);
+            changed |= ui.checkbox(&mut self.config.show_fps, "Show FPS").changed();
+        });
+        changed
+    }
+
+    fn draw_launch_footer(&mut self, ui: &mut egui::Ui) -> bool {
+        if let Some(error) = &self.error {
+            ui.colored_label(Color32::from_rgb(240, 105, 105), error);
+            ui.add_space(6.0);
         }
-        ui.label(
-            RichText::new(
-                "Галочку можно оставить включённой без PartyChat: игра автоматически уйдёт в offline.",
-            )
-            .small()
-            .weak(),
-        );
-        changed
+
+        let eboot_valid = self.selected_eboot().is_some_and(|path| is_eboot(&path));
+        let addon_valid = self.addon_root().is_none_or(|path| path.is_dir());
+        let core_valid = core_executable_path().is_file();
+        let can_launch = self.child.is_none() && eboot_valid && addon_valid && core_valid;
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(&self.run_status).small().weak());
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let response = ui.add_enabled(
+                    can_launch,
+                    egui::Button::new(RichText::new("Launch").size(18.0).strong())
+                        .fill(Color32::from_rgb(28, 132, 245))
+                        .corner_radius(10.0)
+                        .min_size([180.0, 46.0].into()),
+                );
+                response.clicked() && self.request_launch()
+            })
+            .inner
+        })
+        .inner
     }
 
-    fn draw_patches_section(&mut self, ui: &mut egui::Ui) -> bool {
-        let mut changed = false;
-        ui.heading("Патчи совместимости LBP3 v1.26");
-        changed |= ui
-            .checkbox(
-                &mut self.config.patch_prize_bubbles,
-                "Патч пузырьков-наград (рекомендуется)",
+    fn draw_warning_modal(&mut self, context: &egui::Context) -> bool {
+        let Some(warning) = self.pending_warning.clone() else {
+            return false;
+        };
+        #[derive(Clone, Copy)]
+        enum Action {
+            Continue,
+            Cancel,
+        }
+        let mut action = None;
+        let modal = egui::Modal::new(egui::Id::new("launch-warning"))
+            .backdrop_color(Color32::from_black_alpha(185))
+            .frame(
+                egui::Frame::popup(&context.style())
+                    .fill(Color32::from_rgb(36, 38, 44))
+                    .corner_radius(14.0)
+                    .inner_margin(egui::Margin::symmetric(24, 20)),
             )
-            .changed();
-        changed |= ui
-            .checkbox(
-                &mut self.config.disable_sprite_lights,
-                "Отключить Sprite Lights",
-            )
-            .changed();
-        changed |= ui
-            .checkbox(
-                &mut self.config.disable_tone_map,
-                "Отключить ToneMap Sprite Lights",
-            )
-            .changed();
-        ui.label(
-            RichText::new(
-                "Отключения света нужны только как fallback: текущий нативный фикс рассчитан на включённые эффекты.",
-            )
-            .small()
-            .weak(),
-        );
-        changed
+            .show(context, |ui| {
+                ui.set_min_width(470.0);
+                ui.heading(RichText::new("Before launching").size(21.0));
+                ui.add_space(8.0);
+
+                if warning.patch_version_mismatch {
+                    let detected = warning
+                        .detected_app_version
+                        .as_deref()
+                        .unwrap_or("not detected");
+                    ui.label(
+                        RichText::new("Patches do not match this game version").strong(),
+                    );
+                    ui.label(format!(
+                        "Selected patches are prepared for APP_VER {SUPPORTED_PATCH_APP_VERSION}, but the selected game reports {detected}. If you continue, the patches will not be applied."
+                    ));
+                }
+
+                if warning.patch_version_mismatch && warning.partychat_offline {
+                    ui.add_space(10.0);
+                    ui.separator();
+                    ui.add_space(10.0);
+                }
+
+                if warning.partychat_offline {
+                    ui.label(RichText::new("PartyChat is not running").strong());
+                    if self.partychat.state().is_running() {
+                        ui.colored_label(
+                            Color32::from_rgb(95, 215, 135),
+                            "PartyChat is now detected. Continue will connect to it.",
+                        );
+                    } else {
+                        ui.label(
+                            "LBP Online is enabled. You can start PartyChat while this warning is open, then press Continue. It will be checked again immediately before launch; if it is still unavailable, the game will fall back to offline mode.",
+                        );
+                    }
+                }
+
+                ui.add_space(18.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_sized([110.0, 36.0], egui::Button::new("Cancel"))
+                        .clicked()
+                    {
+                        action = Some(Action::Cancel);
+                    }
+                    if ui
+                        .add_sized(
+                            [130.0, 36.0],
+                            egui::Button::new(RichText::new("Continue").strong())
+                                .fill(Color32::from_rgb(28, 132, 245)),
+                        )
+                        .clicked()
+                    {
+                        action = Some(Action::Continue);
+                    }
+                });
+            });
+        if modal.should_close() && action.is_none() {
+            action = Some(Action::Cancel);
+        }
+
+        match action {
+            Some(Action::Cancel) => {
+                self.pending_warning = None;
+                false
+            }
+            Some(Action::Continue) => {
+                self.pending_warning = None;
+                if self.config.lbp3_online {
+                    self.refresh_partychat();
+                }
+                let disable_patches = self.config.has_selected_patches()
+                    && self
+                        .selected_eboot()
+                        .and_then(|eboot| read_game_param(&eboot, "APP_VER"))
+                        .as_deref()
+                        != Some(SUPPORTED_PATCH_APP_VERSION);
+                self.launch_now(disable_patches)
+            }
+            None => false,
+        }
+    }
+}
+
+fn draw_partychat_status(ui: &mut egui::Ui, state: PartyChatState) {
+    match state {
+        PartyChatState::Checking => {
+            ui.colored_label(Color32::from_rgb(235, 185, 70), "● Checking PartyChat…");
+        }
+        PartyChatState::Offline => {
+            ui.colored_label(Color32::from_rgb(230, 95, 95), "● PartyChat offline");
+        }
+        PartyChatState::Running {
+            online_id,
+            emulator_attached,
+        } => {
+            let id = online_id.map(|id| format!(" · {id}")).unwrap_or_default();
+            let attached = if emulator_attached {
+                " · connected"
+            } else {
+                ""
+            };
+            ui.colored_label(
+                Color32::from_rgb(95, 215, 135),
+                format!("● PartyChat online{id}{attached}"),
+            );
+        }
     }
 }
 
@@ -461,84 +760,48 @@ impl eframe::App for LauncherApp {
     fn update(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_child();
         context.request_repaint_after(Duration::from_millis(500));
+        let launched = egui::CentralPanel::default()
+            .frame(
+                egui::Frame::new()
+                    .fill(Color32::from_rgb(22, 23, 27))
+                    .inner_margin(egui::Margin::same(24)),
+            )
+            .show(context, |ui| {
+                let mut changed = false;
+                let card_height = ui.available_height();
+                let launched = egui::Frame::new()
+                    .fill(Color32::from_rgb(37, 38, 43))
+                    .corner_radius(18.0)
+                    .inner_margin(egui::Margin::symmetric(30, 25))
+                    .show(ui, |ui| {
+                        ui.set_min_height((card_height - 50.0).max(0.0));
+                        changed |= self.draw_game_paths(ui);
+                        ui.add_space(18.0);
+                        changed |= self.draw_patch_and_video_options(ui);
+                        ui.add_space(18.0);
+                        changed |= self.draw_online_and_display_options(ui);
+                        let footer_space = (ui.available_height() - 78.0).max(12.0);
+                        ui.add_space(footer_space);
+                        ui.separator();
+                        ui.add_space(10.0);
+                        self.draw_launch_footer(ui)
+                    })
+                    .inner;
 
-        egui::TopBottomPanel::top("header").show(context, |ui| {
-            ui.add_space(12.0);
-            ui.horizontal(|ui| {
-                ui.heading(RichText::new(APP_NAME).size(24.0));
-                ui.separator();
-                ui.label(RichText::new(&self.run_status).strong());
-            });
-            ui.add_space(10.0);
-        });
-
-        egui::CentralPanel::default().show(context, |ui| {
-            let mut changed = false;
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                egui::Frame::group(ui.style()).show(ui, |ui| {
-                    ui.set_width(ui.available_width());
-                    changed |= self.draw_game_section(ui);
-                });
-                ui.add_space(10.0);
-                egui::Frame::group(ui.style()).show(ui, |ui| {
-                    ui.set_width(ui.available_width());
-                    changed |= self.draw_video_section(ui);
-                });
-                ui.add_space(10.0);
-                egui::Frame::group(ui.style()).show(ui, |ui| {
-                    ui.set_width(ui.available_width());
-                    changed |= self.draw_online_section(ui);
-                });
-                ui.add_space(10.0);
-                egui::Frame::group(ui.style()).show(ui, |ui| {
-                    ui.set_width(ui.available_width());
-                    changed |= self.draw_patches_section(ui);
-                });
-                ui.add_space(12.0);
-
-                if let Some(error) = &self.error {
-                    ui.colored_label(Color32::from_rgb(240, 105, 105), error);
-                    ui.add_space(8.0);
+                if changed && let Err(error) = save_config(&self.config_path, &self.config) {
+                    self.error = Some(format!("Could not save launcher settings: {error}"));
                 }
+                launched
+            })
+            .inner;
 
-                let eboot_valid = self.selected_eboot().is_some_and(|path| is_eboot(&path));
-                let addon_valid = self.addon_root().is_none_or(|path| path.is_dir());
-                let core_valid = core_executable_path().is_file();
-                let can_launch = self.child.is_none() && eboot_valid && addon_valid && core_valid;
-                if ui
-                    .add_enabled(
-                        can_launch,
-                        egui::Button::new(RichText::new("Запустить LittleBigPlanet 3").size(18.0))
-                            .min_size([ui.available_width(), 42.0].into()),
-                    )
-                    .clicked()
-                    && self.launch()
-                {
-                    // Closing the last viewport does not quit a macOS application. The core is an
-                    // independent process and the configuration was saved before it was spawned,
-                    // so terminate the launcher explicitly and leave only the game in the Dock.
-                    std::process::exit(0);
-                }
-                if !eboot_valid {
-                    ui.label(
-                        RichText::new("Для запуска выбери валидный eboot.bin")
-                            .small()
-                            .weak(),
-                    );
-                } else if !core_valid {
-                    ui.label(
-                        RichText::new(format!("В bundle отсутствует {CORE_EXECUTABLE}"))
-                            .small()
-                            .weak(),
-                    );
-                }
-                ui.add_space(6.0);
-            });
-
-            if changed && let Err(error) = save_config(&self.config_path, &self.config) {
-                self.error = Some(format!("Не удалось сохранить настройки: {error}"));
-            }
-        });
+        let launched = self.draw_warning_modal(context) || launched;
+        if launched {
+            // Closing the last viewport does not quit a macOS application. The core is an
+            // independent process and the configuration was saved before it was spawned,
+            // so terminate the launcher explicitly and leave only the game in the Dock.
+            std::process::exit(0);
+        }
     }
 }
 
@@ -550,14 +813,26 @@ impl Drop for LauncherApp {
 
 fn configure_style(context: &egui::Context) {
     let mut visuals = egui::Visuals::dark();
-    visuals.panel_fill = Color32::from_rgb(20, 22, 28);
-    visuals.window_fill = Color32::from_rgb(25, 28, 35);
-    visuals.selection.bg_fill = Color32::from_rgb(72, 105, 185);
+    visuals.panel_fill = Color32::from_rgb(22, 23, 27);
+    visuals.window_fill = Color32::from_rgb(36, 38, 44);
+    visuals.extreme_bg_color = Color32::from_rgb(55, 57, 64);
+    visuals.text_edit_bg_color = Some(Color32::from_rgb(55, 57, 64));
+    visuals.faint_bg_color = Color32::from_rgb(48, 50, 56);
+    visuals.selection.bg_fill = Color32::from_rgb(28, 132, 245);
+    visuals.widgets.inactive.bg_fill = Color32::from_rgb(76, 78, 85);
+    visuals.widgets.hovered.bg_fill = Color32::from_rgb(88, 91, 99);
+    visuals.widgets.active.bg_fill = Color32::from_rgb(28, 132, 245);
+    visuals.widgets.inactive.corner_radius = 9.0.into();
+    visuals.widgets.hovered.corner_radius = 9.0.into();
+    visuals.widgets.active.corner_radius = 9.0.into();
+    visuals.window_corner_radius = 14.0.into();
+    visuals.menu_corner_radius = 10.0.into();
     context.set_visuals(visuals);
 
     let mut style = (*context.style()).clone();
-    style.spacing.item_spacing = egui::vec2(8.0, 7.0);
-    style.spacing.button_padding = egui::vec2(12.0, 7.0);
+    style.spacing.item_spacing = egui::vec2(8.0, 6.0);
+    style.spacing.button_padding = egui::vec2(13.0, 8.0);
+    style.spacing.combo_width = 220.0;
     context.set_style(style);
 }
 
@@ -632,7 +907,7 @@ fn prepare_named_core(core: &Path, eboot: &Path) -> io::Result<PathBuf> {
         io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
-                "TITLE не найден в {}/sce_sys/param.sfo",
+                "TITLE was not found in {}/sce_sys/param.sfo",
                 eboot.parent().unwrap_or(eboot).display()
             ),
         )
@@ -644,7 +919,7 @@ fn prepare_named_core(core: &Path, eboot: &Path) -> io::Result<PathBuf> {
     let core_dir = core.parent().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
-            "у core отсутствует родительская папка",
+            "core executable has no parent directory",
         )
     })?;
     for dependency in CORE_RUNTIME_DEPENDENCIES {
@@ -660,7 +935,7 @@ fn install_runtime_file(source: &Path, destination: &Path) -> io::Result<()> {
     if !source.is_file() {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
-            format!("не найден {}", source.display()),
+            format!("{} was not found", source.display()),
         ));
     }
 
@@ -683,12 +958,16 @@ fn install_runtime_file(source: &Path, destination: &Path) -> io::Result<()> {
     Ok(())
 }
 
-fn read_game_title(eboot: &Path) -> Option<String> {
+fn read_game_param(eboot: &Path, key: &str) -> Option<String> {
     let param_sfo = eboot.parent()?.join("sce_sys").join("param.sfo");
-    parse_param_sfo_title(&fs::read(param_sfo).ok()?)
+    parse_param_sfo_string(&fs::read(param_sfo).ok()?, key)
 }
 
-fn parse_param_sfo_title(bytes: &[u8]) -> Option<String> {
+fn read_game_title(eboot: &Path) -> Option<String> {
+    read_game_param(eboot, "TITLE")
+}
+
+fn parse_param_sfo_string(bytes: &[u8], requested_key: &str) -> Option<String> {
     const HEADER_SIZE: usize = 20;
     const ENTRY_SIZE: usize = 16;
     const PSF_MAGIC: u32 = 0x4653_5000;
@@ -712,7 +991,7 @@ fn parse_param_sfo_title(bytes: &[u8]) -> Option<String> {
         let key_start = key_table.checked_add(key_offset)?;
         let key_tail = bytes.get(key_start..)?;
         let key_end = key_start.checked_add(key_tail.iter().position(|byte| *byte == 0)?)?;
-        if bytes.get(key_start..key_end)? != b"TITLE" {
+        if bytes.get(key_start..key_end)? != requested_key.as_bytes() {
             continue;
         }
 
@@ -723,8 +1002,8 @@ fn parse_param_sfo_title(bytes: &[u8]) -> Option<String> {
             .iter()
             .position(|byte| *byte == 0)
             .unwrap_or(value.len());
-        let title = std::str::from_utf8(value.get(..text_end)?).ok()?.trim();
-        return (!title.is_empty()).then(|| title.to_owned());
+        let text = std::str::from_utf8(value.get(..text_end)?).ok()?.trim();
+        return (!text.is_empty()).then(|| text.to_owned());
     }
     None
 }
@@ -941,17 +1220,17 @@ fn forward_to_core(arguments: &[OsString]) -> i32 {
     }
 }
 
-fn run_gui() -> eframe::Result<()> {
+fn run_gui(initial_eboot: Option<PathBuf>) -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([760.0, 790.0])
-            .with_min_inner_size([650.0, 640.0]),
+            .with_inner_size([820.0, 650.0])
+            .with_min_inner_size([700.0, 570.0]),
         ..Default::default()
     };
     eframe::run_native(
         APP_NAME,
         options,
-        Box::new(|context| Ok(Box::new(LauncherApp::new(context)))),
+        Box::new(move |context| Ok(Box::new(LauncherApp::new(context, initial_eboot.clone())))),
     )
 }
 
@@ -960,10 +1239,20 @@ fn main() {
         .skip(1)
         .filter(|argument| !argument.to_string_lossy().starts_with("-psn_"))
         .collect::<Vec<_>>();
+    if arguments
+        .iter()
+        .any(|argument| argument == OsStr::new(LAUNCHER_UI_ARGUMENT))
+    {
+        if let Err(error) = run_gui(game_path_from_arguments(&arguments)) {
+            eprintln!("{APP_NAME}: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
     if !arguments.is_empty() {
         std::process::exit(forward_to_core(&arguments));
     }
-    if let Err(error) = run_gui() {
+    if let Err(error) = run_gui(None) {
         eprintln!("{APP_NAME}: {error}");
         std::process::exit(1);
     }
@@ -1000,11 +1289,9 @@ mod tests {
         assert!(args.contains(&OsString::from("--lbp3-disable-tone-map")));
     }
 
-    #[test]
-    fn parses_and_sanitizes_param_sfo_title() {
-        let title = "LittleBigPlanet™3 (EU)";
+    fn test_sfo(key: &str, value: &str) -> Vec<u8> {
         let key_table = 20 + 16;
-        let data_table = key_table + b"TITLE\0".len();
+        let data_table = key_table + key.len() + 1;
         let mut sfo = Vec::new();
         sfo.extend_from_slice(&0x4653_5000_u32.to_le_bytes());
         sfo.extend_from_slice(&0x0000_0101_u32.to_le_bytes());
@@ -1013,14 +1300,31 @@ mod tests {
         sfo.extend_from_slice(&1_u32.to_le_bytes());
         sfo.extend_from_slice(&0_u16.to_le_bytes());
         sfo.extend_from_slice(&0x0204_u16.to_le_bytes());
-        sfo.extend_from_slice(&((title.len() + 1) as u32).to_le_bytes());
-        sfo.extend_from_slice(&((title.len() + 1) as u32).to_le_bytes());
+        sfo.extend_from_slice(&((value.len() + 1) as u32).to_le_bytes());
+        sfo.extend_from_slice(&((value.len() + 1) as u32).to_le_bytes());
         sfo.extend_from_slice(&0_u32.to_le_bytes());
-        sfo.extend_from_slice(b"TITLE\0");
-        sfo.extend_from_slice(title.as_bytes());
+        sfo.extend_from_slice(key.as_bytes());
         sfo.push(0);
+        sfo.extend_from_slice(value.as_bytes());
+        sfo.push(0);
+        sfo
+    }
 
-        assert_eq!(parse_param_sfo_title(&sfo).as_deref(), Some(title));
+    #[test]
+    fn parses_arbitrary_param_sfo_strings_and_sanitizes_title() {
+        let title = "LittleBigPlanet™3 (EU)";
+        let title_sfo = test_sfo("TITLE", title);
+        let version_sfo = test_sfo("APP_VER", "01.26");
+
+        assert_eq!(
+            parse_param_sfo_string(&title_sfo, "TITLE").as_deref(),
+            Some(title)
+        );
+        assert_eq!(
+            parse_param_sfo_string(&version_sfo, "APP_VER").as_deref(),
+            Some("01.26")
+        );
+        assert_eq!(parse_param_sfo_string(&title_sfo, "APP_VER"), None);
         assert_eq!(
             sanitize_process_file_name(" bad/name:here "),
             "bad_name_here"
@@ -1028,8 +1332,59 @@ mod tests {
     }
 
     #[test]
+    fn combines_patch_version_and_partychat_warnings() {
+        let mut config = LauncherConfig {
+            lbp3_online: true,
+            ..LauncherConfig::default()
+        };
+        let warning = derive_launch_warning(&config, Some("01.25".to_owned()), false);
+        assert!(warning.patch_version_mismatch);
+        assert!(warning.partychat_offline);
+
+        let warning = derive_launch_warning(&config, Some("01.26".to_owned()), true);
+        assert!(warning.is_empty());
+
+        config.patch_prize_bubbles = false;
+        config.disable_sprite_lights = false;
+        config.disable_tone_map = false;
+        let warning = derive_launch_warning(&config, None, true);
+        assert!(warning.is_empty());
+    }
+
+    #[test]
+    fn incompatible_version_disables_effective_patches_without_changing_saved_choices() {
+        let config = LauncherConfig {
+            patch_prize_bubbles: true,
+            disable_sprite_lights: true,
+            disable_tone_map: true,
+            ..LauncherConfig::default()
+        };
+        let effective = config.with_patches_disabled();
+        assert!(config.patch_prize_bubbles);
+        assert!(config.disable_sprite_lights);
+        assert!(config.disable_tone_map);
+        assert!(!effective.patch_prize_bubbles);
+        assert!(!effective.disable_sprite_lights);
+        assert!(!effective.disable_tone_map);
+
+        let args = build_core_args(&effective, Path::new("/game/eboot.bin"), None);
+        for flag in [
+            "--lbp3-patch-bubbles",
+            "--lbp3-disable-sprite-lights",
+            "--lbp3-disable-tone-map",
+        ] {
+            let index = args
+                .iter()
+                .position(|argument| argument == OsStr::new(flag))
+                .unwrap();
+            assert_eq!(args.get(index + 1), Some(&OsString::from("false")));
+        }
+    }
+
+    #[test]
     fn finds_game_argument_for_named_process() {
         let arguments = vec![
+            OsString::from(LAUNCHER_UI_ARGUMENT),
             OsString::from("--show-fps"),
             OsString::from("-g"),
             OsString::from("/game/eboot.bin"),
