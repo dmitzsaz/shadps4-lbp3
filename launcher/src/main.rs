@@ -10,7 +10,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Color32, RichText};
 use serde::{Deserialize, Serialize};
@@ -181,6 +181,7 @@ struct LauncherApp {
     bundled_eboot: Option<PathBuf>,
     bundled_addons: Option<PathBuf>,
     partychat: PartyChatMonitor,
+    game_launched: bool,
     error: Option<String>,
     pending_warning: Option<LaunchWarning>,
 }
@@ -222,6 +223,7 @@ impl LauncherApp {
             bundled_eboot,
             bundled_addons,
             partychat: PartyChatMonitor::new(context.egui_ctx.clone()),
+            game_launched: false,
             error: None,
             pending_warning: None,
         }
@@ -711,6 +713,9 @@ fn draw_folder_icon(ui: &mut egui::Ui) {
 
 impl eframe::App for LauncherApp {
     fn update(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
+        if self.game_launched {
+            return;
+        }
         context.request_repaint_after(Duration::from_millis(500));
         let launched = egui::CentralPanel::default()
             .frame(
@@ -740,10 +745,12 @@ impl eframe::App for LauncherApp {
 
         let launched = self.draw_warning_modal(context) || launched;
         if launched {
-            // Closing the last viewport does not quit a macOS application. The core is an
-            // independent process and the configuration was saved before it was spawned,
-            // so terminate the launcher explicitly and leave only the game in the Dock.
-            std::process::exit(0);
+            // A launchd job bootstrapped by a GUI application can be terminated with its
+            // submitter's process coalition if the submitter exits immediately. Keep this
+            // LSUIElement launcher alive without a visible window while the game runs; the
+            // launch-agent monitor terminates it after the game exits.
+            self.game_launched = true;
+            context.send_viewport_cmd(egui::ViewportCommand::Visible(false));
         }
     }
 }
@@ -861,7 +868,57 @@ fn launch_core_detached(program: &Path, arguments: &[OsString]) -> io::Result<()
     if !output.status.success() {
         return Err(launchctl_error("bootstrap the game process", &output));
     }
+    wait_for_launch_agent_running(&target, Duration::from_secs(5))?;
+    monitor_launch_agent(target);
     Ok(())
+}
+
+fn launch_agent_description(target: &str) -> io::Result<Option<String>> {
+    let output = Command::new("/bin/launchctl")
+        .arg("print")
+        .arg(target)
+        .output()?;
+    if output.status.success() {
+        return Ok(Some(String::from_utf8_lossy(&output.stdout).into_owned()));
+    }
+    if output.status.code() == Some(113) {
+        return Ok(None);
+    }
+    Err(launchctl_error("inspect the game process", &output))
+}
+
+fn wait_for_launch_agent_running(target: &str, timeout: Duration) -> io::Result<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(description) = launch_agent_description(target)?
+            && launch_agent_is_running(&description)
+        {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "the game process did not reach the running state",
+            ));
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn monitor_launch_agent(target: String) {
+    thread::spawn(move || {
+        // The initial running state was already observed synchronously. A short grace period
+        // avoids treating launchd's xpcproxy-to-executable transition as a game exit.
+        thread::sleep(Duration::from_millis(500));
+        loop {
+            match launch_agent_description(&target) {
+                Ok(Some(description)) if launch_agent_is_running(&description) => {}
+                Ok(_) => std::process::exit(0),
+                Err(_) => {}
+            }
+            thread::sleep(Duration::from_millis(500));
+        }
+    });
 }
 
 fn current_user_id() -> io::Result<String> {
