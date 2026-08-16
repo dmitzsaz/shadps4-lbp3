@@ -84,15 +84,12 @@ enum PartyChatState {
     #[default]
     Checking,
     Offline,
-    Running {
-        online_id: Option<String>,
-        emulator_attached: bool,
-    },
+    Running,
 }
 
 impl PartyChatState {
     fn is_running(&self) -> bool {
-        matches!(self, Self::Running { .. })
+        matches!(self, Self::Running)
     }
 }
 
@@ -126,10 +123,6 @@ fn derive_launch_warning(
 struct PartyChatResponse {
     status: Option<String>,
     service: Option<String>,
-    #[serde(rename = "onlineId")]
-    online_id: Option<String>,
-    #[serde(rename = "emulatorAttached", default)]
-    emulator_attached: bool,
 }
 
 struct PartyChatMonitor {
@@ -188,7 +181,6 @@ struct LauncherApp {
     bundled_addons: Option<PathBuf>,
     partychat: PartyChatMonitor,
     child: Option<Child>,
-    run_status: String,
     error: Option<String>,
     pending_warning: Option<LaunchWarning>,
 }
@@ -196,6 +188,7 @@ struct LauncherApp {
 impl LauncherApp {
     fn new(context: &eframe::CreationContext<'_>, initial_eboot: Option<PathBuf>) -> Self {
         configure_style(&context.egui_ctx);
+        egui_extras::install_image_loaders(&context.egui_ctx);
         let config_path = launcher_config_path();
         let mut config = load_config(&config_path);
         let contents_dir = bundle_contents_dir();
@@ -230,7 +223,6 @@ impl LauncherApp {
             bundled_addons,
             partychat: PartyChatMonitor::new(context.egui_ctx.clone()),
             child: None,
-            run_status: "Emulator is not running".to_owned(),
             error: None,
             pending_warning: None,
         }
@@ -260,16 +252,11 @@ impl LauncherApp {
         };
         match child.try_wait() {
             Ok(Some(status)) => {
-                self.run_status = match status.code() {
-                    Some(0) => "Emulator stopped".to_owned(),
-                    Some(code) => format!("Emulator exited with code {code}"),
-                    None => "Emulator crashed".to_owned(),
-                };
+                let _ = status;
                 self.child = None;
             }
-            Ok(None) => self.run_status = "Game is running".to_owned(),
+            Ok(None) => {}
             Err(error) => {
-                self.run_status = "Could not check the emulator process".to_owned();
                 self.error = Some(error.to_string());
                 self.child = None;
             }
@@ -380,7 +367,6 @@ impl LauncherApp {
         match command.spawn() {
             Ok(child) => {
                 self.child = Some(child);
-                self.run_status = "Launching game…".to_owned();
                 true
             }
             Err(error) => {
@@ -395,40 +381,24 @@ impl LauncherApp {
         ui.label(RichText::new("eboot.bin").size(19.0).strong());
         ui.add_space(4.0);
         let bundled_game_active = self.config.prefer_bundled_game && self.bundled_eboot.is_some();
-        ui.horizontal(|ui| {
-            let field_width = (ui.available_width() - 48.0).max(120.0);
-            if bundled_game_active {
-                let mut bundled_label = "Using bundled game".to_owned();
-                ui.add_sized(
-                    [field_width, 38.0],
-                    egui::TextEdit::singleline(&mut bundled_label).interactive(false),
-                );
-            } else {
-                changed |= ui
-                    .add_sized(
-                        [field_width, 38.0],
-                        egui::TextEdit::singleline(&mut self.config.external_eboot)
-                            .hint_text("/path/to/CUSA00063/eboot.bin"),
-                    )
-                    .changed();
-            }
-            if ui
-                .add_sized(
-                    [40.0, 38.0],
-                    egui::Button::new(RichText::new("…").size(19.0)),
-                )
-                .on_hover_text("Choose an external eboot.bin")
-                .clicked()
-                && let Some(path) = rfd::FileDialog::new()
-                    .add_filter("PlayStation executable", &["bin"])
-                    .set_file_name("eboot.bin")
-                    .pick_file()
-            {
-                self.config.external_eboot = path.to_string_lossy().into_owned();
-                self.config.prefer_bundled_game = false;
-                changed = true;
-            }
-        });
+        let (field_changed, browse_clicked) = draw_path_field(
+            ui,
+            &mut self.config.external_eboot,
+            bundled_game_active.then_some("Using bundled game"),
+            "/path/to/CUSA00063/eboot.bin",
+            "Choose an external eboot.bin",
+        );
+        changed |= field_changed;
+        if browse_clicked
+            && let Some(path) = rfd::FileDialog::new()
+                .add_filter("PlayStation executable", &["bin"])
+                .set_file_name("eboot.bin")
+                .pick_file()
+        {
+            self.config.external_eboot = path.to_string_lossy().into_owned();
+            self.config.prefer_bundled_game = false;
+            changed = true;
+        }
         if let Some(path) = &self.bundled_eboot {
             ui.horizontal(|ui| {
                 if !bundled_game_active && ui.small_button("Use bundled game").clicked() {
@@ -447,36 +417,18 @@ impl LauncherApp {
         let bundled_addons_active = self.bundled_addons.as_ref().is_some_and(|path| {
             Path::new(&self.config.addon_root) == path && !self.config.addon_root.is_empty()
         });
-        ui.horizontal(|ui| {
-            let field_width = (ui.available_width() - 48.0).max(120.0);
-            if bundled_addons_active {
-                let mut bundled_label = "Using bundled DLC".to_owned();
-                ui.add_sized(
-                    [field_width, 38.0],
-                    egui::TextEdit::singleline(&mut bundled_label).interactive(false),
-                );
-            } else {
-                changed |= ui
-                    .add_sized(
-                        [field_width, 38.0],
-                        egui::TextEdit::singleline(&mut self.config.addon_root)
-                            .hint_text("Optional add-on root"),
-                    )
-                    .changed();
-            }
-            if ui
-                .add_sized(
-                    [40.0, 38.0],
-                    egui::Button::new(RichText::new("…").size(19.0)),
-                )
-                .on_hover_text("Choose an external DLC folder")
-                .clicked()
-                && let Some(path) = rfd::FileDialog::new().pick_folder()
-            {
-                self.config.addon_root = path.to_string_lossy().into_owned();
-                changed = true;
-            }
-        });
+        let (field_changed, browse_clicked) = draw_path_field(
+            ui,
+            &mut self.config.addon_root,
+            bundled_addons_active.then_some("Using bundled DLC"),
+            "Optional add-on root",
+            "Choose an external DLC folder",
+        );
+        changed |= field_changed;
+        if browse_clicked && let Some(path) = rfd::FileDialog::new().pick_folder() {
+            self.config.addon_root = path.to_string_lossy().into_owned();
+            changed = true;
+        }
         ui.horizontal(|ui| {
             if let Some(path) = &self.bundled_addons
                 && !bundled_addons_active
@@ -515,75 +467,87 @@ impl LauncherApp {
 
     fn draw_patch_and_video_options(&mut self, ui: &mut egui::Ui) -> bool {
         let mut changed = false;
-        ui.columns(2, |columns| {
-            columns[0].label(RichText::new("Patches").size(17.0).strong());
-            columns[0].add_space(3.0);
-            let patch_summary = self.patch_summary();
-            egui::ComboBox::from_id_salt("lbp3-patches")
-                .selected_text(patch_summary)
-                .width(columns[0].available_width())
-                .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
-                .show_ui(&mut columns[0], |ui| {
-                    ui.set_min_width(315.0);
-                    changed |= ui
-                        .checkbox(
-                            &mut self.config.patch_prize_bubbles,
-                            "Prize bubbles (recommended)",
-                        )
-                        .changed();
-                    changed |= ui
-                        .checkbox(
-                            &mut self.config.disable_sprite_lights,
-                            "Disable sprite lights",
-                        )
-                        .changed();
-                    changed |= ui
-                        .checkbox(
-                            &mut self.config.disable_tone_map,
-                            "Disable sprite-light tone map",
-                        )
-                        .changed();
-                    ui.separator();
-                    ui.label(
-                        RichText::new(format!("Prepared for LBP3 {SUPPORTED_PATCH_APP_VERSION}"))
-                            .small()
-                            .weak(),
-                    );
-                });
-
-            columns[1].label(RichText::new("Resolution").size(17.0).strong());
-            columns[1].add_space(3.0);
-            egui::ComboBox::from_id_salt("resolution")
-                .selected_text(&self.config.resolution)
-                .width(columns[1].available_width())
-                .show_ui(&mut columns[1], |ui| {
-                    for resolution in RESOLUTIONS {
-                        changed |= ui
-                            .selectable_value(
-                                &mut self.config.resolution,
-                                (*resolution).to_owned(),
-                                *resolution,
-                            )
-                            .changed();
-                    }
-                });
+        let available_width = ui.available_width();
+        let option_width = (available_width * 0.305).clamp(170.0, 230.0);
+        let option_gap = (available_width * 0.03).clamp(14.0, 22.0);
+        ui.horizontal_top(|ui| {
+            ui.allocate_ui_with_layout(
+                egui::vec2(option_width, 58.0),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    ui.label(RichText::new("Patches").size(17.0).strong());
+                    ui.add_space(3.0);
+                    let patch_summary = self.patch_summary();
+                    egui::ComboBox::from_id_salt("lbp3-patches")
+                        .selected_text(patch_summary)
+                        .width(option_width)
+                        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                        .show_ui(ui, |ui| {
+                            ui.set_min_width(285.0);
+                            changed |= ui
+                                .checkbox(
+                                    &mut self.config.patch_prize_bubbles,
+                                    "Prize bubbles (recommended)",
+                                )
+                                .changed();
+                            changed |= ui
+                                .checkbox(
+                                    &mut self.config.disable_sprite_lights,
+                                    "Disable sprite lights",
+                                )
+                                .changed();
+                            changed |= ui
+                                .checkbox(
+                                    &mut self.config.disable_tone_map,
+                                    "Disable sprite-light tone map",
+                                )
+                                .changed();
+                            ui.separator();
+                            ui.label(
+                                RichText::new(format!(
+                                    "Prepared for LBP3 {SUPPORTED_PATCH_APP_VERSION}"
+                                ))
+                                .small()
+                                .weak(),
+                            );
+                        });
+                },
+            );
+            ui.add_space(option_gap);
+            ui.allocate_ui_with_layout(
+                egui::vec2(option_width, 58.0),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    ui.label(RichText::new("Resolution").size(17.0).strong());
+                    ui.add_space(3.0);
+                    egui::ComboBox::from_id_salt("resolution")
+                        .selected_text(&self.config.resolution)
+                        .width(option_width)
+                        .show_ui(ui, |ui| {
+                            for resolution in RESOLUTIONS {
+                                changed |= ui
+                                    .selectable_value(
+                                        &mut self.config.resolution,
+                                        (*resolution).to_owned(),
+                                        *resolution,
+                                    )
+                                    .changed();
+                            }
+                        });
+                },
+            );
         });
         changed
     }
 
     fn draw_online_and_display_options(&mut self, ui: &mut egui::Ui) -> bool {
         let mut changed = false;
-        ui.horizontal(|ui| {
-            changed |= ui
-                .checkbox(
-                    &mut self.config.lbp3_online,
-                    RichText::new("LBP Online").size(17.0),
-                )
-                .changed();
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                draw_partychat_status(ui, self.partychat.state());
-            });
-        });
+        changed |= ui
+            .checkbox(
+                &mut self.config.lbp3_online,
+                RichText::new("LBP Online").size(17.0),
+            )
+            .changed();
         ui.label(
             RichText::new("Enable LittleBigPlanet™ 3 online features")
                 .small()
@@ -610,19 +574,15 @@ impl LauncherApp {
         let addon_valid = self.addon_root().is_none_or(|path| path.is_dir());
         let core_valid = core_executable_path().is_file();
         let can_launch = self.child.is_none() && eboot_valid && addon_valid && core_valid;
-        ui.horizontal(|ui| {
-            ui.label(RichText::new(&self.run_status).small().weak());
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let response = ui.add_enabled(
-                    can_launch,
-                    egui::Button::new(RichText::new("Launch").size(18.0).strong())
-                        .fill(Color32::from_rgb(28, 132, 245))
-                        .corner_radius(10.0)
-                        .min_size([180.0, 46.0].into()),
-                );
-                response.clicked() && self.request_launch()
-            })
-            .inner
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let response = ui.add_enabled(
+                can_launch,
+                egui::Button::new(RichText::new("Launch").size(18.0).strong())
+                    .fill(Color32::from_rgb(28, 132, 245))
+                    .corner_radius(10.0)
+                    .min_size([180.0, 46.0].into()),
+            );
+            response.clicked() && self.request_launch()
         })
         .inner
     }
@@ -730,30 +690,68 @@ impl LauncherApp {
     }
 }
 
-fn draw_partychat_status(ui: &mut egui::Ui, state: PartyChatState) {
-    match state {
-        PartyChatState::Checking => {
-            ui.colored_label(Color32::from_rgb(235, 185, 70), "● Checking PartyChat…");
-        }
-        PartyChatState::Offline => {
-            ui.colored_label(Color32::from_rgb(230, 95, 95), "● PartyChat offline");
-        }
-        PartyChatState::Running {
-            online_id,
-            emulator_attached,
-        } => {
-            let id = online_id.map(|id| format!(" · {id}")).unwrap_or_default();
-            let attached = if emulator_attached {
-                " · connected"
-            } else {
-                ""
-            };
-            ui.colored_label(
-                Color32::from_rgb(95, 215, 135),
-                format!("● PartyChat online{id}{attached}"),
+fn draw_path_field(
+    ui: &mut egui::Ui,
+    value: &mut String,
+    read_only_label: Option<&str>,
+    hint: &str,
+    browse_tooltip: &str,
+) -> (bool, bool) {
+    let mut changed = false;
+    let mut browse_clicked = false;
+    egui::Frame::new()
+        .fill(Color32::from_rgb(76, 77, 82))
+        .corner_radius(10.0)
+        .inner_margin(egui::Margin::symmetric(12, 2))
+        .show(ui, |ui| {
+            let row_width = ui.available_width();
+            ui.allocate_ui_with_layout(
+                egui::vec2(row_width, 36.0),
+                egui::Layout::left_to_right(egui::Align::Center),
+                |ui| {
+                    draw_folder_icon(ui);
+                    let text_width = (ui.available_width() - 48.0).max(80.0);
+                    if let Some(label) = read_only_label {
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(text_width, 34.0),
+                            egui::Layout::left_to_right(egui::Align::Center),
+                            |ui| {
+                                ui.add(egui::Label::new(label).truncate());
+                            },
+                        );
+                    } else {
+                        changed |= ui
+                            .add_sized(
+                                [text_width, 34.0],
+                                egui::TextEdit::singleline(value)
+                                    .hint_text(hint)
+                                    .frame(false)
+                                    .margin(egui::Margin::ZERO)
+                                    .vertical_align(egui::Align::Center),
+                            )
+                            .changed();
+                    }
+                    browse_clicked = ui
+                        .add_sized(
+                            [32.0, 32.0],
+                            egui::Button::new(RichText::new("•••").size(13.0))
+                                .fill(Color32::from_rgb(105, 106, 111))
+                                .stroke(egui::Stroke::NONE)
+                                .corner_radius(16.0),
+                        )
+                        .on_hover_text(browse_tooltip)
+                        .clicked();
+                },
             );
-        }
-    }
+        });
+    (changed, browse_clicked)
+}
+
+fn draw_folder_icon(ui: &mut egui::Ui) {
+    ui.add(
+        egui::Image::new(egui::include_image!("../assets/foldericon.svg"))
+            .fit_to_exact_size(egui::vec2(21.0, 16.33)),
+    );
 }
 
 impl eframe::App for LauncherApp {
@@ -763,30 +761,21 @@ impl eframe::App for LauncherApp {
         let launched = egui::CentralPanel::default()
             .frame(
                 egui::Frame::new()
-                    .fill(Color32::from_rgb(22, 23, 27))
-                    .inner_margin(egui::Margin::same(24)),
+                    .fill(Color32::from_rgb(43, 43, 46))
+                    .inner_margin(egui::Margin::symmetric(26, 22)),
             )
             .show(context, |ui| {
                 let mut changed = false;
-                let card_height = ui.available_height();
-                let launched = egui::Frame::new()
-                    .fill(Color32::from_rgb(37, 38, 43))
-                    .corner_radius(18.0)
-                    .inner_margin(egui::Margin::symmetric(30, 25))
-                    .show(ui, |ui| {
-                        ui.set_min_height((card_height - 50.0).max(0.0));
-                        changed |= self.draw_game_paths(ui);
-                        ui.add_space(18.0);
-                        changed |= self.draw_patch_and_video_options(ui);
-                        ui.add_space(18.0);
-                        changed |= self.draw_online_and_display_options(ui);
-                        let footer_space = (ui.available_height() - 78.0).max(12.0);
-                        ui.add_space(footer_space);
-                        ui.separator();
-                        ui.add_space(10.0);
-                        self.draw_launch_footer(ui)
-                    })
-                    .inner;
+                changed |= self.draw_game_paths(ui);
+                ui.add_space(15.0);
+                changed |= self.draw_patch_and_video_options(ui);
+                ui.add_space(15.0);
+                changed |= self.draw_online_and_display_options(ui);
+                let footer_space = (ui.available_height() - 78.0).max(12.0);
+                ui.add_space(footer_space);
+                ui.separator();
+                ui.add_space(10.0);
+                let launched = self.draw_launch_footer(ui);
 
                 if changed && let Err(error) = save_config(&self.config_path, &self.config) {
                     self.error = Some(format!("Could not save launcher settings: {error}"));
@@ -813,18 +802,30 @@ impl Drop for LauncherApp {
 
 fn configure_style(context: &egui::Context) {
     let mut visuals = egui::Visuals::dark();
-    visuals.panel_fill = Color32::from_rgb(22, 23, 27);
-    visuals.window_fill = Color32::from_rgb(36, 38, 44);
-    visuals.extreme_bg_color = Color32::from_rgb(55, 57, 64);
-    visuals.text_edit_bg_color = Some(Color32::from_rgb(55, 57, 64));
-    visuals.faint_bg_color = Color32::from_rgb(48, 50, 56);
+    visuals.panel_fill = Color32::from_rgb(31, 31, 33);
+    visuals.window_fill = Color32::from_rgb(43, 43, 46);
+    visuals.window_stroke = egui::Stroke::NONE;
+    visuals.extreme_bg_color = Color32::from_rgb(82, 83, 88);
+    visuals.text_edit_bg_color = Some(Color32::from_rgb(82, 83, 88));
+    visuals.faint_bg_color = Color32::from_rgb(51, 51, 54);
     visuals.selection.bg_fill = Color32::from_rgb(28, 132, 245);
-    visuals.widgets.inactive.bg_fill = Color32::from_rgb(76, 78, 85);
-    visuals.widgets.hovered.bg_fill = Color32::from_rgb(88, 91, 99);
+    visuals.widgets.noninteractive.bg_stroke = egui::Stroke::NONE;
+    visuals.widgets.inactive.bg_fill = Color32::from_rgb(82, 83, 88);
+    visuals.widgets.inactive.weak_bg_fill = Color32::from_rgb(82, 83, 88);
+    visuals.widgets.inactive.bg_stroke = egui::Stroke::NONE;
+    visuals.widgets.hovered.bg_fill = Color32::from_rgb(94, 95, 100);
+    visuals.widgets.hovered.weak_bg_fill = Color32::from_rgb(94, 95, 100);
+    visuals.widgets.hovered.bg_stroke = egui::Stroke::NONE;
     visuals.widgets.active.bg_fill = Color32::from_rgb(28, 132, 245);
+    visuals.widgets.active.weak_bg_fill = Color32::from_rgb(28, 132, 245);
+    visuals.widgets.active.bg_stroke = egui::Stroke::NONE;
+    visuals.widgets.open.bg_fill = Color32::from_rgb(94, 95, 100);
+    visuals.widgets.open.weak_bg_fill = Color32::from_rgb(94, 95, 100);
+    visuals.widgets.open.bg_stroke = egui::Stroke::NONE;
     visuals.widgets.inactive.corner_radius = 9.0.into();
     visuals.widgets.hovered.corner_radius = 9.0.into();
     visuals.widgets.active.corner_radius = 9.0.into();
+    visuals.widgets.open.corner_radius = 9.0.into();
     visuals.window_corner_radius = 14.0.into();
     visuals.menu_corner_radius = 10.0.into();
     context.set_visuals(visuals);
@@ -1184,10 +1185,7 @@ fn parse_partychat_response(response: &str) -> Option<PartyChatState> {
     {
         return None;
     }
-    Some(PartyChatState::Running {
-        online_id: status.online_id,
-        emulator_attached: status.emulator_attached,
-    })
+    Some(PartyChatState::Running)
 }
 
 fn forward_to_core(arguments: &[OsString]) -> i32 {
@@ -1223,8 +1221,8 @@ fn forward_to_core(arguments: &[OsString]) -> i32 {
 fn run_gui(initial_eboot: Option<PathBuf>) -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([820.0, 650.0])
-            .with_min_inner_size([700.0, 570.0]),
+            .with_inner_size([680.0, 500.0])
+            .with_min_inner_size([620.0, 470.0]),
         ..Default::default()
     };
     eframe::run_native(
@@ -1270,10 +1268,7 @@ mod tests {
         );
         assert!(matches!(
             parse_partychat_response(response),
-            Some(PartyChatState::Running {
-                emulator_attached: true,
-                ..
-            })
+            Some(PartyChatState::Running)
         ));
         assert!(parse_partychat_response("HTTP/1.1 500 Nope\r\n\r\n{}").is_none());
     }
