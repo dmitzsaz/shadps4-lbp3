@@ -11,6 +11,12 @@ arguments. After a successful GUI launch, the launcher exits and leaves only the
 The core changes its LaunchServices display name to the title loaded from the game's `param.sfo`
 after SDL registers the application.
 
+The GUI starts the core through a per-user interactive LaunchAgent with `KeepAlive` disabled. This
+places the game in its own macOS process coalition before the launcher exits; otherwise
+LaunchServices retains the dead parent as `exited-with-subordinates` and shows a second
+`shadPS4-lbp3` background item in the Dock. The inactive agent is removed and recreated on the next
+launch, and it never restarts a game after a normal exit or crash.
+
 The built-in compatibility patches target `APP_VER 01.26`. If selected patches do not match the
 chosen game's `param.sfo`, the launcher warns before starting and passes all patch switches as
 disabled for that run without overwriting the saved choices. LBP Online performs the same

@@ -6,7 +6,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 const APP_NAME: &str = "LittleBigPlanet™ 3 Launcher";
 const CORE_EXECUTABLE: &str = "shadps4-core";
 const LAUNCHER_UI_ARGUMENT: &str = "--launcher-ui";
+const GAME_LAUNCH_AGENT_LABEL: &str = "com.dmitzsaz.shadps4-lbp3.game";
 const SUPPORTED_PATCH_APP_VERSION: &str = "01.26";
 const CORE_RUNTIME_DEPENDENCIES: &[&str] = &[
     "libvulkan.dylib",
@@ -180,7 +181,6 @@ struct LauncherApp {
     bundled_eboot: Option<PathBuf>,
     bundled_addons: Option<PathBuf>,
     partychat: PartyChatMonitor,
-    child: Option<Child>,
     error: Option<String>,
     pending_warning: Option<LaunchWarning>,
 }
@@ -222,7 +222,6 @@ impl LauncherApp {
             bundled_eboot,
             bundled_addons,
             partychat: PartyChatMonitor::new(context.egui_ctx.clone()),
-            child: None,
             error: None,
             pending_warning: None,
         }
@@ -246,27 +245,7 @@ impl LauncherApp {
         }
     }
 
-    fn poll_child(&mut self) {
-        let Some(child) = self.child.as_mut() else {
-            return;
-        };
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                let _ = status;
-                self.child = None;
-            }
-            Ok(None) => {}
-            Err(error) => {
-                self.error = Some(error.to_string());
-                self.child = None;
-            }
-        }
-    }
-
     fn launch_inputs(&self) -> Result<(PathBuf, Option<PathBuf>, PathBuf), String> {
-        if self.child.is_some() {
-            return Err("The game is already running".to_owned());
-        }
         let eboot = self
             .selected_eboot()
             .ok_or_else(|| "Choose an existing eboot.bin".to_owned())?;
@@ -341,34 +320,10 @@ impl LauncherApp {
         } else {
             self.config.clone()
         };
-        let mut command = Command::new(&named_core);
-        command.args(build_core_args(
-            &effective_config,
-            &eboot,
-            addon_root.as_deref(),
-        ));
-        if let Some(parent) = named_core.parent() {
-            command.current_dir(parent);
-        }
+        let arguments = build_core_args(&effective_config, &eboot, addon_root.as_deref());
 
-        if let Ok(log) = open_core_log() {
-            match log.try_clone() {
-                Ok(stdout) => {
-                    command.stdout(Stdio::from(stdout));
-                    command.stderr(Stdio::from(log));
-                }
-                Err(_) => {
-                    command.stdout(Stdio::null());
-                    command.stderr(Stdio::null());
-                }
-            }
-        }
-
-        match command.spawn() {
-            Ok(child) => {
-                self.child = Some(child);
-                true
-            }
+        match launch_core_detached(&named_core, &arguments) {
+            Ok(()) => true,
             Err(error) => {
                 self.error = Some(format!("Could not start the emulator: {error}"));
                 false
@@ -573,7 +528,7 @@ impl LauncherApp {
         let eboot_valid = self.selected_eboot().is_some_and(|path| is_eboot(&path));
         let addon_valid = self.addon_root().is_none_or(|path| path.is_dir());
         let core_valid = core_executable_path().is_file();
-        let can_launch = self.child.is_none() && eboot_valid && addon_valid && core_valid;
+        let can_launch = eboot_valid && addon_valid && core_valid;
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let response = ui.add_enabled(
                 can_launch,
@@ -756,7 +711,6 @@ fn draw_folder_icon(ui: &mut egui::Ui) {
 
 impl eframe::App for LauncherApp {
     fn update(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
-        self.poll_child();
         context.request_repaint_after(Duration::from_millis(500));
         let launched = egui::CentralPanel::default()
             .frame(
@@ -878,6 +832,189 @@ fn open_core_log() -> std::io::Result<File> {
         .write(true)
         .truncate(true)
         .open(path)
+}
+
+fn launch_core_detached(program: &Path, arguments: &[OsString]) -> io::Result<()> {
+    let working_directory = program.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "game executable has no parent directory",
+        )
+    })?;
+    let log_path = launcher_core_log_path();
+    drop(open_core_log()?);
+
+    let uid = current_user_id()?;
+    let domain = format!("gui/{uid}");
+    let target = format!("{domain}/{GAME_LAUNCH_AGENT_LABEL}");
+    clear_stale_launch_agent(&target)?;
+
+    let plist_path = launcher_runtime_dir().join("lbp3-game-launch-agent.plist");
+    let plist = build_launch_agent_plist(program, arguments, working_directory, &log_path);
+    write_atomic(&plist_path, plist.as_bytes())?;
+
+    let output = Command::new("/bin/launchctl")
+        .arg("bootstrap")
+        .arg(&domain)
+        .arg(&plist_path)
+        .output()?;
+    if !output.status.success() {
+        return Err(launchctl_error("bootstrap the game process", &output));
+    }
+    Ok(())
+}
+
+fn current_user_id() -> io::Result<String> {
+    let output = Command::new("/usr/bin/id").arg("-u").output()?;
+    if !output.status.success() {
+        return Err(io::Error::other("could not determine the current user ID"));
+    }
+    let uid = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    if uid.is_empty() || !uid.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(io::Error::other("current user ID is invalid"));
+    }
+    Ok(uid)
+}
+
+fn clear_stale_launch_agent(target: &str) -> io::Result<()> {
+    let output = Command::new("/bin/launchctl")
+        .arg("print")
+        .arg(target)
+        .output()?;
+    if !output.status.success() {
+        if output.status.code() == Some(113) {
+            return Ok(());
+        }
+        return Err(launchctl_error("inspect the game process", &output));
+    }
+
+    let description = String::from_utf8_lossy(&output.stdout);
+    if launch_agent_is_running(&description) {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "the game is already running",
+        ));
+    }
+
+    let output = Command::new("/bin/launchctl")
+        .arg("bootout")
+        .arg(target)
+        .output()?;
+    if !output.status.success() {
+        return Err(launchctl_error("remove the previous game process", &output));
+    }
+    Ok(())
+}
+
+fn launch_agent_is_running(description: &str) -> bool {
+    description.lines().any(|line| {
+        let line = line.trim();
+        line == "state = running" || line.starts_with("pid = ")
+    })
+}
+
+fn launchctl_error(action: &str, output: &std::process::Output) -> io::Error {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let detail = if stderr.trim().is_empty() {
+        stdout.trim()
+    } else {
+        stderr.trim()
+    };
+    if detail.is_empty() {
+        io::Error::other(format!("could not {action}"))
+    } else {
+        io::Error::other(format!("could not {action}: {detail}"))
+    }
+}
+
+fn build_launch_agent_plist(
+    program: &Path,
+    arguments: &[OsString],
+    working_directory: &Path,
+    log_path: &Path,
+) -> String {
+    let mut plist = String::from(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+"#,
+    );
+    push_plist_string(&mut plist, OsStr::new(GAME_LAUNCH_AGENT_LABEL), 4);
+    plist.push_str("    <key>ProgramArguments</key>\n    <array>\n");
+    push_plist_string(&mut plist, program.as_os_str(), 8);
+    for argument in arguments {
+        push_plist_string(&mut plist, argument, 8);
+    }
+    plist.push_str("    </array>\n    <key>WorkingDirectory</key>\n");
+    push_plist_string(&mut plist, working_directory.as_os_str(), 4);
+    plist.push_str("    <key>StandardOutPath</key>\n");
+    push_plist_string(&mut plist, log_path.as_os_str(), 4);
+    plist.push_str("    <key>StandardErrorPath</key>\n");
+    push_plist_string(&mut plist, log_path.as_os_str(), 4);
+
+    let environment = [
+        "HOME", "USER", "LOGNAME", "TMPDIR", "PATH", "LANG", "LC_ALL", "LC_CTYPE",
+    ]
+    .into_iter()
+    .filter_map(|name| std::env::var_os(name).map(|value| (name, value)))
+    .collect::<Vec<_>>();
+    if !environment.is_empty() {
+        plist.push_str("    <key>EnvironmentVariables</key>\n    <dict>\n");
+        for (name, value) in environment {
+            plist.push_str("        <key>");
+            plist.push_str(&xml_escape(name));
+            plist.push_str("</key>\n");
+            push_plist_string(&mut plist, &value, 8);
+        }
+        plist.push_str("    </dict>\n");
+    }
+
+    plist.push_str(
+        r#"    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <false/>
+    <key>ProcessType</key>
+    <string>Interactive</string>
+</dict>
+</plist>
+"#,
+    );
+    plist
+}
+
+fn push_plist_string(plist: &mut String, value: &OsStr, indentation: usize) {
+    plist.push_str(&" ".repeat(indentation));
+    plist.push_str("<string>");
+    plist.push_str(&xml_escape(&value.to_string_lossy()));
+    plist.push_str("</string>\n");
+}
+
+fn xml_escape(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '\"' => escaped.push_str("&quot;"),
+            '\'' => escaped.push_str("&apos;"),
+            _ => escaped.push(character),
+        }
+    }
+    escaped
+}
+
+fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let temporary = path.with_extension("plist.tmp");
+    fs::write(&temporary, bytes)?;
+    fs::rename(temporary, path)
 }
 
 fn bundle_contents_dir() -> Option<PathBuf> {
@@ -1282,6 +1419,32 @@ mod tests {
         assert!(args.contains(&OsString::from("--lbp3-patch-bubbles")));
         assert!(args.contains(&OsString::from("--lbp3-disable-sprite-lights")));
         assert!(args.contains(&OsString::from("--lbp3-disable-tone-map")));
+    }
+
+    #[test]
+    fn launch_agent_plist_preserves_arguments_and_escapes_paths() {
+        let plist = build_launch_agent_plist(
+            Path::new("/Games/LBP & Friends/core"),
+            &[
+                OsString::from("-g"),
+                OsString::from("/Games/<LBP>/eboot.bin"),
+            ],
+            Path::new("/Games/LBP & Friends"),
+            Path::new("/tmp/lbp3.log"),
+        );
+        assert!(plist.contains("<string>/Games/LBP &amp; Friends/core</string>"));
+        assert!(plist.contains("<string>/Games/&lt;LBP&gt;/eboot.bin</string>"));
+        assert!(plist.contains("<string>-g</string>"));
+        assert!(plist.contains("<key>KeepAlive</key>\n    <false/>"));
+        assert!(plist.contains("<string>Interactive</string>"));
+    }
+
+    #[test]
+    fn launch_agent_status_detects_only_a_live_process() {
+        assert!(launch_agent_is_running("state = running\n\tpid = 123\n"));
+        assert!(!launch_agent_is_running(
+            "state = not running\n\tjob state = exited\n"
+        ));
     }
 
     fn test_sfo(key: &str, value: &str) -> Vec<u8> {
