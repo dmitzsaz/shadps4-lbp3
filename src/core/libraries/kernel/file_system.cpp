@@ -133,6 +133,16 @@ s32 PS4_SYSV_ABI open(const char* raw_path, s32 flags, u16 mode) {
     file->m_host_name = mnt->GetHostPath(file->m_guest_name, &read_only);
     bool exists = fs::exists(file->m_host_name);
     s32 e = 0;
+    const auto open_host_file = [&](Common::FS::FileAccessMode access) {
+#ifdef _WIN32
+        // PS4 file descriptors may coexist even when one of them is writable. The Windows CRT's
+        // default sharing mode rejects LBP3's concurrent temp_orbis/profile opens with EACCES.
+        return file->f.Open(file->m_host_name, access, Common::FS::FileType::BinaryFile,
+                            Common::FS::FileShareFlag::ShareReadWrite);
+#else
+        return file->f.Open(file->m_host_name, access);
+#endif
+    };
 
     if (create) {
         if (excl && exists) {
@@ -216,7 +226,7 @@ s32 PS4_SYSV_ABI open(const char* raw_path, s32 flags, u16 mode) {
         } else if (truncate) {
             // Open the file as read-write so we can truncate regardless of flags.
             // Since open starts by closing the file, this won't interfere with later open calls.
-            e = file->f.Open(file->m_host_name, Common::FS::FileAccessMode::ReadWrite);
+            e = open_host_file(Common::FS::FileAccessMode::ReadWrite);
             if (e == 0) {
                 // If the file was opened successfully, reduce size to 0
                 file->f.SetSize(0);
@@ -225,7 +235,7 @@ s32 PS4_SYSV_ABI open(const char* raw_path, s32 flags, u16 mode) {
 
         if (read) {
             // Open exclusively for reading
-            e = file->f.Open(file->m_host_name, Common::FS::FileAccessMode::Read);
+            e = open_host_file(Common::FS::FileAccessMode::Read);
         } else if (read_only) {
             // Can't open files with write/read-write access in a read only directory
             h->DeleteHandle(handle);
@@ -235,19 +245,19 @@ s32 PS4_SYSV_ABI open(const char* raw_path, s32 flags, u16 mode) {
         } else if (write) {
             if (append) {
                 // Open exclusively for appending
-                e = file->f.Open(file->m_host_name, Common::FS::FileAccessMode::Append);
+                e = open_host_file(Common::FS::FileAccessMode::Append);
             } else {
                 // Open exclusively for writing
-                e = file->f.Open(file->m_host_name, Common::FS::FileAccessMode::Write);
+                e = open_host_file(Common::FS::FileAccessMode::Write);
             }
         } else if (rdwr) {
             // Read and write
             if (append) {
                 // Open for reading and appending
-                e = file->f.Open(file->m_host_name, Common::FS::FileAccessMode::ReadAppend);
+                e = open_host_file(Common::FS::FileAccessMode::ReadAppend);
             } else {
                 // Open for reading and writing
-                e = file->f.Open(file->m_host_name, Common::FS::FileAccessMode::ReadWrite);
+                e = open_host_file(Common::FS::FileAccessMode::ReadWrite);
             }
         }
     }
