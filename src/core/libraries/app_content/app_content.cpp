@@ -1,7 +1,10 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <array>
 #include <cmath>
+#include <string>
+#include <string_view>
 
 #include "app_content.h"
 #include "common/assert.h"
@@ -36,6 +39,246 @@ static s32 addcont_count = 0;
 static std::string title_id;
 static bool is_initialized = false;
 
+// LBP3 contains the payload for these legacy LBP1/LBP2 products in the base game. On PS4,
+// ownership migration exposes their unified entitlement labels without downloadable addcont data.
+// Keep this list scoped to the exact CUSA00063 v1.26 catalog; ordinary PS4 addcont continues to be
+// discovered from installed param.sfo files below.
+static constexpr std::array<std::string_view, 53> Lbp3LegacyEntitlements = {
+    "LBPDLC2KADCK0001", "LBPDLC2KADCO0001", "LBPDLC2KADCO0002", "LBPDLC2KADCO0003",
+    "LBPDLC2KADCO0004", "LBPDLCCOMPCO0001", "LBPDLCCOMPCO0003", "LBPDLCCOMPCO0004",
+    "LBPDLCCPSFCK0001", "LBPDLCCPSFCO0001", "LBPDLCCPSFCO0002", "LBPDLCCPSFCO0003",
+    "LBPDLCCPSFCO0004", "LBPDLCKMGSCK0001", "LBPDLCKMGSCO0002", "LBPDLCKMGSCO0003",
+    "LBPDLCKMGSCO0004", "LBPDLCKMGSCO0005", "LBPDLCKMGSLK0001", "LBPDLCORIGCK0001",
+    "LBPDLCORIGCO0001", "LBPDLCORIGCO0002", "LBPDLCORIGCO0003", "LBPDLCORIGCO0004",
+    "LBPDLCORIGCO0005", "LBPDLCORIGCO0006", "LBPDLCORIGCO0007", "LBPDLCORIGCO0008",
+    "LBPDLCORIGCO0009", "LBPDLCORIGCO0010", "LBPDLCORIGCO0011", "LBPDLCORIGCO0012",
+    "LBPDLCORIGCO0013", "LBPDLCORIGLK0001", "LBPDLCORIGLK0002", "LBPDLCRARECO0001",
+    "LBPDLCRARECO0002", "LBPDLCSONYCK0002", "LBPDLCSONYCK0003", "LBPDLCSONYCO0001",
+    "LBPDLCSONYCO0002", "LBPDLCSONYCO0003", "LBPDLCSONYCO0004", "LBPDLCSONYCO0005",
+    "LBPDLCSONYCO0006", "LBPDLCSONYCO0007", "LBPDLCSONYCO0008", "LBPDLCSONYCO0011",
+    "LBPDLCSONYCO0012", "LBPDLCSONYMP0001", "LBPDLCSONYMP0002", "LBPDLCSONYMP0003",
+    "LBPDLCSONYST0001",
+};
+
+// patch_001.farc in CUSA00063 v1.26 contains 659 unique DLCt records. Every record names a shipped
+// .edat and carries one direct ContentID. Grouping the numeric suffixes keeps the exact catalog
+// auditable without granting IDs that are only mentioned by UI/config strings elsewhere.
+struct Lbp3EntitlementGroup {
+    std::string_view prefix;
+    std::string_view suffixes;
+};
+
+static constexpr std::array<Lbp3EntitlementGroup, 128> Lbp3EmbeddedEntitlementGroups = {{
+    {"LBPDLC7ELECO", "0001"},
+    {"LBPDLCBBDWCK", "0001 0002 0003 0004"},
+    {"LBPDLCBBDWCO",
+     "0001 0002 0003 0004 0005 0006 0007 0008 0009 0010 0011 0012 0013 0014 0015 0016"},
+    {"LBPDLCBIOSCK", "0001"},
+    {"LBPDLCBIOSCO", "0001 0002 0003 0004 0005"},
+    {"LBPDLCBIOSMP", "0001"},
+    {"LBPDLCBSGACK", "0001"},
+    {"LBPDLCBSGACO", "0001 0002 0003 0004"},
+    {"LBPDLCBTTFCO", "0001 0002 0003 0004 0005 0006 0007 0008"},
+    {"LBPDLCBTTFCP", "0001 0002"},
+    {"LBPDLCBTTFLK", "0001"},
+    {"LBPDLCBTWACP", "0001"},
+    {"LBPDLCCNATCO", "0001 0002 0003 0004 0005"},
+    {"LBPDLCCNATCP", "0001"},
+    {"LBPDLCCNATLK", "0001"},
+    {"LBPDLCCNSUCK", "0001"},
+    {"LBPDLCCNSUCO", "0001 0002 0003 0004"},
+    {"LBPDLCDSALCK", "0001"},
+    {"LBPDLCDSALCO", "0001 0002 0003 0006"},
+    {"LBPDLCDSBHCK", "0001"},
+    {"LBPDLCDSBHCO", "0001 0002 0003 0004 0005"},
+    {"LBPDLCDSFRCK", "0001"},
+    {"LBPDLCDSFRCO", "0001 0002 0003 0004 0005 0006 0007"},
+    {"LBPDLCDSFWMP", "0001"},
+    {"LBPDLCDSGDCO", "0001 0002 0003 0004 0005"},
+    {"LBPDLCDSGDCP", "0001"},
+    {"LBPDLCDSINCK", "0001"},
+    {"LBPDLCDSINCO", "0001 0002 0003 0004 0005"},
+    {"LBPDLCDSINLK", "0001"},
+    {"LBPDLCDSIOCK", "0001"},
+    {"LBPDLCDSIOCO", "0001 0002 0003 0004 0005 0006"},
+    {"LBPDLCDSMFMP", "0001"},
+    {"LBPDLCDSMICO", "0001 0002 0003 0004 0005"},
+    {"LBPDLCDSMICP", "0001"},
+    {"LBPDLCDSMUCK", "0001 0002 0003"},
+    {"LBPDLCDSMUCO", "0001 0002 0003 0004 0005 0006 0008 0009 0010 0011 0012 0013 0014 0015"},
+    {"LBPDLCDSMULK", "0001"},
+    {"LBPDLCDSNBCK", "0001"},
+    {"LBPDLCDSNBCO", "0001 0002 0003 0004"},
+    {"LBPDLCDSNBLK", "0001"},
+    {"LBPDLCDSPCCK", "0001"},
+    {"LBPDLCDSPCCO", "0001 0002 0003 0004 0005 0006"},
+    {"LBPDLCDSPCLK", "0001"},
+    {"LBPDLCDSPRCK", "0001 0002"},
+    {"LBPDLCDSPRCO", "0001 0002 0003 0004 0005 0006 0007 0008"},
+    {"LBPDLCDSTRCO", "0001"},
+    {"LBPDLCDSTRMP", "0001 0003"},
+    {"LBPDLCDSTSCK", "0001 0002 0003"},
+    {"LBPDLCDSTSCO", "0001 0002 0003 0004 0005 0006 0007 0008 0009 0010 0011 0012 0013"},
+    {"LBPDLCDSTSLK", "0001"},
+    {"LBPDLCEADACK", "0001"},
+    {"LBPDLCEADACO", "0001 0002 0003 0004 0005"},
+    {"LBPDLCEADAMP", "0001"},
+    {"LBPDLCEADSCO", "0001"},
+    {"LBPDLCEAMCCO", "0001 0002 0003 0004 0005"},
+    {"LBPDLCEAMCCP", "0001"},
+    {"LBPDLCEAMECK", "0001 0002"},
+    {"LBPDLCEAMECO", "0001 0002 0003 0004 0005 0006 0007 0008 0009"},
+    {"LBPDLCEAPZCO", "0001 0002 0003 0004 0005"},
+    {"LBPDLCEAPZCP", "0001"},
+    {"LBPDLCFLV2CO", "0001"},
+    {"LBPDLCGILMSK", "0001"},
+    {"LBPDLCHGJDCO", "0001"},
+    {"LBPDLCINSOCK", "0001"},
+    {"LBPDLCINSOCO", "0001 0002"},
+    {"LBPDLCKLEICO", "0001 0002 0003 0004 0005"},
+    {"LBPDLCKLEICP", "0001"},
+    {"LBPDLCKMGSCK", "0002 0003"},
+    {"LBPDLCKMGSCO", "0006 0007 0008 0009 0010 0011 0012 0013"},
+    {"LBPDLCLBPCUPCK", "01 02 03 04 05 06 07 08"},
+    {"LBPDLCLBPCUPCO", "01 02 03 04 05 06 07 08 09 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 "
+                       "26 27 28 29 30 31 32 33 34"},
+    {"LBPDLCLBPCUPCP", "01"},
+    {"LBPDLCLEV5CK", "0001"},
+    {"LBPDLCLEV5CO", "0001 0002 0003 0004"},
+    {"LBPDLCMARVCK", "0001 0002 0003 0004 0005 0006"},
+    {"LBPDLCMARVCO", "0001 0002 0003 0004 0005 0006 0007 0008 0009 0010 0011 0012 0013 0014 0015 "
+                     "0016 0017 0018 0019 0020 0021 0022 0023 0024 0025 0026 0027 0028 0029 0030"},
+    {"LBPDLCMARVLK", "0001"},
+    {"LBPDLCMCBESK", "0001"},
+    {"LBPDLCMOVELK", "0001"},
+    {"LBPDLCNBDSCK", "0001"},
+    {"LBPDLCNBDSCO", "0001 0002 0003 0004 0005"},
+    {"LBPDLCNBLNMP", "0001"},
+    {"LBPDLCNBNCCK", "0001"},
+    {"LBPDLCNBNCCO", "0001 0002 0003 0004 0005 0006 0007"},
+    {"LBPDLCNBSCCK", "0001"},
+    {"LBPDLCNBSCCO", "0001 0002 0003 0004 0005 0006"},
+    {"LBPDLCNBTKCK", "0001"},
+    {"LBPDLCNBTKCO", "0001 0002 0003 0004 0005 0006"},
+    {"LBPDLCNDOGCK", "0001"},
+    {"LBPDLCNDOGCO", "0001 0002"},
+    {"LBPDLCNISBCK", "0001"},
+    {"LBPDLCNISBCO", "0001 0002 0003 0004 0005"},
+    {"LBPDLCNISBLK", "0001"},
+    {"LBPDLCODDWCO", "0001 0002 0003"},
+    {"LBPDLCORIGCK", "0002 0003 0004 0005 0006 0007 0008 0009 0010 0011 0012 0013 0014 0015 0016 "
+                     "0017 0018 0019 0020 0021 0023"},
+    {"LBPDLCORIGCO",
+     "0014 0015 0016 0017 0018 0019 0020 0021 0022 0023 0024 0025 0026 0027 0028 0029 0030 0031 "
+     "0032 0033 0034 0035 0036 0037 0038 0039 0040 0041 0042 0043 0044 0045 0046 0047 0048 0049 "
+     "0050 0051 0052 0053 0054 0055 0056 0057 0058 0059 0060 0061 0062 0063 0064 0065 0066 0067 "
+     "0068 0069 0070 0071 0072 0073 0074 0075 0076 0077 0078 0079 0080 0081 0082 0083 0084 0085 "
+     "0086 0087 0088 0089 0090 0091 0092 0093 0094 0095 0096 0101 0102 0103 0104 0105 0106 0107 "
+     "0108 0109 0110 0111 0112 0113 0114 0115 0116 0117 0118 0119 0120 0124 0125 0126 0127 0128 "
+     "0129 0130 0131 0132 0133 0134 0135 0136"},
+    {"LBPDLCORIGCP", "0001"},
+    {"LBPDLCORIGLK", "0003 0004 0005 0006 0007 0008 0009 0010 0011 0013 0014 0015"},
+    {"LBPDLCORIGMP", "0002 0003 0008 0010"},
+    {"LBPDLCPAWSMP", "0001"},
+    {"LBPDLCRARECO", "0003 0004 0005 0006 0007 0008 0009 0010"},
+    {"LBPDLCSEGACK", "0001"},
+    {"LBPDLCSEGACO", "0001 0002 0003 0004 0005"},
+    {"LBPDLCSNYPCK", "0001 0002"},
+    {"LBPDLCSNYPCO", "0001 0002 0003 0004 0005 0006 0007 0008"},
+    {"LBPDLCSONYCK", "0004 0005 0006 0007 0008 0009 0010 0011"},
+    {"LBPDLCSONYCO",
+     "0013 0014 0015 0016 0017 0018 0019 0020 0021 0022 0023 0024 0026 0027 0028 0029 0030 0031 "
+     "0032 0033 0034 0035 0036 0037 0038 0039 0040 0041 0042 0043 0044 0045 0046 0050 0051 0052 "
+     "0054 0055 0056 0057 0058 0059 0060 0061 0062 0063 0064 0065 0066 0067 0068 0069"},
+    {"LBPDLCSONYCP", "0001"},
+    {"LBPDLCSONYMP", "0004 0005 0006 0007 0009 0010"},
+    {"LBPDLCSONYSK", "0001 0002"},
+    {"LBPDLCSPAAMP", "0001"},
+    {"LBPDLCSQEXCK", "0001"},
+    {"LBPDLCSQEXCO", "0001 0002 0003 0004 0005"},
+    {"LBPDLCSUPUCK", "0001"},
+    {"LBPDLCTARGCO", "0001"},
+    {"LBPDLCTESTSK", "0001 0002 0003"},
+    {"LBPDLCTLOUCO", "0001 0002"},
+    {"LBPDLCTLOUMP", "0001"},
+    {"LBPDLCTMNTCK", "0001 0002"},
+    {"LBPDLCTMNTCO", "0001 0002 0003 0004 0005 0006 0007 0008 0009 0010 0011"},
+    {"LBPDLCUBACCO", "0001 0002"},
+    {"LBPDLCWARNCK", "0001"},
+    {"LBPDLCWARNCO", "0001 0002 0003 0004"},
+    {"LBPDLCWBDCCK", "0001 0002 0003 0004"},
+    {"LBPDLCWBDCCO", "0001 0002 0003 0004 0005 0006 0007 0008 0009 0010 0011 0012 0013 0014 0015 "
+                     "0016 0017 0018 0019 0020"},
+    {"LBPDLCWBDCLK", "0001 0002"},
+    {"LBPDLCYHODCO", "0001"},
+}};
+
+static constexpr std::array<std::string_view, 1> Lbp3EmbeddedLiteralEntitlements = {
+    "LBPDLCCHALLENGES",
+};
+
+static bool AddEntitlement(std::string_view entitlement_label,
+                           OrbisAppContentAddcontDownloadStatus status) {
+    for (s32 i = 0; i < addcont_count; ++i) {
+        if (entitlement_label == addcont_info[i].entitlement_label) {
+            return false;
+        }
+    }
+
+    if (addcont_count >= static_cast<s32>(addcont_info.size())) {
+        LOG_WARNING(Lib_AppContent, "Cannot add entitlement {}: info list is full",
+                    entitlement_label);
+        return false;
+    }
+    ASSERT_MSG(entitlement_label.size() < ORBIS_NP_UNIFIED_ENTITLEMENT_LABEL_SIZE,
+               "Malformed entitlement label {}", entitlement_label);
+
+    auto& info = addcont_info[addcont_count++];
+    info = {};
+    entitlement_label.copy(info.entitlement_label, entitlement_label.size());
+    info.entitlement_label[entitlement_label.size()] = '\0';
+    info.status = status;
+    return true;
+}
+
+static s32 AddLbp3EmbeddedCatalogEntitlements() {
+    constexpr auto status = OrbisAppContentAddcontDownloadStatus::NoExtraData;
+    s32 catalog_entries = 0;
+    s32 added_entries = 0;
+
+    for (const auto entitlement_label : Lbp3EmbeddedLiteralEntitlements) {
+        ++catalog_entries;
+        added_entries += AddEntitlement(entitlement_label, status);
+    }
+
+    for (const auto& group : Lbp3EmbeddedEntitlementGroups) {
+        std::size_t suffix_begin = 0;
+        while (suffix_begin < group.suffixes.size()) {
+            const std::size_t suffix_end = group.suffixes.find(' ', suffix_begin);
+            const std::string_view suffix =
+                suffix_end == std::string_view::npos
+                    ? group.suffixes.substr(suffix_begin)
+                    : group.suffixes.substr(suffix_begin, suffix_end - suffix_begin);
+
+            std::string entitlement_label{group.prefix};
+            entitlement_label.append(suffix.data(), suffix.size());
+            ASSERT_MSG(entitlement_label.size() == ORBIS_NP_UNIFIED_ENTITLEMENT_LABEL_SIZE - 1,
+                       "Malformed embedded LBP3 entitlement {}", entitlement_label);
+            ++catalog_entries;
+            added_entries += AddEntitlement(entitlement_label, status);
+
+            if (suffix_end == std::string_view::npos) {
+                break;
+            }
+            suffix_begin = suffix_end + 1;
+        }
+    }
+
+    ASSERT_MSG(catalog_entries == 659, "Expected 659 embedded LBP3 DLCt records, got {}",
+               catalog_entries);
+    return added_entries;
+}
+
 static bool HasExtraData(const std::filesystem::path& addon_path) {
     for (const auto& entry : std::filesystem::directory_iterator(addon_path)) {
         const auto filename = entry.path().filename();
@@ -69,7 +312,10 @@ int PS4_SYSV_ABI sceAppContentAddcontEnqueueDownloadSp() {
 int PS4_SYSV_ABI sceAppContentAddcontMount(u32 service_label,
                                            const OrbisNpUnifiedEntitlementLabel* entitlement_label,
                                            OrbisAppContentMountPoint* mount_point) {
-    LOG_INFO(Lib_AppContent, "called");
+    if (entitlement_label == nullptr || mount_point == nullptr) {
+        return ORBIS_APP_CONTENT_ERROR_PARAMETER;
+    }
+    LOG_INFO(Lib_AppContent, "called for {}", entitlement_label->data);
 
     const auto& addon_path = EmulatorSettings.GetAddonInstallDir() / title_id;
     auto* mnt = Common::Singleton<Core::FileSys::MntPoints>::Instance();
@@ -79,7 +325,6 @@ int PS4_SYSV_ABI sceAppContentAddcontMount(u32 service_label,
     while (i < addcont_count) {
         if (strncmp(entitlement_label->data, addcont_info[i].entitlement_label,
                     ORBIS_NP_UNIFIED_ENTITLEMENT_LABEL_SIZE - 1) == 0) {
-            snprintf(mount_point->data, ORBIS_APP_CONTENT_MOUNTPOINT_DATA_MAXSIZE, "/addcont%d", i);
             break;
         }
         ++i;
@@ -89,6 +334,15 @@ int PS4_SYSV_ABI sceAppContentAddcontMount(u32 service_label,
         // None of the loaded additional content match the entitlement label requested.
         return ORBIS_APP_CONTENT_ERROR_NOT_FOUND;
     }
+
+    // An entitlement with NoExtraData grants access to content embedded in the base game and has
+    // no filesystem payload to mount.
+    if (addcont_info[i].status == OrbisAppContentAddcontDownloadStatus::NoExtraData) {
+        LOG_INFO(Lib_AppContent, "Entitlement {} has no mountable addcont data",
+                 entitlement_label->data);
+        return ORBIS_APP_CONTENT_ERROR_NOT_FOUND;
+    }
+    snprintf(mount_point->data, ORBIS_APP_CONTENT_MOUNTPOINT_DATA_MAXSIZE, "/addcont%d", i);
 
     // Find which directory corresponds to this entitlement
     for (const auto& entry : std::filesystem::directory_iterator(addon_path)) {
@@ -239,7 +493,7 @@ int PS4_SYSV_ABI sceAppContentGetAddcontInfo(u32 service_label,
 int PS4_SYSV_ABI sceAppContentGetAddcontInfoList(u32 service_label,
                                                  OrbisAppContentAddcontInfo* list, u32 list_num,
                                                  u32* hit_num) {
-    LOG_INFO(Lib_AppContent, "called");
+    LOG_INFO(Lib_AppContent, "called: list_num={}, available={}", list_num, addcont_count);
 
     if (list_num == 0 || list == nullptr) {
         if (hit_num == nullptr) {
@@ -309,12 +563,11 @@ int PS4_SYSV_ABI sceAppContentInitialize(const OrbisAppContentInitParam* initPar
         UNREACHABLE_MSG("Failed to get TITLE_ID");
     }
     const auto addon_path = addons_dir / title_id;
-    if (!std::filesystem::exists(addon_path)) {
-        return ORBIS_OK;
-    }
-
-    for (const auto& entry : std::filesystem::directory_iterator(addon_path)) {
-        if (entry.is_directory()) {
+    if (std::filesystem::exists(addon_path)) {
+        for (const auto& entry : std::filesystem::directory_iterator(addon_path)) {
+            if (!entry.is_directory()) {
+                continue;
+            }
             // Look for a param.sfo in the additional content directory.
             const auto& param_sfo_path = entry.path() / "sce_sys/param.sfo";
             if (!std::filesystem::exists(param_sfo_path)) {
@@ -350,20 +603,31 @@ int PS4_SYSV_ABI sceAppContentInitialize(const OrbisAppContentInitParam* initPar
                     content_id.value().substr(ORBIS_APP_CONTENT_ENTITLEMENT_LABEL_OFFSET);
                 LOG_INFO(Lib_AppContent, "Entitlement {} found", entitlement_id);
 
-                // Save the additional content info in addcont_info.
-                auto& info = addcont_info[addcont_count++];
-                entitlement_id.copy(info.entitlement_label, entitlement_id.length());
                 // Entitlement-only add-ons have no downloadable payload outside sce_sys.
                 // Report NoExtraData for them; Installed describes add-ons with mounted data.
-                info.status = HasExtraData(entry.path())
-                                  ? OrbisAppContentAddcontDownloadStatus::Installed
-                                  : OrbisAppContentAddcontDownloadStatus::NoExtraData;
+                AddEntitlement(entitlement_id,
+                               HasExtraData(entry.path())
+                                   ? OrbisAppContentAddcontDownloadStatus::Installed
+                                   : OrbisAppContentAddcontDownloadStatus::NoExtraData);
             } else {
                 LOG_WARNING(Lib_AppContent, "Additonal content folder {} is not additional content",
                             entry.path().filename().string());
                 continue;
             }
         }
+    }
+
+    if (title_id == "CUSA00063") {
+        s32 legacy_count = 0;
+        for (const auto entitlement_label : Lbp3LegacyEntitlements) {
+            legacy_count += AddEntitlement(entitlement_label,
+                                           OrbisAppContentAddcontDownloadStatus::NoExtraData);
+        }
+        const s32 embedded_count = AddLbp3EmbeddedCatalogEntitlements();
+        LOG_INFO(Lib_AppContent,
+                 "Exposed {} migrated and {} of 659 direct embedded LBP DLCt entitlements ({} "
+                 "total addcont entries)",
+                 legacy_count, embedded_count, addcont_count);
     }
 
     if (addcont_count > 0) {
