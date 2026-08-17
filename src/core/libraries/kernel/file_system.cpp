@@ -1201,12 +1201,12 @@ s64 PS4_SYSV_ABI sceKernelPwritev(s32 fd, const OrbisKernelIovec* iov, s32 iovcn
 }
 
 s32 PS4_SYSV_ABI posix_unlink(const char* path) {
-    if (strlen(path) > 255) {
-        *__Error() = POSIX_ENAMETOOLONG;
-        return -1;
-    }
     if (path == nullptr) {
         *__Error() = POSIX_EINVAL;
+        return -1;
+    }
+    if (strlen(path) > 255) {
+        *__Error() = POSIX_ENAMETOOLONG;
         return -1;
     }
 
@@ -1232,11 +1232,29 @@ s32 PS4_SYSV_ABI posix_unlink(const char* path) {
 
     auto* file = h->GetFile(host_path);
     if (file == nullptr) {
-        // File to unlink hasn't been opened, manually open and unlink it.
-        Common::FS::IOFile file(host_path, Common::FS::FileAccessMode::ReadWrite);
-        file.Unlink();
+        // Opening a file through the Windows CRT does not grant DELETE access. Remove closed files
+        // by path instead, and never report success unless the host filesystem confirms removal.
+        std::error_code ec;
+        const bool removed = fs::remove(host_path, ec);
+        if (!removed) {
+            if (!ec || ec == std::errc::no_such_file_or_directory) {
+                *__Error() = POSIX_ENOENT;
+            } else if (ec == std::errc::permission_denied) {
+                *__Error() = POSIX_EACCES;
+            } else {
+                *__Error() = POSIX_EIO;
+            }
+            LOG_ERROR(Kernel_Fs, "Failed to unlink {}: {}", path,
+                      ec ? ec.message() : "file does not exist");
+            return -1;
+        }
     } else {
-        file->f.Unlink();
+        std::scoped_lock lk{file->m_mutex};
+        if (!file->f.Unlink()) {
+            *__Error() = POSIX_EIO;
+            LOG_ERROR(Kernel_Fs, "Failed to unlink open file {}", path);
+            return -1;
+        }
     }
 
     LOG_INFO(Kernel_Fs, "Unlinked {}", path);

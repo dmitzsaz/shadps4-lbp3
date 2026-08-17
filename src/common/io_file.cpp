@@ -229,9 +229,9 @@ void IOFile::Close() {
 #endif
 }
 
-void IOFile::Unlink() {
+bool IOFile::Unlink() {
     if (!IsOpen()) {
-        return;
+        return false;
     }
 
     // Mark the file for deletion
@@ -244,15 +244,23 @@ void IOFile::Unlink() {
     HANDLE hfile = reinterpret_cast<HANDLE>(_get_osfhandle(fd));
 
     disposition.DeleteFile = TRUE;
-    NtSetInformationFile(hfile, &iosb, &disposition, sizeof(disposition),
-                         FileDispositionInformation);
+    const auto status = NtSetInformationFile(hfile, &iosb, &disposition, sizeof(disposition),
+                                             FileDispositionInformation);
+    if (status != 0) {
+        LOG_ERROR(Common_Filesystem,
+                  "Failed to unlink the file at path={}, NtSetInformationFile status={:#x}",
+                  PathToUTF8String(file_path), status);
+        return false;
+    }
 #else
     if (unlink(file_path.c_str()) != 0) {
         const auto ec = std::error_code{errno, std::generic_category()};
         LOG_ERROR(Common_Filesystem, "Failed to unlink the file at path={}, ec_message={}",
                   PathToUTF8String(file_path), ec.message());
+        return false;
     }
 #endif
+    return true;
 }
 
 uintptr_t IOFile::GetFileMapping() {
