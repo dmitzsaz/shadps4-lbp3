@@ -8,12 +8,14 @@
 #include <SDL3/SDL_timer.h>
 #include <SDL3/SDL_video.h>
 #include <cmrc/cmrc.hpp>
+#include <memory>
 #include <stb_image.h>
 
 #include "common/assert.h"
 #include "common/elf_info.h"
 #include "common/io_file.h"
 #include "common/logging/formatter.h"
+#include "common/memory_patcher.h"
 #include "common/scope_exit.h"
 #include "core/debug_state.h"
 #include "core/devtools/layer.h"
@@ -99,6 +101,48 @@ static Uint32 SDLCALL PollControllerLightColour(void* userdata, SDL_TimerID time
     controller->PollLightColour();
     return interval;
 }
+
+namespace {
+
+constexpr Uint32 Lbp3DirectLevelPadEvent = SDL_EVENT_USER + 16;
+
+struct Lbp3DirectLevelPadInput {
+    OrbisPadButtonDataOffset button{};
+    bool down{};
+};
+
+Uint32 SDLCALL PushLbp3DirectLevelPadInput(void* userdata, SDL_TimerID, Uint32) {
+    const std::unique_ptr<Lbp3DirectLevelPadInput> input{
+        static_cast<Lbp3DirectLevelPadInput*>(userdata)};
+    SDL_Event event{};
+    event.type = Lbp3DirectLevelPadEvent;
+    event.user.code = static_cast<Sint32>(input->button);
+    event.user.data1 = input->down ? reinterpret_cast<void*>(uintptr_t{1}) : nullptr;
+    SDL_PushEvent(&event);
+    return 0;
+}
+
+void ScheduleLbp3DirectLevelBootstrap() {
+    if (!MemoryPatcher::g_lbp3_direct_level) {
+        return;
+    }
+
+    // The direct loader bypasses the Pod Computer and all planet UI, but LBP3 still needs one
+    // Cross press to leave its boot movie and finish creating the local profile.
+    constexpr Uint32 BootstrapDelayMs = 50'000;
+    SDL_AddTimer(BootstrapDelayMs, &PushLbp3DirectLevelPadInput,
+                 new Lbp3DirectLevelPadInput{.button = OrbisPadButtonDataOffset::Cross,
+                                             .down = true});
+    SDL_AddTimer(BootstrapDelayMs + 250, &PushLbp3DirectLevelPadInput,
+                 new Lbp3DirectLevelPadInput{.button = OrbisPadButtonDataOffset::Cross,
+                                             .down = false});
+    LOG_INFO(Debug,
+             "[LBP3_DIRECT_LEVEL] bootstrap scheduled at {} ms; level selection uses the guest "
+             "high-level launcher",
+             BootstrapDelayMs);
+}
+
+} // namespace
 
 WindowSDL::WindowSDL(s32 width_, s32 height_, Input::GameControllers* controllers_,
                      std::string_view application_name, std::string_view window_title)
@@ -194,6 +238,7 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, Input::GameControllers* controller
     Input::ControllerOutput::LinkJoystickAxes();
     Input::ParseInputConfig(std::string(Common::ElfInfo::Instance().GameSerial()));
     controllers.TryOpenSDLControllers();
+    ScheduleLbp3DirectLevelBootstrap();
 
     if (EmulatorSettings.IsBackgroundControllerInput()) {
         SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
@@ -281,6 +326,10 @@ void WindowSDL::WaitEvent() {
     case SDL_EVENT_GAMEPAD_TOUCHPAD_MOTION:
     case SDL_EVENT_GAMEPAD_SENSOR_UPDATE:
         OnGamepadEvent(&event);
+        break;
+    case Lbp3DirectLevelPadEvent:
+        controllers[0]->Button(static_cast<OrbisPadButtonDataOffset>(event.user.code),
+                               event.user.data1 != nullptr);
         break;
     case SDL_EVENT_QUIT:
         is_open = false;

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <charconv>
+#include <cstdlib>
 #include <filesystem>
 #include <iostream>
 #include <memory>
@@ -99,6 +100,7 @@ int main(int argc, char* argv[]) {
     std::optional<std::string> lbp3PatchBubblesStr;
     std::optional<std::string> lbp3DisableSpriteLightsStr;
     std::optional<std::string> lbp3DisableToneMapStr;
+    std::optional<std::string> lbp3DirectLevelStr;
     bool ignoreGamePatch = false;
     bool showFps = false;
     bool hideFps = false;
@@ -145,6 +147,9 @@ int main(int argc, char* argv[]) {
                    "Disable LBP3 sprite lights (true|false)");
     app.add_option("--lbp3-disable-tone-map", lbp3DisableToneMapStr,
                    "Disable the LBP3 sprite-light tone-map pass (true|false)");
+    app.add_option("--lbp3-direct-level", lbp3DirectLevelStr,
+                   "Directly load an LBP3 Story/DLC LevelID "
+                   "(slot_type:slot_id[:adventure_type:adventure_id])");
 
     app.add_option("--add-game-folder", addGameFolder)->check(CLI::ExistingDirectory);
     app.add_option("--set-addon-folder", setAddonFolder)->check(CLI::ExistingDirectory);
@@ -181,6 +186,24 @@ int main(int argc, char* argv[]) {
 
     // Initialize main log with default config
     Common::Log::Setup("shadps4.log");
+
+    if (!lbp3DirectLevelStr) {
+        const char* direct_level = std::getenv("SHADPS4_LBP3_DIRECT_LEVEL");
+        if (direct_level == nullptr || direct_level[0] == '\0') {
+            direct_level = std::getenv("SHADPS4_DIAGNOSTIC_LBP3_DIRECT_LEVEL");
+        }
+        if (direct_level != nullptr && direct_level[0] != '\0') {
+            lbp3DirectLevelStr = direct_level;
+        }
+    }
+    if (lbp3DirectLevelStr &&
+        !MemoryPatcher::ConfigureLbp3DirectLevel(*lbp3DirectLevelStr)) {
+        LOG_ERROR(Debug,
+                  "Invalid --lbp3-direct-level value '{}'; expected "
+                  "slot_type:slot_id[:adventure_type:adventure_id]",
+                  *lbp3DirectLevelStr);
+        return 1;
+    }
 
     Core::Lbp3Online::SetEnabled(lbp3Online);
     if (lbp3Online) {

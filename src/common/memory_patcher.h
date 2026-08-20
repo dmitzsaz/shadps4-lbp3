@@ -2,8 +2,11 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
+#include <cstdint>
 #include <cstring>
+#include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #if defined(WIN32)
@@ -21,6 +24,18 @@ extern std::string patch_file;
 extern bool g_lbp3_patch_prize_bubbles;
 extern bool g_lbp3_disable_sprite_lights;
 extern bool g_lbp3_disable_tone_map;
+
+struct Lbp3DirectLevelTarget {
+    uint32_t slot_type{};
+    uint32_t slot_id{};
+    uint32_t adventure_type{};
+    uint32_t adventure_id{};
+};
+
+extern std::optional<Lbp3DirectLevelTarget> g_lbp3_direct_level;
+
+bool ConfigureLbp3DirectLevel(std::string_view spec);
+std::string GetLbp3DirectLevelSpec();
 
 enum PatchMask : uint8_t {
     None,

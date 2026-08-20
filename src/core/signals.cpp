@@ -4,10 +4,13 @@
 #include "common/arch.h"
 #include "common/assert.h"
 #include "common/decoder.h"
+#include "common/memory_patcher.h"
 #include "common/signal_context.h"
 #include "core/libraries/kernel/threads/exception.h"
 #include "core/signals.h"
 #include "emulator.h"
+
+#include <atomic>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -28,6 +31,18 @@ extern std::array<OrbisKernelExceptionHandler, 32> Handlers;
 #endif
 
 namespace Core {
+
+#if defined(__APPLE__) && defined(ARCH_X86_64)
+namespace {
+
+std::atomic_bool lbp3_direct_level_consumed{};
+std::atomic_bool lbp3_direct_level_loader_configured{};
+std::atomic_bool lbp3_direct_level_configured{};
+std::atomic_bool lbp3_direct_level_wait_reported{};
+std::atomic_uint lbp3_direct_level_attempts{};
+
+} // namespace
+#endif
 
 #if defined(_WIN32)
 
@@ -120,6 +135,154 @@ void SignalHandler(int sig, siginfo_t* info, void* raw_context) {
         break;
     }
     case SIGILL:
+#if defined(__APPLE__) && defined(ARCH_X86_64)
+        // CUSA00063 01.26's Game::Update normally calls GetLevelManager here. The built-in
+        // direct-level patch replaces that call with UD2. Once the profile and manager are ready,
+        // invoke the same high-level launcher used by the game UI with a known registered carrier
+        // slot. A later hook replaces only the final LaunchConfig LevelID, after progression lookup.
+        if (code_address == reinterpret_cast<void*>(0x40bf01) &&
+            MemoryPatcher::g_lbp3_direct_level) {
+            const auto level = *MemoryPatcher::g_lbp3_direct_level;
+            auto& state = reinterpret_cast<ucontext_t*>(raw_context)->uc_mcontext->__ss;
+            const auto resume_manager_getter = [&state] {
+                state.__rsp -= sizeof(u64);
+                *reinterpret_cast<u64*>(state.__rsp) = 0x40bf06;
+                state.__rip = 0x93b060;
+            };
+
+            constexpr uintptr_t ManagerGlobal = 0x17abbd8;
+            constexpr uintptr_t GameGlobal = 0x16ecd80;
+            const u64 manager = *reinterpret_cast<const u64*>(ManagerGlobal);
+            const u64 game = *reinterpret_cast<const u64*>(GameGlobal);
+            const bool profile_ready =
+                game != 0 && *reinterpret_cast<const u8*>(game + 0x4f5) != 0;
+            const bool manager_idle =
+                manager != 0 && *reinterpret_cast<const u32*>(manager + 0x1380) == 0;
+            if (!profile_ready || !manager_idle) {
+                if (!lbp3_direct_level_wait_reported.exchange(true,
+                                                              std::memory_order_relaxed)) {
+                    LOG_INFO(Debug,
+                             "[LBP3_DIRECT_LEVEL] state=waiting profile_ready={} manager={:#x} "
+                             "manager_idle={}",
+                             profile_ready, manager, manager_idle);
+                }
+                resume_manager_getter();
+                return;
+            }
+
+            if (!lbp3_direct_level_consumed.exchange(true, std::memory_order_relaxed)) {
+                constexpr u32 CarrierSlotType = 2;
+                constexpr u32 CarrierSlotId = 55;
+                const u32 attempt =
+                    lbp3_direct_level_attempts.fetch_add(1, std::memory_order_relaxed) + 1;
+
+                // Keep the carrier LevelID alive on the guest stack until the launcher returns.
+                state.__rsp -= sizeof(MemoryPatcher::Lbp3DirectLevelTarget);
+                auto* carrier =
+                    reinterpret_cast<MemoryPatcher::Lbp3DirectLevelTarget*>(state.__rsp);
+                *carrier = {.slot_type = CarrierSlotType, .slot_id = CarrierSlotId};
+                state.__rsp -= sizeof(u64);
+                *reinterpret_cast<u64*>(state.__rsp) = 0x9444ba;
+                state.__rdi = manager;
+                state.__rsi = reinterpret_cast<u64>(carrier);
+                state.__rdx = 1;
+                state.__rcx = 0;
+                state.__r8 = 0;
+                state.__rip = 0x943310;
+                LOG_INFO(Debug,
+                         "[LBP3_DIRECT_LEVEL] state=launch attempt={} target={}:{} "
+                         "adventure={}:{} carrier={}:{} manager={:#x}",
+                         attempt, level.slot_type, level.slot_id, level.adventure_type,
+                         level.adventure_id, CarrierSlotType, CarrierSlotId, manager);
+                return;
+            }
+
+            resume_manager_getter();
+            return;
+        }
+
+        // Force the high-level carrier launch through mode 1 and prevent it from replacing the
+        // supplied carrier with the current Pod LevelID. Reproduce the displaced function prologue.
+        if (code_address == reinterpret_cast<void*>(0x9444c0) &&
+            MemoryPatcher::g_lbp3_direct_level) {
+            const auto level = *MemoryPatcher::g_lbp3_direct_level;
+            auto& state = reinterpret_cast<ucontext_t*>(raw_context)->uc_mcontext->__ss;
+            const auto return_address = *reinterpret_cast<const u64*>(state.__rsp);
+            if (return_address == 0x9436db &&
+                !lbp3_direct_level_loader_configured.exchange(true,
+                                                              std::memory_order_relaxed)) {
+                const auto* carrier = reinterpret_cast<const u32*>(state.__rsi);
+                const u32 carrier_type = carrier != nullptr ? carrier[0] : 0;
+                const u32 carrier_id = carrier != nullptr ? carrier[1] : 0;
+                state.__rcx = 1;
+                state.__r9 = 0;
+                LOG_INFO(Debug,
+                         "[LBP3_DIRECT_LEVEL] state=loader target={}:{} adventure={}:{} "
+                         "carrier={}:{} mode={} use_current_level={}",
+                         level.slot_type, level.slot_id, level.adventure_type,
+                         level.adventure_id, carrier_type, carrier_id, state.__rcx, state.__r9);
+            }
+
+            state.__rsp -= sizeof(u64);
+            *reinterpret_cast<u64*>(state.__rsp) = state.__rbp;
+            state.__rbp = state.__rsp;
+            state.__rip = 0x9444c4;
+            return;
+        }
+
+        // Return probe for the direct high-level launcher. Restore the GetLevelManager result and
+        // original Game::Update continuation after dropping the carrier reserved above.
+        if (code_address == reinterpret_cast<void*>(0x9444ba) &&
+            MemoryPatcher::g_lbp3_direct_level) {
+            auto& state = reinterpret_cast<ucontext_t*>(raw_context)->uc_mcontext->__ss;
+            constexpr uintptr_t ManagerGlobal = 0x17abbd8;
+            const u64 manager = *reinterpret_cast<const u64*>(ManagerGlobal);
+            const u32 manager_loading =
+                manager != 0 ? *reinterpret_cast<const u32*>(manager + 0x1380) : 0;
+            LOG_INFO(Debug, "[LBP3_DIRECT_LEVEL] state=returned result={} manager_loading={}",
+                     static_cast<u32>(state.__rax & 0xff), manager_loading);
+            state.__rsp += sizeof(MemoryPatcher::Lbp3DirectLevelTarget);
+            state.__rsp -= sizeof(u64);
+            *reinterpret_cast<u64*>(state.__rsp) = 0x40bf06;
+            state.__rip = 0x93b060;
+            return;
+        }
+
+        // LaunchConfig is created after the carrier's resource vector has been resolved. Replace
+        // its LevelID only at the proven high-level callsite, so locked Story/DLC targets never go
+        // through the progression-gated lookup. Reproduce the displaced function prologue.
+        if (code_address == reinterpret_cast<void*>(0xc7c2b0) &&
+            MemoryPatcher::g_lbp3_direct_level) {
+            const auto level = *MemoryPatcher::g_lbp3_direct_level;
+            auto& state = reinterpret_cast<ucontext_t*>(raw_context)->uc_mcontext->__ss;
+            auto* slot_id = reinterpret_cast<u32*>(state.__rdx);
+            const auto* resource = reinterpret_cast<const u32*>(state.__rsi);
+            const auto return_address = *reinterpret_cast<const u64*>(state.__rsp);
+            if (slot_id != nullptr && resource != nullptr && return_address == 0x944d65 &&
+                lbp3_direct_level_loader_configured.load(std::memory_order_relaxed) &&
+                !lbp3_direct_level_configured.exchange(true, std::memory_order_relaxed)) {
+                const u32 resolved_carrier_type = slot_id[0];
+                const u32 resolved_carrier_id = slot_id[1];
+                slot_id[0] = level.slot_type;
+                slot_id[1] = level.slot_id;
+                slot_id[2] = level.adventure_type;
+                slot_id[3] = level.adventure_id;
+                state.__rcx = 1;
+                LOG_INFO(Debug,
+                         "[LBP3_DIRECT_LEVEL] state=config target={}:{} adventure={}:{} mode={} "
+                         "resolved_carrier={}:{}",
+                         level.slot_type, level.slot_id, level.adventure_type,
+                         level.adventure_id, state.__rcx, resolved_carrier_type,
+                         resolved_carrier_id);
+            }
+
+            state.__rsp -= sizeof(u64);
+            *reinterpret_cast<u64*>(state.__rsp) = state.__rbp;
+            state.__rbp = state.__rsp;
+            state.__rip = 0xc7c2b4;
+            return;
+        }
+#endif
         if (!signals->DispatchIllegalInstruction(raw_context)) {
             if (Libraries::Kernel::Handlers[Libraries::Kernel::NativeToOrbisSignal(sig)]) {
                 Libraries::Kernel::SigactionHandler(sig, info,

@@ -628,6 +628,11 @@ void Emulator::Restart(std::filesystem::path eboot_path,
     args.push_back("--lbp3-disable-tone-map");
     args.push_back(MemoryPatcher::g_lbp3_disable_tone_map ? "true" : "false");
 
+    if (MemoryPatcher::g_lbp3_direct_level) {
+        args.push_back("--lbp3-direct-level");
+        args.push_back(MemoryPatcher::GetLbp3DirectLevelSpec());
+    }
+
     if (guest_args.size() > 0) {
         args.push_back("--");
         for (const auto& arg : guest_args) {

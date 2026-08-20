@@ -2,13 +2,18 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <array>
+#include <charconv>
 #include <codecvt>
+#include <cstdlib>
 #include <fstream>
+#include <span>
 #include <sstream>
 #include <string>
 #include <string_view>
 #include <nlohmann/json.hpp>
 #include <pugixml.hpp>
+#include "common/arch.h"
 #include "common/elf_info.h"
 #include "common/logging/log.h"
 #include "common/path_util.h"
@@ -26,8 +31,75 @@ std::string patch_file;
 bool g_lbp3_patch_prize_bubbles = true;
 bool g_lbp3_disable_sprite_lights = false;
 bool g_lbp3_disable_tone_map = false;
+std::optional<Lbp3DirectLevelTarget> g_lbp3_direct_level;
 bool patches_applied = false;
 std::vector<patchInfo> pending_patches;
+
+static bool ParseU32(std::string_view text, uint32_t& value) {
+    if (text.empty()) {
+        return false;
+    }
+    int base = 10;
+    if (text.size() > 2 && text[0] == '0' && (text[1] == 'x' || text[1] == 'X')) {
+        text.remove_prefix(2);
+        base = 16;
+        if (text.empty()) {
+            return false;
+        }
+    }
+    uint32_t parsed{};
+    const auto* begin = text.data();
+    const auto* end = begin + text.size();
+    const auto [position, error] = std::from_chars(begin, end, parsed, base);
+    if (error != std::errc{} || position != end) {
+        return false;
+    }
+    value = parsed;
+    return true;
+}
+
+bool ConfigureLbp3DirectLevel(std::string_view spec) {
+    std::array<std::string_view, 4> fields{};
+    size_t field_count{};
+    size_t begin{};
+    while (begin <= spec.size() && field_count < fields.size()) {
+        const size_t separator = spec.find(':', begin);
+        fields[field_count++] = spec.substr(begin, separator - begin);
+        if (separator == std::string_view::npos) {
+            begin = spec.size() + 1;
+            break;
+        }
+        begin = separator + 1;
+    }
+    if ((field_count != 2 && field_count != 4) || begin <= spec.size()) {
+        return false;
+    }
+
+    Lbp3DirectLevelTarget target{};
+    if (!ParseU32(fields[0], target.slot_type) || !ParseU32(fields[1], target.slot_id)) {
+        return false;
+    }
+    if (field_count == 4 &&
+        (!ParseU32(fields[2], target.adventure_type) ||
+         !ParseU32(fields[3], target.adventure_id))) {
+        return false;
+    }
+    g_lbp3_direct_level = target;
+    return true;
+}
+
+std::string GetLbp3DirectLevelSpec() {
+    if (!g_lbp3_direct_level) {
+        return {};
+    }
+    const auto& target = *g_lbp3_direct_level;
+    std::string spec = std::to_string(target.slot_type) + ":" + std::to_string(target.slot_id);
+    if (target.adventure_type != 0 || target.adventure_id != 0) {
+        spec += ":" + std::to_string(target.adventure_type) + ":" +
+                std::to_string(target.adventure_id);
+    }
+    return spec;
+}
 
 std::string toHex(u64 value, size_t byteSize) {
     std::stringstream ss;
@@ -189,10 +261,70 @@ static void ApplyBuiltInLbp3CompatibilityPatches() {
                          "LBP3 built-in disable sprite-light tone map", "c3", 0);
     }
 
+    if (g_lbp3_direct_level) {
+#if defined(__APPLE__) && defined(ARCH_X86_64)
+        static constexpr uintptr_t GuestImageBase = 0x400000;
+        static constexpr std::array<u8, 5> GameUpdateCallExpected{0xe8, 0x5a, 0xf1, 0x52,
+                                                                  0x00};
+        static constexpr std::array<u8, 5> GameUpdateCallPatch{0x0f, 0x0b, 0x90, 0x90,
+                                                               0x90};
+        static constexpr std::array<u8, 2> ReturnProbeExpected{0x90, 0x0f};
+        static constexpr std::array<u8, 2> ReturnProbePatch{0x0f, 0x0b};
+        static constexpr std::array<u8, 4> FunctionPrologueExpected{0x55, 0x48, 0x89, 0xe5};
+        static constexpr std::array<u8, 4> FunctionProloguePatch{0x0f, 0x0b, 0x90, 0x90};
+
+        struct ExactPatch {
+            uintptr_t guest_address;
+            std::span<const u8> expected;
+            std::span<const u8> replacement;
+            std::string_view name;
+        };
+        const std::array exact_patches{
+            ExactPatch{0x40bf01, GameUpdateCallExpected, GameUpdateCallPatch,
+                       "LBP3 direct-level dispatch trigger"},
+            ExactPatch{0x9444ba, ReturnProbeExpected, ReturnProbePatch,
+                       "LBP3 direct-level return probe"},
+            ExactPatch{0x9444c0, FunctionPrologueExpected, FunctionProloguePatch,
+                       "LBP3 direct-level loader hook"},
+            ExactPatch{0xc7c2b0, FunctionPrologueExpected, FunctionProloguePatch,
+                       "LBP3 direct-level config hook"},
+        };
+
+        bool patches_valid = true;
+        for (const auto& patch : exact_patches) {
+            const uintptr_t image_offset = patch.guest_address - GuestImageBase;
+            if (patch.guest_address < GuestImageBase ||
+                image_offset + patch.expected.size() > g_eboot_image_size ||
+                patch.expected.size() != patch.replacement.size() ||
+                std::memcmp(reinterpret_cast<const void*>(g_eboot_address + image_offset),
+                            patch.expected.data(), patch.expected.size()) != 0) {
+                LOG_ERROR(Loader,
+                          "Direct-level hook '{}' skipped: CUSA00063 01.26 code did not match at "
+                          "{:#x}",
+                          patch.name, patch.guest_address);
+                patches_valid = false;
+            }
+        }
+        if (patches_valid) {
+            for (const auto& patch : exact_patches) {
+                const uintptr_t image_offset = patch.guest_address - GuestImageBase;
+                std::memcpy(reinterpret_cast<void*>(g_eboot_address + image_offset),
+                            patch.replacement.data(), patch.replacement.size());
+                LOG_INFO(Loader, "Applied {} at {:#x}", patch.name, patch.guest_address);
+            }
+        }
+#else
+        LOG_WARNING(Loader,
+                    "LBP3 direct-level loading is currently supported only by the x86_64 macOS "
+                    "build");
+#endif
+    }
+
     LOG_INFO(Loader,
              "LBP3 compatibility profile: prize_bubbles={}, disable_sprite_lights={}, "
-             "disable_tone_map={}",
-             g_lbp3_patch_prize_bubbles, g_lbp3_disable_sprite_lights, g_lbp3_disable_tone_map);
+             "disable_tone_map={}, direct_level={}",
+             g_lbp3_patch_prize_bubbles, g_lbp3_disable_sprite_lights, g_lbp3_disable_tone_map,
+             GetLbp3DirectLevelSpec());
 }
 
 void ApplyPatchesFromXML(std::filesystem::path path) {
