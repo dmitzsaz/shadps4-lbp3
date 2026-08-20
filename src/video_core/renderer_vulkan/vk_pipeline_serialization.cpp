@@ -552,6 +552,7 @@ void PipelineCache::WarmUp() {
 }
 
 void PipelineCache::Sync() {
+    WaitForAsyncCompiler();
     Storage::DataBase::Instance().Close();
 }
 

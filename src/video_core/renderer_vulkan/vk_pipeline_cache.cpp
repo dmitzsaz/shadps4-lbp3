@@ -1,13 +1,21 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <condition_variable>
+#include <cstdlib>
+#include <deque>
+#include <exception>
+#include <mutex>
 #include <ranges>
+#include <thread>
 
 #include "common/guest_time_stall.h"
 #include "common/hash.h"
 #include "common/io_file.h"
 #include "common/path_util.h"
 #include "common/scope_exit.h"
+#include "common/thread.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
 #include "core/performance_telemetry.h"
@@ -39,6 +47,65 @@ constexpr static std::array DescriptorHeapSizes = {
     vk::DescriptorPoolSize{vk::DescriptorType::eStorageImage, 1024},
     vk::DescriptorPoolSize{vk::DescriptorType::eSampler, 1024},
 };
+
+struct PipelineCache::AsyncCompiler {
+    std::mutex mutex;
+    std::condition_variable_any job_cv;
+    std::condition_variable_any idle_cv;
+    std::deque<std::function<void()>> jobs;
+    std::deque<std::function<void()>> completions;
+    size_t active_jobs{};
+    Shader::Pools pools;
+    vk::UniquePipelineCache pipeline_cache;
+    std::jthread worker;
+};
+
+namespace {
+
+struct AsyncShaderCompileRequest {
+    Shader::Stage stage{};
+    Shader::LogicalStage logical_stage{};
+    Shader::RuntimeInfo runtime_info{};
+    Shader::Backend::Bindings start_binding{};
+    std::array<u32, Shader::ShaderParams::NumShaderUserData> user_data{};
+    std::vector<u32> code;
+    u64 hash{};
+    size_t permutation_index{};
+    bool is_base_program{};
+    Shader::StageSpecialization specialization{};
+    std::unique_ptr<Shader::Info> info;
+    std::vector<u32> spirv;
+    std::vector<u32> patch;
+    vk::ShaderModule module{};
+    bool is_patched{};
+    std::string error;
+};
+
+struct AsyncGraphicsPipelineRequest {
+    GraphicsPipelineKey key{};
+    u64 hash{};
+    std::array<const Shader::Info*, MaxShaderStages> live_infos{};
+    std::array<const Shader::Info*, MaxShaderStages> snapshot_info_ptrs{};
+    std::array<std::unique_ptr<Shader::Info>, MaxShaderStages> snapshot_infos{};
+    std::array<std::array<u32, Shader::ShaderParams::NumShaderUserData>, MaxShaderStages>
+        snapshot_user_data{};
+    std::array<Shader::RuntimeInfo, MaxShaderStages> runtime_infos{};
+    std::array<vk::ShaderModule, MaxShaderStages> modules{};
+    std::optional<Shader::Gcn::FetchShaderData> fetch_shader{};
+    GraphicsPipeline::SerializationSupport serialization{};
+    std::unique_ptr<GraphicsPipeline> pipeline;
+    std::string error;
+};
+
+bool UseAsyncGraphicsCompilation(const Instance& instance) {
+    const char* setting = std::getenv("SHADPS4_ASYNC_GRAPHICS_COMPILATION");
+    if (setting != nullptr) {
+        return !(setting[0] == '0' && setting[1] == '\0');
+    }
+    return instance.GetDriverID() == vk::DriverId::eMesaKosmickrisp;
+}
+
+} // Anonymous namespace
 
 static u32 MapOutputs(std::span<Shader::OutputMap, 3> outputs, const AmdGpu::VsOutputControl& ctl) {
     u32 num_outputs = 0;
@@ -357,6 +424,25 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
     // VK_NULL_HANDLE to all of them and throws away potential driver-side reuse for later state
     // variants.
     WarmUp();
+
+    if (UseAsyncGraphicsCompilation(instance) && !EmulatorSettings.IsShaderCollect()) {
+        async_compiler = std::make_unique<AsyncCompiler>();
+        auto [async_cache_result, async_cache] =
+            instance.GetDevice().createPipelineCacheUnique({});
+        ASSERT_MSG(async_cache_result == vk::Result::eSuccess,
+                   "Failed to create async pipeline cache: {}",
+                   vk::to_string(async_cache_result));
+        async_compiler->pipeline_cache = std::move(async_cache);
+        async_compiler->worker =
+            std::jthread{[this](std::stop_token stop_token) { AsyncCompilerThread(stop_token); }};
+        LOG_INFO(Render_Vulkan,
+                 "Asynchronous graphics shader/pipeline compilation enabled; "
+                 "compute compilation remains synchronous");
+    } else if (UseAsyncGraphicsCompilation(instance)) {
+        LOG_WARNING(Render_Vulkan,
+                    "Asynchronous graphics compilation disabled while shader collection is "
+                    "active");
+    }
 }
 
 PipelineCache::~PipelineCache() {
@@ -364,14 +450,191 @@ PipelineCache::~PipelineCache() {
     // process-global destruction can stop the IO worker before the last gameplay discoveries reach
     // disk, which makes the next run compile those shaders again.
     Sync();
+    StopAsyncCompiler();
+}
+
+void PipelineCache::QueueAsyncJob(std::function<void()> job) {
+    ASSERT(async_compiler);
+    {
+        std::scoped_lock lock{async_compiler->mutex};
+        async_compiler->jobs.emplace_back(std::move(job));
+    }
+    async_compiler->job_cv.notify_one();
+}
+
+void PipelineCache::QueueAsyncCompletion(std::function<void()> completion) {
+    ASSERT(async_compiler);
+    std::scoped_lock lock{async_compiler->mutex};
+    async_compiler->completions.emplace_back(std::move(completion));
+}
+
+void PipelineCache::DrainAsyncCompletions() {
+    if (!async_compiler) {
+        return;
+    }
+
+    std::deque<std::function<void()>> completions;
+    {
+        std::scoped_lock lock{async_compiler->mutex};
+        completions.swap(async_compiler->completions);
+    }
+    for (auto& completion : completions) {
+        completion();
+    }
+}
+
+void PipelineCache::WaitForAsyncCompiler() {
+    if (!async_compiler) {
+        return;
+    }
+
+    {
+        std::unique_lock lock{async_compiler->mutex};
+        async_compiler->idle_cv.wait(lock, [this] {
+            return async_compiler->jobs.empty() && async_compiler->active_jobs == 0;
+        });
+    }
+    DrainAsyncCompletions();
+}
+
+void PipelineCache::StopAsyncCompiler() {
+    if (!async_compiler) {
+        return;
+    }
+
+    async_compiler->worker.request_stop();
+    async_compiler->job_cv.notify_all();
+    if (async_compiler->worker.joinable()) {
+        async_compiler->worker.join();
+    }
+    DrainAsyncCompletions();
+    async_compiler.reset();
+}
+
+void PipelineCache::AsyncCompilerThread(std::stop_token stop_token) {
+    Common::SetCurrentThreadName("shadPS4:ShaderCompiler");
+    Common::SetCurrentThreadPriority(Common::ThreadPriority::Low);
+
+    while (!stop_token.stop_requested()) {
+        std::function<void()> job;
+        {
+            std::unique_lock lock{async_compiler->mutex};
+            if (!async_compiler->job_cv.wait(lock, stop_token,
+                                             [this] { return !async_compiler->jobs.empty(); })) {
+                break;
+            }
+            if (stop_token.stop_requested()) {
+                break;
+            }
+            job = std::move(async_compiler->jobs.front());
+            async_compiler->jobs.pop_front();
+            ++async_compiler->active_jobs;
+        }
+
+        try {
+            job();
+        } catch (const std::exception& exception) {
+            LOG_ERROR(Render_Vulkan, "Unhandled async compiler exception: {}", exception.what());
+        } catch (...) {
+            LOG_ERROR(Render_Vulkan, "Unhandled unknown async compiler exception");
+        }
+
+        {
+            std::scoped_lock lock{async_compiler->mutex};
+            --async_compiler->active_jobs;
+            if (async_compiler->jobs.empty() && async_compiler->active_jobs == 0) {
+                async_compiler->idle_cv.notify_all();
+            }
+        }
+    }
 }
 
 const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(bool expand_quad_list) {
+    DrainAsyncCompletions();
     if (!RefreshGraphicsKey(expand_quad_list)) {
         return nullptr;
     }
     const auto [it, is_new] = graphics_pipelines.try_emplace(graphics_key);
     if (is_new) {
+        if (async_compiler) {
+            auto request = std::make_shared<AsyncGraphicsPipelineRequest>();
+            request->key = graphics_key;
+            request->hash = std::hash<GraphicsPipelineKey>{}(graphics_key);
+            request->live_infos = infos;
+            request->runtime_infos = runtime_infos;
+            request->modules = modules;
+            request->fetch_shader = fetch_shader;
+
+            for (u32 stage = 0; stage < MaxShaderStages; ++stage) {
+                if (infos[stage] == nullptr) {
+                    continue;
+                }
+                request->snapshot_infos[stage] =
+                    std::make_unique<Shader::Info>(*infos[stage]);
+                auto& user_data = request->snapshot_user_data[stage];
+                const auto source_user_data = infos[stage]->user_data;
+                const size_t copy_count = std::min(user_data.size(), source_user_data.size());
+                std::ranges::copy_n(source_user_data.begin(), copy_count, user_data.begin());
+                request->snapshot_infos[stage]->user_data = user_data;
+                request->snapshot_info_ptrs[stage] = request->snapshot_infos[stage].get();
+            }
+
+            QueueAsyncJob([this, request] {
+                Core::PerfTelemetry::Increment(
+                    Core::PerfTelemetry::Counter::GraphicsPipelineCompiles);
+                Core::PerfTelemetry::ScopedTimer telemetry_timer{
+                    Core::PerfTelemetry::TimeMetric::GraphicsPipelineCompile};
+                DebugState.BeginShaderCompile(
+                    DebugStateType::ShaderCompileKind::GraphicsPipeline);
+                SCOPE_EXIT {
+                    DebugState.EndShaderCompile();
+                };
+                LOG_INFO(Render_Vulkan, "Compiling graphics pipeline {:#x} asynchronously",
+                         request->hash);
+                try {
+                    request->pipeline = std::make_unique<GraphicsPipeline>(
+                        instance, scheduler, desc_heap, profile, request->key,
+                        *async_compiler->pipeline_cache, request->snapshot_info_ptrs,
+                        request->runtime_infos, request->fetch_shader, request->modules,
+                        request->serialization, false);
+                } catch (const std::exception& exception) {
+                    request->error = exception.what();
+                } catch (...) {
+                    request->error = "unknown exception";
+                }
+
+                QueueAsyncCompletion([this, request] {
+                    const auto pipeline_it = graphics_pipelines.find(request->key);
+                    if (pipeline_it == graphics_pipelines.end() || pipeline_it->second) {
+                        return;
+                    }
+                    if (!request->pipeline) {
+                        LOG_ERROR(Render_Vulkan,
+                                  "Async graphics pipeline {:#x} failed: {}", request->hash,
+                                  request->error);
+                        graphics_pipelines.erase(pipeline_it);
+                        return;
+                    }
+
+                    request->pipeline->RebindStageInfos(request->live_infos);
+                    pipeline_it.value() = std::move(request->pipeline);
+                    RegisterPipelineData(request->key, request->hash, request->serialization);
+                    ++num_new_pipelines;
+
+                    if (EmulatorSettings.IsShaderCollect()) {
+                        for (u32 stage = 0; stage < MaxShaderStages; ++stage) {
+                            if (request->live_infos[stage]) {
+                                module_related_pipelines[request->modules[stage]].emplace_back(
+                                    request->key);
+                            }
+                        }
+                    }
+                });
+            });
+            fetch_shader.reset();
+            return nullptr;
+        }
+
         Core::PerfTelemetry::Increment(
             Core::PerfTelemetry::Counter::GraphicsPipelineCompiles);
         Core::PerfTelemetry::ScopedTimer telemetry_timer{
@@ -406,6 +669,7 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(bool expand_quad_list
 }
 
 const ComputePipeline* PipelineCache::GetComputePipeline() {
+    DrainAsyncCompletions();
     if (!RefreshComputeKey()) {
         return nullptr;
     }
@@ -536,38 +800,54 @@ bool PipelineCache::RefreshGraphicsStages() {
     auto& key = graphics_key;
     fetch_shader = std::nullopt;
 
+    enum class BindStageResult {
+        Disabled,
+        Ready,
+        Pending,
+    };
+
     Shader::Backend::Bindings binding{};
-    const auto bind_stage = [&](Shader::Stage stage_in, Shader::LogicalStage stage_out) -> bool {
+    const auto bind_stage = [&](Shader::Stage stage_in,
+                                Shader::LogicalStage stage_out) -> BindStageResult {
         const auto stage_in_idx = static_cast<u32>(stage_in);
         const auto stage_out_idx = static_cast<u32>(stage_out);
         if (!regs.stage_enable.IsStageEnabled(stage_in_idx)) {
             key.stage_hashes[stage_out_idx] = 0;
             infos[stage_out_idx] = nullptr;
-            return false;
+            return BindStageResult::Disabled;
         }
 
         const auto* pgm = regs.ProgramForStage(stage_in_idx);
         if (!pgm || !pgm->Address<u32*>()) {
             key.stage_hashes[stage_out_idx] = 0;
             infos[stage_out_idx] = nullptr;
-            return false;
+            return BindStageResult::Disabled;
         }
 
         const auto params = AmdGpu::GetParams(*pgm);
+        const auto program = GetProgram(stage_in, stage_out, params, binding);
+        if (!program) {
+            infos[stage_out_idx] = nullptr;
+            modules[stage_out_idx] = nullptr;
+            return BindStageResult::Pending;
+        }
         std::optional<Shader::Gcn::FetchShaderData> fetch_shader_;
         std::tie(infos[stage_out_idx], modules[stage_out_idx], fetch_shader_,
                  key.stage_hashes[stage_out_idx]) =
-            GetProgram(stage_in, stage_out, params, binding);
+            *program;
         if (fetch_shader_) {
             fetch_shader = fetch_shader_;
         }
-        return true;
+        return BindStageResult::Ready;
     };
 
     infos.fill(nullptr);
     modules.fill(nullptr);
     const auto result = bind_stage(Stage::Fragment, LogicalStage::Fragment);
-    if (!result && regs.vs_output_control.clip_distance_enable &&
+    if (result == BindStageResult::Pending) {
+        return false;
+    }
+    if (result == BindStageResult::Disabled && regs.vs_output_control.clip_distance_enable &&
         profile.needs_clip_distance_emulation) {
         // TODO: need to implement a discard only fallback shader
         LOG_WARNING(Render_Vulkan,
@@ -588,10 +868,10 @@ bool PipelineCache::RefreshGraphicsStages() {
             LOG_WARNING(Render_Vulkan, "Geometry shader features unsupported, skipping");
             return false;
         }
-        if (!bind_stage(Stage::Export, LogicalStage::Vertex)) {
+        if (bind_stage(Stage::Export, LogicalStage::Vertex) != BindStageResult::Ready) {
             return false;
         }
-        if (!bind_stage(Stage::Geometry, LogicalStage::Geometry)) {
+        if (bind_stage(Stage::Geometry, LogicalStage::Geometry) != BindStageResult::Ready) {
             return false;
         }
         break;
@@ -599,13 +879,15 @@ bool PipelineCache::RefreshGraphicsStages() {
         if (!instance.IsTessellationSupported()) {
             return false;
         }
-        if (!bind_stage(Stage::Hull, LogicalStage::TessellationControl)) {
+        if (bind_stage(Stage::Hull, LogicalStage::TessellationControl) !=
+            BindStageResult::Ready) {
             return false;
         }
-        if (!bind_stage(Stage::Vertex, LogicalStage::TessellationEval)) {
+        if (bind_stage(Stage::Vertex, LogicalStage::TessellationEval) !=
+            BindStageResult::Ready) {
             return false;
         }
-        if (!bind_stage(Stage::Local, LogicalStage::Vertex)) {
+        if (bind_stage(Stage::Local, LogicalStage::Vertex) != BindStageResult::Ready) {
             return false;
         }
         break;
@@ -621,22 +903,28 @@ bool PipelineCache::RefreshGraphicsStages() {
             LOG_WARNING(Render_Vulkan, "Geometry shader features unsupported, skipping");
             return false;
         }
-        if (!bind_stage(Stage::Hull, LogicalStage::TessellationControl)) {
+        if (bind_stage(Stage::Hull, LogicalStage::TessellationControl) !=
+            BindStageResult::Ready) {
             return false;
         }
-        if (!bind_stage(Stage::Export, LogicalStage::TessellationEval)) {
+        if (bind_stage(Stage::Export, LogicalStage::TessellationEval) !=
+            BindStageResult::Ready) {
             return false;
         }
-        if (!bind_stage(Stage::Local, LogicalStage::Vertex)) {
+        if (bind_stage(Stage::Local, LogicalStage::Vertex) != BindStageResult::Ready) {
             return false;
         }
-        if (!bind_stage(Stage::Geometry, LogicalStage::Geometry)) {
+        if (bind_stage(Stage::Geometry, LogicalStage::Geometry) != BindStageResult::Ready) {
             return false;
         }
         break;
-    case AmdGpu::ShaderStageEnable::VgtStages::Vs:
-        bind_stage(Stage::Vertex, LogicalStage::Vertex);
+    case AmdGpu::ShaderStageEnable::VgtStages::Vs: {
+        const auto vertex_result = bind_stage(Stage::Vertex, LogicalStage::Vertex);
+        if (vertex_result == BindStageResult::Pending) {
+            return false;
+        }
         break;
+    }
     default:
         UNREACHABLE_MSG("unhandled stage_en: {}", (u32)regs.stage_enable.raw);
     }
@@ -663,8 +951,12 @@ bool PipelineCache::RefreshComputeKey() {
     Shader::Backend::Bindings binding{};
     const auto& cs_pgm = liverpool->GetCsRegs();
     const auto cs_params = AmdGpu::GetParams(cs_pgm);
-    std::tie(infos[0], modules[0], fetch_shader, compute_key.value) =
+    const auto program =
         GetProgram(Shader::Stage::Compute, LogicalStage::Compute, cs_params, binding);
+    if (!program) {
+        return false;
+    }
+    std::tie(infos[0], modules[0], fetch_shader, compute_key.value) = *program;
     return true;
 }
 
@@ -709,9 +1001,9 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
     return module;
 }
 
-PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stage,
-                                                const Shader::ShaderParams& params,
-                                                Shader::Backend::Bindings& binding) {
+std::optional<PipelineCache::Result> PipelineCache::GetProgram(
+    Stage stage, LogicalStage l_stage, const Shader::ShaderParams& params,
+    Shader::Backend::Bindings& binding) {
     auto runtime_info = BuildRuntimeInfo(stage, l_stage);
     // LBP3's sprite-light normalize/tone-map vertex shader renders one 2D-array slice per draw.
     // This otherwise-generic fullscreen VS is reused by pipelines with other primitive topologies,
@@ -730,8 +1022,171 @@ PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stag
         graphics_key.expand_quad_list && profile.supports_shader_output_layer) {
         runtime_info.vs_info.force_host_layer_output = true;
     }
-    auto [it_pgm, new_program] = program_cache.try_emplace(params.hash);
-    if (new_program) {
+
+    const auto queue_async_shader = [&](bool is_base_program, size_t permutation_index,
+                                        const Shader::StageSpecialization* specialization) {
+        auto request = std::make_shared<AsyncShaderCompileRequest>();
+        request->stage = stage;
+        request->logical_stage = l_stage;
+        request->runtime_info = runtime_info;
+        request->start_binding = binding;
+        request->hash = params.hash;
+        request->permutation_index = permutation_index;
+        request->is_base_program = is_base_program;
+        std::ranges::copy(params.user_data, request->user_data.begin());
+        request->code.assign(params.code.begin(), params.code.end());
+        if (specialization) {
+            request->specialization = *specialization;
+        }
+
+        const Shader::ShaderParams snapshot_params{
+            .user_data = request->user_data,
+            .code = request->code,
+            .hash = request->hash,
+        };
+        request->info = std::make_unique<Shader::Info>(stage, l_stage, snapshot_params);
+
+        QueueAsyncJob([this, request] {
+            Core::PerfTelemetry::Increment(Core::PerfTelemetry::Counter::GuestShaderCompiles);
+            Core::PerfTelemetry::ScopedTimer telemetry_timer{
+                Core::PerfTelemetry::TimeMetric::GuestShaderCompile};
+            DebugState.BeginShaderCompile(DebugStateType::ShaderCompileKind::GuestShader);
+            SCOPE_EXIT {
+                DebugState.EndShaderCompile();
+            };
+
+            LOG_INFO(Render_Vulkan, "Compiling {} shader {:#x} {} asynchronously",
+                     request->stage, request->hash,
+                     request->permutation_index != 0 ? "(permutation)" : "");
+            try {
+                DumpShader(request->code, request->hash, request->stage,
+                           request->permutation_index, "bin");
+
+                auto worker_runtime_info = request->runtime_info;
+                auto worker_binding = request->start_binding;
+                const auto ir_program =
+                    Shader::TranslateProgram(request->code, async_compiler->pools,
+                                             *request->info, worker_runtime_info, profile);
+                request->spirv = Shader::Backend::SPIRV::EmitSPIRV(
+                    profile, worker_runtime_info, ir_program, worker_binding);
+                DumpShader(request->spirv, request->hash, request->stage,
+                           request->permutation_index, "spv");
+
+                auto patch = GetShaderPatch(request->hash, request->stage,
+                                            request->permutation_index, "spv");
+                if (patch) {
+                    request->patch = std::move(*patch);
+                }
+                request->is_patched = !request->patch.empty() && EmulatorSettings.IsPatchShaders();
+                if (request->is_patched) {
+                    LOG_INFO(Loader, "Loaded patch for {} shader {:#x}", request->stage,
+                             request->hash);
+                    request->module = CompileSPV(request->patch, instance.GetDevice());
+                } else {
+                    request->module = CompileSPV(request->spirv, instance.GetDevice());
+                }
+
+                if (request->is_base_program) {
+                    request->specialization = Shader::StageSpecialization(
+                        *request->info, worker_runtime_info, profile, request->start_binding);
+                }
+
+                const auto name = GetShaderName(request->stage, request->hash,
+                                                request->permutation_index);
+                Vulkan::SetObjectName(instance.GetDevice(), request->module, name);
+            } catch (const std::exception& exception) {
+                request->error = exception.what();
+            } catch (...) {
+                request->error = "unknown exception";
+            }
+
+            // The request-owned register/code snapshots go away after publication. Live values
+            // are restored by GetProgram whenever the shader is selected for a draw.
+            request->info->pgm_base = 0;
+            request->info->user_data = {};
+
+            QueueAsyncCompletion([this, request] {
+                const u64 permutation_hash =
+                    HashCombine(request->hash, request->permutation_index);
+                const auto destroy_request_module = [&] {
+                    if (request->module) {
+                        instance.GetDevice().destroyShaderModule(request->module);
+                        request->module = nullptr;
+                    }
+                };
+
+                if (request->is_base_program) {
+                    async_pending_programs.erase(request->hash);
+                    if (!request->error.empty() || !request->module) {
+                        LOG_ERROR(Render_Vulkan, "Async {} shader {:#x} failed: {}",
+                                  request->stage, request->hash, request->error);
+                        destroy_request_module();
+                        return;
+                    }
+                    if (program_cache.contains(request->hash)) {
+                        destroy_request_module();
+                        return;
+                    }
+
+                    auto program = std::make_unique<Program>();
+                    program->info = std::move(*request->info);
+                    request->specialization.info = &program->info;
+                    RegisterShaderBinary(std::move(request->spirv), request->hash,
+                                         request->permutation_index);
+                    RegisterShaderMeta(program->info, request->specialization.fetch_shader_data,
+                                       request->specialization, permutation_hash,
+                                       request->permutation_index);
+                    program->AddPermut(request->module, std::move(request->specialization));
+                    request->module = nullptr;
+                    program_cache[request->hash] = std::move(program);
+                    return;
+                }
+
+                const auto program_it = program_cache.find(request->hash);
+                if (program_it == program_cache.end() ||
+                    request->permutation_index >= program_it->second->modules.size()) {
+                    destroy_request_module();
+                    return;
+                }
+                auto& program = *program_it->second;
+                auto& module = program.modules[request->permutation_index];
+                if (module.module) {
+                    destroy_request_module();
+                    return;
+                }
+                if (!request->error.empty() || !request->module) {
+                    LOG_ERROR(Render_Vulkan,
+                              "Async {} shader {:#x} permutation {} failed: {}",
+                              request->stage, request->hash, request->permutation_index,
+                              request->error);
+                    destroy_request_module();
+                    return;
+                }
+
+                request->specialization.info = &program.info;
+                RegisterShaderBinary(std::move(request->spirv), request->hash,
+                                     request->permutation_index);
+                RegisterShaderMeta(program.info, request->specialization.fetch_shader_data,
+                                   request->specialization, permutation_hash,
+                                   request->permutation_index);
+                module = Program::Module{request->module, std::move(request->specialization)};
+                request->module = nullptr;
+            });
+        });
+    };
+
+    auto it_pgm = program_cache.find(params.hash);
+    if (it_pgm == program_cache.end()) {
+        if (async_compiler && stage != Shader::Stage::Compute) {
+            if (async_pending_programs.emplace(params.hash).second) {
+                queue_async_shader(true, 0, nullptr);
+            }
+            return std::nullopt;
+        }
+
+        auto [new_it, new_program] = program_cache.try_emplace(params.hash);
+        ASSERT(new_program);
+        it_pgm = new_it;
         it_pgm.value() = std::make_unique<Program>(stage, l_stage, params);
         auto& program = it_pgm.value();
         auto start = binding;
@@ -741,8 +1196,8 @@ PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stag
 
         RegisterShaderMeta(program->info, spec.fetch_shader_data, spec, perm_hash, 0);
         program->AddPermut(module, std::move(spec));
-        return std::make_tuple(&program->info, module, program->modules[0].spec.fetch_shader_data,
-                               perm_hash);
+        return Result{&program->info, module, program->modules[0].spec.fetch_shader_data,
+                      perm_hash};
     }
 
     auto& program = it_pgm.value();
@@ -759,19 +1214,28 @@ PipelineCache::Result PipelineCache::GetProgram(Stage stage, LogicalStage l_stag
 
     const auto it = std::ranges::find(program->modules, spec, &Program::Module::spec);
     if (it == program->modules.end()) {
+        if (async_compiler && stage != Shader::Stage::Compute) {
+            queue_async_shader(false, perm_idx, &spec);
+            program->AddPendingPermut(std::move(spec));
+            return std::nullopt;
+        }
+
         auto new_info = Shader::Info(stage, l_stage, params);
         module = CompileModule(new_info, runtime_info, params.code, perm_idx, binding);
 
         RegisterShaderMeta(info, spec.fetch_shader_data, spec, perm_hash, perm_idx);
         program->AddPermut(module, std::move(spec));
     } else {
+        if (!it->module) {
+            return std::nullopt;
+        }
         info.AddBindings(binding);
         module = it->module;
         perm_idx = std::distance(program->modules.begin(), it);
         perm_hash = HashCombine(params.hash, perm_idx);
     }
-    return std::make_tuple(&program->info, module,
-                           program->modules[perm_idx].spec.fetch_shader_data, perm_hash);
+    return Result{&program->info, module, program->modules[perm_idx].spec.fetch_shader_data,
+                  perm_hash};
 }
 
 std::optional<vk::ShaderModule> PipelineCache::ReplaceShader(vk::ShaderModule module,

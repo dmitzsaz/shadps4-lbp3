@@ -131,6 +131,9 @@ void ClearLingerAndTimeoutLocked(OrbisNpSignalingConnectionId conn_id) {
     }
     it->second.deactivate_lingering = false;
     CancelTimeoutCalloutLocked(it->second);
+    if (it->second.state == ConnState::Established && !it->second.step_callout_armed) {
+        ArmStepCalloutLocked(it->second, kKeepaliveIntervalMs * 1000);
+    }
 }
 
 long long NowMs() {
@@ -742,6 +745,7 @@ void EstablishConnection(s32 conn_id, bool peer_activated_hint) {
         ConnectionInfo& ci = it->second;
         if (peer_activated_hint) {
             ci.peer_activated = true;
+            ci.peer_deactivated = false;
         }
 
         if (!ci.established_fired) {
@@ -764,6 +768,10 @@ void EstablishConnection(s32 conn_id, bool peer_activated_hint) {
                 ci.peer_activated_fired = true;
                 fire_peer_activated = true;
             }
+        }
+
+        if (ci.state == ConnState::Established && !ci.step_callout_armed) {
+            ArmStepCalloutLocked(ci, kKeepaliveIntervalMs * 1000);
         }
 
         if (ci.locally_activated && ci.state == ConnState::Established &&
@@ -813,10 +821,13 @@ void DeactivateConnectionFaithful(s32 conn_id) {
             SendControlCloseLocked(ci, ControlReason::Deactivate);
             ci.locally_activated = false;
             ci.deactivate_lingering = true;
-            CancelStepCalloutLocked(ci);
-            ArmTimeoutCalloutLocked(ci, 60'000'000);
+            ci.mutual_fired = false;
+            CancelTimeoutCalloutLocked(ci);
+            if (!ci.step_callout_armed) {
+                ArmStepCalloutLocked(ci, kKeepaliveIntervalMs * 1000);
+            }
             LOG_DEBUG(Lib_NpSignaling,
-                      "Connection {} deactivated (established) -> 60s keepalive linger before DEAD",
+                      "Connection {} deactivated (established) -> suspended with keepalive",
                       conn_id);
         } else if (!ci.dead_fired) {
             transient_close = true;
@@ -840,11 +851,44 @@ void TerminateConnectionFaithful(s32 conn_id) {
 
 namespace {
 
+bool AdoptRemoteGenerationLocked(ConnectionInfo& ci, u32 remote_conn_id) {
+    if (remote_conn_id == 0 || ci.remote_conn_id == remote_conn_id) {
+        return false;
+    }
+
+    const u32 previous_remote_conn_id = ci.remote_conn_id;
+    ci.remote_conn_id = remote_conn_id;
+    ci.peer_established = false;
+    ci.mutual_fired = false;
+    if (previous_remote_conn_id != 0) {
+        LOG_INFO(Lib_NpSignaling,
+                 "Connection {} adopted new peer generation {} (previously {})", ci.conn_id,
+                 remote_conn_id, previous_remote_conn_id);
+        return true;
+    }
+    return false;
+}
+
+bool MarkPeerReactivatedLocked(ConnectionInfo& ci) {
+    const bool reactivated = ci.peer_deactivated;
+    ci.peer_activated = true;
+    ci.peer_deactivated = false;
+    if (reactivated) {
+        ci.peer_activated_fired = true;
+    }
+    return reactivated;
+}
+
+bool IsCurrentRemoteGeneration(const ConnectionInfo& ci, u32 remote_conn_id) {
+    return remote_conn_id == 0 || ci.remote_conn_id == 0 ||
+           ci.remote_conn_id == remote_conn_id;
+}
+
 SignalingHandshake MakeHandshakeLocked(const ConnectionInfo& ci, HandshakeKind kind) {
     SignalingHandshake pkt{};
     pkt.kind = static_cast<u8>(kind);
     pkt.from_conn_id = static_cast<u32>(ci.conn_id);
-    pkt.to_conn_id = 0;
+    pkt.to_conn_id = ci.remote_conn_id;
     const auto ctx_it = g_contexts.find(ci.ctx_id);
     if (ctx_it != g_contexts.end()) {
         std::memcpy(pkt.online_id_from, ctx_it->second.owner_online_id.data,
@@ -962,33 +1006,56 @@ void HandleHandshakePacket(u32 from_addr, u16 from_port, const SignalingHandshak
     SignalingHandshake reply{};
     bool send_reply = false;
     s32 reply_conn = 0;
+    s32 peer_reactivated_conn = 0;
+    SignalingControl established_reply{};
+    bool send_established_reply = false;
+    u32 established_reply_addr = 0;
+    u16 established_reply_port = 0;
 
     {
         SignalingMutexGuard lock;
 
         s32 conn_id = 0;
-        for (auto& [cid, ci] : g_connections) {
-            if (ci.state == ConnState::Inactive || ci.dead_fired) {
-                continue;
+        if (pkt.to_conn_id != 0) {
+            const auto targeted = g_connections.find(static_cast<s32>(pkt.to_conn_id));
+            if (targeted != g_connections.end() && targeted->second.state != ConnState::Inactive &&
+                !targeted->second.dead_fired &&
+                OnlineIdEqualsString(targeted->second.online_id, from_id)) {
+                conn_id = targeted->first;
             }
-            if (OnlineIdEqualsString(ci.online_id, from_id)) {
-                conn_id = cid;
-                break;
+        } else {
+            for (auto& [cid, ci] : g_connections) {
+                if (ci.state == ConnState::Inactive || ci.dead_fired) {
+                    continue;
+                }
+                if (OnlineIdEqualsString(ci.online_id, from_id)) {
+                    conn_id = cid;
+                    break;
+                }
             }
         }
 
-        if (conn_id != 0) {
-            g_connections[conn_id].last_peer_rx_us = NowUs();
+        if (conn_id == 0) {
+            return;
         }
+
+        ConnectionInfo& ci = g_connections[conn_id];
+        if (kind != HandshakeKind::Offer &&
+            !IsCurrentRemoteGeneration(ci, pkt.from_conn_id)) {
+            LOG_DEBUG(Lib_NpSignaling,
+                      "Handshake[{}] ignored stale peer generation {} (current {}) kind={}",
+                      conn_id, pkt.from_conn_id, ci.remote_conn_id, pkt.kind);
+            return;
+        }
+        AdoptRemoteGenerationLocked(ci, pkt.from_conn_id);
+        ci.last_peer_rx_us = NowUs();
 
         if (kind == HandshakeKind::Offer) {
-            if (conn_id == 0) {
-                return;
-            }
-            ConnectionInfo& ci = g_connections[conn_id];
             ci.addr = from_addr;
             ci.port = from_port;
-            ci.peer_activated = true;
+            if (MarkPeerReactivatedLocked(ci)) {
+                peer_reactivated_conn = conn_id;
+            }
             if (pkt.mapped_addr != 0) {
                 ci.addr = pkt.mapped_addr;
             }
@@ -998,15 +1065,22 @@ void HandleHandshakePacket(u32 from_addr, u16 from_port, const SignalingHandshak
                     ArmTimeoutCalloutLocked(ci, kHandshakeConnectTimeoutMs * 1000);
                 }
                 ArmStepCalloutLocked(ci, kHandshakeRetransmitMs * 1000);
-                reply = MakeHandshakeLocked(ci, HandshakeKind::Accept);
-                send_reply = true;
-                reply_conn = conn_id;
+            } else {
+                if (!ci.step_callout_armed) {
+                    ArmStepCalloutLocked(ci, kKeepaliveIntervalMs * 1000);
+                }
+                established_reply = MakeControlLocked(ci, ControlKind::Established);
+                send_established_reply = ci.addr != 0 && ci.port != 0;
+                established_reply_addr = ci.addr;
+                established_reply_port = ci.port;
             }
-        } else if (conn_id == 0) {
-            return;
+            reply = MakeHandshakeLocked(ci, HandshakeKind::Accept);
+            send_reply = true;
+            reply_conn = conn_id;
         } else if (kind == HandshakeKind::Accept) {
-            ConnectionInfo& ci = g_connections[conn_id];
-            ci.peer_activated = true;
+            if (MarkPeerReactivatedLocked(ci)) {
+                peer_reactivated_conn = conn_id;
+            }
             if (pkt.mapped_addr != 0) {
                 ci.addr = pkt.mapped_addr;
             } else {
@@ -1023,7 +1097,6 @@ void HandleHandshakePacket(u32 from_addr, u16 from_port, const SignalingHandshak
                 reply_conn = conn_id;
             }
         } else if (kind == HandshakeKind::Check) {
-            ConnectionInfo& ci = g_connections[conn_id];
             reply = MakeHandshakeLocked(ci, HandshakeKind::CheckAck);
             reply.nonce = pkt.nonce;
             send_reply = true;
@@ -1032,7 +1105,6 @@ void HandleHandshakePacket(u32 from_addr, u16 from_port, const SignalingHandshak
                 SetConnStateLocked(ci, ConnState::ConnCheck);
             }
         } else if (kind == HandshakeKind::CheckAck) {
-            ConnectionInfo& ci = g_connections[conn_id];
             const s64 rtt_us = NowUs() - static_cast<s64>(pkt.nonce);
             if (rtt_us >= 0) {
                 RecordRttSampleLocked(conn_id, static_cast<s32>(rtt_us));
@@ -1049,6 +1121,14 @@ void HandleHandshakePacket(u32 from_addr, u16 from_port, const SignalingHandshak
         if (it != g_connections.end()) {
             SendHandshakeLocked(it->second, reply);
         }
+    }
+    if (send_established_reply) {
+        Stubs::ControlSendTo(&established_reply, sizeof(established_reply), established_reply_addr,
+                             established_reply_port);
+    }
+
+    if (peer_reactivated_conn != 0) {
+        DispatchPeerActivatedEvent(peer_reactivated_conn);
     }
 
     if (establish_conn != 0) {
@@ -1068,8 +1148,6 @@ static void PS4_SYSV_ABI TimeoutCalloutHandler(u64 arg) {
         ConnectionInfo& ci = it->second;
         ci.timeout_callout_armed = false;
         if (ci.state != ConnState::Established) {
-            fire_dead = true;
-        } else if (ci.deactivate_lingering) {
             fire_dead = true;
         }
     }
@@ -1092,16 +1170,19 @@ static void PS4_SYSV_ABI StepCalloutHandler(u64 arg) {
         const s64 now_us = NowUs();
 
         if (ci.state == ConnState::Established) {
-            if (!ci.deactivate_lingering && ci.addr != 0 && ci.port != 0) {
-                if (ci.last_peer_rx_us != 0 &&
+            const bool transition_suspended = ci.deactivate_lingering || ci.peer_deactivated;
+            if (ci.addr != 0 && ci.port != 0) {
+                if (!transition_suspended && ci.last_peer_rx_us != 0 &&
                     now_us - ci.last_peer_rx_us >= kEstablishedLivenessTimeoutMs * 1000) {
                     liveness_dead = true;
                 } else {
                     SignalingHandshake pkt = MakeHandshakeLocked(ci, HandshakeKind::Check);
                     pkt.nonce = static_cast<u64>(now_us);
                     SendHandshakeLocked(ci, pkt);
-                    ArmStepCalloutLocked(ci, kKeepaliveIntervalMs * 1000);
                 }
+            }
+            if (!liveness_dead) {
+                ArmStepCalloutLocked(ci, kKeepaliveIntervalMs * 1000);
             }
         } else if (ci.state != ConnState::Inactive) {
             if (ci.addr != 0 && ci.port != 0) {
@@ -1183,6 +1264,7 @@ void HandleControlPacket(u32 from_addr, u16 from_port, const SignalingControl& p
     s32 establish_conn = 0;
     s32 dead_conn = 0;
     s32 peer_deactivated_conn = 0;
+    s32 peer_reactivated_conn = 0;
     SignalingControl ack{};
     bool send_ack = false;
     u32 ack_addr = 0;
@@ -1200,6 +1282,18 @@ void HandleControlPacket(u32 from_addr, u16 from_port, const SignalingControl& p
                 conn_id = cid;
                 break;
             }
+        }
+
+        if (kind != ControlKind::ActivationRequest && conn_id != 0) {
+            ConnectionInfo& ci = g_connections[conn_id];
+            if (!IsCurrentRemoteGeneration(ci, pkt.from_conn_id)) {
+                LOG_DEBUG(Lib_NpSignaling,
+                          "Control[{}] ignored stale peer generation {} (current {}) kind={}",
+                          conn_id, pkt.from_conn_id, ci.remote_conn_id, pkt.kind);
+                return;
+            }
+            AdoptRemoteGenerationLocked(ci, pkt.from_conn_id);
+            ci.last_peer_rx_us = NowUs();
         }
 
         if (kind == ControlKind::ActivationRequest) {
@@ -1236,7 +1330,14 @@ void HandleControlPacket(u32 from_addr, u16 from_port, const SignalingControl& p
                          from_id, conn_id);
             }
             ConnectionInfo& ci = g_connections[conn_id];
-            ci.peer_activated = true;
+            AdoptRemoteGenerationLocked(ci, pkt.from_conn_id);
+            ci.last_peer_rx_us = NowUs();
+            if (MarkPeerReactivatedLocked(ci)) {
+                peer_reactivated_conn = conn_id;
+                if (ci.state == ConnState::Established && ci.peer_established) {
+                    establish_conn = conn_id;
+                }
+            }
             ci.addr = pkt.mapped_addr != 0 ? pkt.mapped_addr : from_addr;
             ci.port = from_port;
             if (ci.state == ConnState::Inactive) {
@@ -1256,12 +1357,20 @@ void HandleControlPacket(u32 from_addr, u16 from_port, const SignalingControl& p
             return;
         } else if (kind == ControlKind::ActivationAck) {
             ConnectionInfo& ci = g_connections[conn_id];
-            ci.peer_activated = true;
+            if (MarkPeerReactivatedLocked(ci)) {
+                peer_reactivated_conn = conn_id;
+                if (ci.state == ConnState::Established && ci.peer_established) {
+                    establish_conn = conn_id;
+                }
+            }
             if (pkt.mapped_addr != 0) {
                 ci.addr = pkt.mapped_addr;
             }
         } else if (kind == ControlKind::Established) {
             ConnectionInfo& ci = g_connections[conn_id];
+            if (MarkPeerReactivatedLocked(ci)) {
+                peer_reactivated_conn = conn_id;
+            }
             ci.peer_established = true;
             if (ci.state == ConnState::Established) {
                 establish_conn = conn_id;
@@ -1274,7 +1383,13 @@ void HandleControlPacket(u32 from_addr, u16 from_port, const SignalingControl& p
                      conn_id, from_id, pkt.reason, from_addr, sceNetNtohs(from_port),
                      static_cast<s32>(ci.state));
             if (reason == ControlReason::Deactivate && ci.state == ConnState::Established) {
-                peer_deactivated_conn = conn_id;
+                if (!ci.peer_deactivated) {
+                    ci.peer_activated = false;
+                    ci.peer_deactivated = true;
+                    ci.peer_activated_fired = false;
+                    ci.mutual_fired = false;
+                    peer_deactivated_conn = conn_id;
+                }
             } else {
                 dead_conn = conn_id;
             }
@@ -1286,6 +1401,9 @@ void HandleControlPacket(u32 from_addr, u16 from_port, const SignalingControl& p
     }
     if (start_handshake_conn != 0) {
         StartHandshakeInitiator(start_handshake_conn);
+    }
+    if (peer_reactivated_conn != 0) {
+        DispatchPeerActivatedEvent(peer_reactivated_conn);
     }
     if (establish_conn != 0) {
         EstablishConnection(establish_conn, false);

@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <boost/container/static_vector.hpp>
 #include <xxhash.h>
 
@@ -99,6 +100,12 @@ public:
 
     const GraphicsPipelineKey& GetGraphicsKey() const {
         return key;
+    }
+
+    // Async pipeline creation uses immutable stage snapshots on the compiler thread. Once the
+    // pipeline is published on the render thread, switch back to the live per-draw metadata.
+    void RebindStageInfos(std::span<const Shader::Info*, MaxShaderStages> infos) {
+        std::ranges::copy(infos, stages.begin());
     }
 
     /// Gets the attributes and bindings for vertex inputs.

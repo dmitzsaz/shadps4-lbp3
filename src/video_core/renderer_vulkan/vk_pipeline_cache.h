@@ -3,6 +3,9 @@
 
 #pragma once
 
+#include <functional>
+#include <stop_token>
+#include <unordered_set>
 #include <variant>
 #include <tsl/robin_map.h>
 #include "shader_recompiler/profile.h"
@@ -39,8 +42,8 @@ class ShaderCache;
 
 struct Program {
     struct Module {
-        vk::ShaderModule module;
-        Shader::StageSpecialization spec;
+        vk::ShaderModule module{};
+        Shader::StageSpecialization spec{};
     };
     static constexpr size_t MaxPermutations = 8;
     using ModuleList = boost::container::small_vector<Module, MaxPermutations>;
@@ -60,6 +63,10 @@ struct Program {
                       size_t perm_idx) {
         modules.resize(std::max(modules.size(), perm_idx + 1)); // <-- beware of realloc
         modules[perm_idx] = {module, std::move(spec)};
+    }
+
+    void AddPendingPermut(Shader::StageSpecialization&& spec) {
+        modules.emplace_back(vk::ShaderModule{}, std::move(spec));
     }
 };
 
@@ -82,8 +89,9 @@ public:
 
     using Result = std::tuple<const Shader::Info*, vk::ShaderModule,
                               std::optional<Shader::Gcn::FetchShaderData>, u64>;
-    Result GetProgram(Shader::Stage stage, Shader::LogicalStage l_stage,
-                      const Shader::ShaderParams& params, Shader::Backend::Bindings& binding);
+    std::optional<Result> GetProgram(Shader::Stage stage, Shader::LogicalStage l_stage,
+                                     const Shader::ShaderParams& params,
+                                     Shader::Backend::Bindings& binding);
 
     std::optional<vk::ShaderModule> ReplaceShader(vk::ShaderModule module,
                                                   std::span<const u32> spv_code);
@@ -108,6 +116,13 @@ private:
                                    const std::span<const u32>& code, size_t perm_idx,
                                    Shader::Backend::Bindings& binding);
     const Shader::RuntimeInfo& BuildRuntimeInfo(Shader::Stage stage, Shader::LogicalStage l_stage);
+
+    void QueueAsyncJob(std::function<void()> job);
+    void QueueAsyncCompletion(std::function<void()> completion);
+    void DrainAsyncCompletions();
+    void WaitForAsyncCompiler();
+    void StopAsyncCompiler();
+    void AsyncCompilerThread(std::stop_token stop_token);
 
     [[nodiscard]] bool IsPipelineCacheDirty() const {
         return num_new_pipelines > 0;
@@ -137,6 +152,10 @@ private:
     tsl::robin_map<vk::ShaderModule,
                    std::vector<std::variant<GraphicsPipelineKey, ComputePipelineKey>>>
         module_related_pipelines;
+
+    struct AsyncCompiler;
+    std::unique_ptr<AsyncCompiler> async_compiler;
+    std::unordered_set<u64> async_pending_programs;
 };
 
 } // namespace Vulkan

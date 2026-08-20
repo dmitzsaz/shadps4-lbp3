@@ -136,6 +136,7 @@ enum class ConnState : s32 {
 struct ConnectionInfo {
     OrbisNpSignalingConnectionId conn_id = 0;
     OrbisNpSignalingContextId ctx_id = 0;
+    u32 remote_conn_id = 0;
 
     u32 addr = 0;
     u16 port = 0;
@@ -162,6 +163,7 @@ struct ConnectionInfo {
     bool established_fired = false;
     bool established_event_fired = false;
     bool peer_activated = false;
+    bool peer_deactivated = false;
     bool locally_activated = false;
     bool peer_activated_fired = false;
     bool peer_established = false;

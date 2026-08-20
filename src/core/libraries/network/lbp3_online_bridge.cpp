@@ -50,6 +50,7 @@ constexpr u16 DefaultGamePort = 3658;
 constexpr u16 DefaultHelperPort = 46973;
 constexpr auto HelloInterval = std::chrono::seconds(2);
 constexpr auto HelloAckTimeout = std::chrono::seconds(6);
+constexpr auto ServiceInterval = std::chrono::milliseconds(25);
 
 // Guest virtual addresses for CUSA00063 01.26; they exclude the SELF file bias (0x4000).
 constexpr uintptr_t MatchingDispatcherOffset = 0x338cc0;
@@ -82,6 +83,7 @@ struct Frame {
 struct BridgeState {
     std::mutex mutex;
     std::mutex find_best_room_mutex;
+    std::jthread service_thread;
     net_socket socket{InvalidSocket};
     sockaddr_in helper{};
     bool endpoint_configured{};
@@ -100,6 +102,10 @@ struct BridgeState {
     std::string helper_roster_local_online_id;
 
     ~BridgeState() {
+        if (service_thread.joinable()) {
+            service_thread.request_stop();
+            service_thread.join();
+        }
 #ifdef _WIN32
         if (socket != InvalidSocket) {
             closesocket(socket);
@@ -111,6 +117,8 @@ struct BridgeState {
 #endif
     }
 };
+
+void ServiceLoop(BridgeState& state, std::stop_token stop_token);
 
 BridgeState& State() {
     static BridgeState state;
@@ -278,6 +286,11 @@ bool OpenSocketLocked(BridgeState& state) {
         return false;
     }
 #endif
+    if (!state.service_thread.joinable()) {
+        state.service_thread = std::jthread(
+            [&state](std::stop_token stop_token) { ServiceLoop(state, stop_token); });
+        LOG_INFO(Lib_Net, "Started independent LBP3 helper bridge service");
+    }
     return true;
 }
 
@@ -421,6 +434,18 @@ bool SendHelloLocked(BridgeState& state) {
     }
     state.last_hello = now;
     return true;
+}
+
+void ServiceLoop(BridgeState& state, std::stop_token stop_token) {
+    while (!stop_token.stop_requested()) {
+        {
+            std::scoped_lock lock{state.mutex};
+            PumpLocked(state);
+            ExpireStaleConnectionLocked(state);
+            SendHelloLocked(state);
+        }
+        std::this_thread::sleep_for(ServiceInterval);
+    }
 }
 
 bool MatchesLocalEndpoint(const Frame& frame, const Endpoint* local) {
