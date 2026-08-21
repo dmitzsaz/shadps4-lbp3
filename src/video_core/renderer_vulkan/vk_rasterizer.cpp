@@ -233,7 +233,7 @@ void Rasterizer::EliminateFastClear() {
     ScopeMarkerEnd();
 }
 
-void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
+bool Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     RENDERER_TRACE;
     Core::PerfTelemetry::Increment(Core::PerfTelemetry::Counter::DrawCalls);
     Core::PerfTelemetry::ScopedTimer telemetry_timer{Core::PerfTelemetry::TimeMetric::DrawCpu};
@@ -241,7 +241,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     scheduler.PopPendingOperations();
 
     if (!FilterDraw()) {
-        return;
+        return true;
     }
 
     const auto& regs = liverpool->regs;
@@ -255,12 +255,16 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
         expand_quad_list ? static_cast<u32>(expanded_quad_index_count) : 0;
     const GraphicsPipeline* pipeline = pipeline_cache.GetGraphicsPipeline(expand_quad_list);
     if (!pipeline) {
-        return;
+        const bool pending = pipeline_cache.IsGraphicsCompilationPending();
+        if (pending) {
+            pipeline_cache.WaitForAsyncGraphicsProgress();
+        }
+        return !pending;
     }
 
     PrepareRenderState(pipeline);
     if (!BindResources(pipeline)) {
-        return;
+        return true;
     }
     const auto state = BeginRendering(pipeline);
 
@@ -296,9 +300,10 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     Core::PerfTelemetry::Increment(Core::PerfTelemetry::Counter::DrawsEmitted);
 
     ResetBindings();
+    return true;
 }
 
-void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u32 stride,
+bool Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u32 stride,
                               u32 max_count, VAddr count_address) {
     RENDERER_TRACE;
     Core::PerfTelemetry::Increment(Core::PerfTelemetry::Counter::DrawCalls);
@@ -308,17 +313,21 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     scheduler.PopPendingOperations();
 
     if (!FilterDraw()) {
-        return;
+        return true;
     }
 
     const GraphicsPipeline* pipeline = pipeline_cache.GetGraphicsPipeline();
     if (!pipeline) {
-        return;
+        const bool pending = pipeline_cache.IsGraphicsCompilationPending();
+        if (pending) {
+            pipeline_cache.WaitForAsyncGraphicsProgress();
+        }
+        return !pending;
     }
 
     PrepareRenderState(pipeline);
     if (!BindResources(pipeline)) {
-        return;
+        return true;
     }
     const auto state = BeginRendering(pipeline);
 
@@ -379,6 +388,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     Core::PerfTelemetry::Increment(Core::PerfTelemetry::Counter::DrawsEmitted, max_count);
 
     ResetBindings();
+    return true;
 }
 
 void Rasterizer::DispatchDirect(bool async_compute) {

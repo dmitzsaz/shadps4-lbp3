@@ -85,6 +85,16 @@ public:
 
     const GraphicsPipeline* GetGraphicsPipeline(bool expand_quad_list = false);
 
+    /// True when the last graphics lookup was deferred to the async compiler. The guest draw
+    /// must be retried instead of consumed in that case.
+    [[nodiscard]] bool IsGraphicsCompilationPending() const noexcept {
+        return graphics_compilation_pending;
+    }
+
+    /// Briefly yields the GPU command processor until the compiler publishes progress. This
+    /// prevents a deferred draw from busy-spinning while other GPU queues still get scheduled.
+    void WaitForAsyncGraphicsProgress();
+
     const ComputePipeline* GetComputePipeline();
 
     using Result = std::tuple<const Shader::Info*, vk::ShaderModule,
@@ -156,6 +166,7 @@ private:
     struct AsyncCompiler;
     std::unique_ptr<AsyncCompiler> async_compiler;
     std::unordered_set<u64> async_pending_programs;
+    bool graphics_compilation_pending{};
 };
 
 } // namespace Vulkan

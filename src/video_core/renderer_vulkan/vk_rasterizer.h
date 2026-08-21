@@ -43,9 +43,10 @@ public:
         return texture_cache;
     }
 
-    void Draw(bool is_indexed, u32 index_offset = 0);
-    void DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u32 size, u32 max_count,
-                      VAddr count_address);
+    /// False means async compilation is pending and the same guest draw must be retried.
+    [[nodiscard]] bool Draw(bool is_indexed, u32 index_offset = 0);
+    [[nodiscard]] bool DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u32 size,
+                                    u32 max_count, VAddr count_address);
 
     void DispatchDirect(bool async_compute);
     void DispatchIndirect(VAddr address, u32 offset, u32 size);

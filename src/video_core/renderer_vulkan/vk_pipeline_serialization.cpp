@@ -624,7 +624,11 @@ void StageSpecialization::Serialize(Serialization::Archive& ar) const {
     Serialization::Writer spec{ar};
 
     spec.Write(start);
-    spec.Write(runtime_info);
+    auto persistent_runtime_info = runtime_info;
+    if (persistent_runtime_info.stage == Stage::Geometry) {
+        persistent_runtime_info.gs_info.vs_copy = {};
+    }
+    spec.Write(persistent_runtime_info);
 
     spec.Write(bitset.to_string());
 
@@ -647,6 +651,9 @@ bool StageSpecialization::Deserialize(Serialization::Archive& ar) {
 
     spec.Read(start);
     spec.Read(runtime_info);
+    if (runtime_info.stage == Stage::Geometry) {
+        runtime_info.gs_info.vs_copy = {};
+    }
 
     std::string bits{};
     spec.Read(bits);

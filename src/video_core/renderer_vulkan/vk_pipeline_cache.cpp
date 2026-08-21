@@ -22,6 +22,7 @@
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "shader_recompiler/frontend/copy_shader.h"
 #include "shader_recompiler/info.h"
+#include "shader_recompiler/ir/passes/srt.h"
 #include "shader_recompiler/recompiler.h"
 #include "shader_recompiler/runtime_info.h"
 #include "video_core/amdgpu/liverpool.h"
@@ -52,6 +53,7 @@ struct PipelineCache::AsyncCompiler {
     std::mutex mutex;
     std::condition_variable_any job_cv;
     std::condition_variable_any idle_cv;
+    std::condition_variable_any completion_cv;
     std::deque<std::function<void()>> jobs;
     std::deque<std::function<void()>> completions;
     size_t active_jobs{};
@@ -69,6 +71,7 @@ struct AsyncShaderCompileRequest {
     Shader::Backend::Bindings start_binding{};
     std::array<u32, Shader::ShaderParams::NumShaderUserData> user_data{};
     std::vector<u32> code;
+    std::vector<u32> geometry_copy_code;
     u64 hash{};
     size_t permutation_index{};
     bool is_base_program{};
@@ -90,6 +93,7 @@ struct AsyncGraphicsPipelineRequest {
     std::array<std::array<u32, Shader::ShaderParams::NumShaderUserData>, MaxShaderStages>
         snapshot_user_data{};
     std::array<Shader::RuntimeInfo, MaxShaderStages> runtime_infos{};
+    std::array<std::vector<u32>, MaxShaderStages> geometry_copy_code{};
     std::array<vk::ShaderModule, MaxShaderStages> modules{};
     std::optional<Shader::Gcn::FetchShaderData> fetch_shader{};
     GraphicsPipeline::SerializationSupport serialization{};
@@ -103,6 +107,14 @@ bool UseAsyncGraphicsCompilation(const Instance& instance) {
         return !(setting[0] == '0' && setting[1] == '\0');
     }
     return instance.GetDriverID() == vk::DriverId::eMesaKosmickrisp;
+}
+
+void SnapshotGeometryCopyShader(Shader::RuntimeInfo& runtime_info, std::vector<u32>& storage) {
+    if (runtime_info.stage != Shader::Stage::Geometry || runtime_info.gs_info.vs_copy.empty()) {
+        return;
+    }
+    storage.assign(runtime_info.gs_info.vs_copy.begin(), runtime_info.gs_info.vs_copy.end());
+    runtime_info.gs_info.vs_copy = storage;
 }
 
 } // Anonymous namespace
@@ -356,6 +368,10 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
                              AmdGpu::Liverpool* liverpool_)
     : instance{instance_}, scheduler{scheduler_}, liverpool{liverpool_},
       desc_heap{instance, scheduler.GetMasterSemaphore(), DescriptorHeapSizes} {
+    // Register the SRT fault handler before the async compiler can generate or execute walkers.
+    // Registering into the global signal dispatcher from a worker would race signal dispatch.
+    Shader::InitializeSrtWalker();
+
     const auto& vk12_props = instance.GetVk12Properties();
     profile = Shader::Profile{
         // When binding a UBO, we calculate its size considering the offset in the larger buffer
@@ -464,8 +480,11 @@ void PipelineCache::QueueAsyncJob(std::function<void()> job) {
 
 void PipelineCache::QueueAsyncCompletion(std::function<void()> completion) {
     ASSERT(async_compiler);
-    std::scoped_lock lock{async_compiler->mutex};
-    async_compiler->completions.emplace_back(std::move(completion));
+    {
+        std::scoped_lock lock{async_compiler->mutex};
+        async_compiler->completions.emplace_back(std::move(completion));
+    }
+    async_compiler->completion_cv.notify_all();
 }
 
 void PipelineCache::DrainAsyncCompletions() {
@@ -495,6 +514,19 @@ void PipelineCache::WaitForAsyncCompiler() {
         });
     }
     DrainAsyncCompletions();
+}
+
+void PipelineCache::WaitForAsyncGraphicsProgress() {
+    if (!async_compiler) {
+        return;
+    }
+
+    std::unique_lock lock{async_compiler->mutex};
+    if (!async_compiler->completions.empty()) {
+        return;
+    }
+    async_compiler->completion_cv.wait_for(lock, std::chrono::microseconds{500},
+                                           [this] { return !async_compiler->completions.empty(); });
 }
 
 void PipelineCache::StopAsyncCompiler() {
@@ -550,6 +582,7 @@ void PipelineCache::AsyncCompilerThread(std::stop_token stop_token) {
 }
 
 const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(bool expand_quad_list) {
+    graphics_compilation_pending = false;
     DrainAsyncCompletions();
     if (!RefreshGraphicsKey(expand_quad_list)) {
         return nullptr;
@@ -562,6 +595,10 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(bool expand_quad_list
             request->hash = std::hash<GraphicsPipelineKey>{}(graphics_key);
             request->live_infos = infos;
             request->runtime_infos = runtime_infos;
+            for (u32 stage = 0; stage < MaxShaderStages; ++stage) {
+                SnapshotGeometryCopyShader(request->runtime_infos[stage],
+                                           request->geometry_copy_code[stage]);
+            }
             request->modules = modules;
             request->fetch_shader = fetch_shader;
 
@@ -632,6 +669,7 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(bool expand_quad_list
                 });
             });
             fetch_shader.reset();
+            graphics_compilation_pending = true;
             return nullptr;
         }
 
@@ -664,6 +702,9 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(bool expand_quad_list
             }
         }
         fetch_shader.reset();
+    }
+    if (!it->second) {
+        graphics_compilation_pending = true;
     }
     return it->second.get();
 }
@@ -1029,6 +1070,7 @@ std::optional<PipelineCache::Result> PipelineCache::GetProgram(
         request->stage = stage;
         request->logical_stage = l_stage;
         request->runtime_info = runtime_info;
+        SnapshotGeometryCopyShader(request->runtime_info, request->geometry_copy_code);
         request->start_binding = binding;
         request->hash = params.hash;
         request->permutation_index = permutation_index;
@@ -1181,6 +1223,7 @@ std::optional<PipelineCache::Result> PipelineCache::GetProgram(
             if (async_pending_programs.emplace(params.hash).second) {
                 queue_async_shader(true, 0, nullptr);
             }
+            graphics_compilation_pending = true;
             return std::nullopt;
         }
 
@@ -1217,6 +1260,7 @@ std::optional<PipelineCache::Result> PipelineCache::GetProgram(
         if (async_compiler && stage != Shader::Stage::Compute) {
             queue_async_shader(false, perm_idx, &spec);
             program->AddPendingPermut(std::move(spec));
+            graphics_compilation_pending = true;
             return std::nullopt;
         }
 
@@ -1227,6 +1271,7 @@ std::optional<PipelineCache::Result> PipelineCache::GetProgram(
         program->AddPermut(module, std::move(spec));
     } else {
         if (!it->module) {
+            graphics_compilation_pending = true;
             return std::nullopt;
         }
         info.AddBindings(binding);

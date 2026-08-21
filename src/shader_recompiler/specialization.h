@@ -164,6 +164,13 @@ struct StageSpecialization {
             info->ReadTessConstantBuffer(tess_constants);
             runtime_info.InitFromTessConstants(tess_constants);
         }
+
+        // The copy-shader bytes are needed only while translating a geometry shader. Keeping the
+        // guest-memory span in a cached specialization would leave a dangling pointer after a
+        // level unload; equality uses the persistent copy-shader hash instead.
+        if (runtime_info.stage == Stage::Geometry) {
+            runtime_info.gs_info.vs_copy = {};
+        }
     }
 
     void ForEachSharp(auto& spec_list, auto& desc_list, auto&& func) {
