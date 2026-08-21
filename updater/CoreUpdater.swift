@@ -148,6 +148,10 @@ private final class RuntimeUpdater {
                                 updatedFileCount: 0, alreadyCurrent: true)
         }
 
+        // A failed older updater may have left one of its UUID-named staging files behind.
+        // Remove only files whose names exactly match our private staging/rollback format.
+        try removeStaleTransactionFiles(from: targetURL)
+
         let identifier = UUID().uuidString
         let backupDirectory = fileManager.temporaryDirectory
             .appendingPathComponent("shadps4-runtime-backup-\(identifier)", isDirectory: true)
@@ -156,7 +160,19 @@ private final class RuntimeUpdater {
         defer { try? fileManager.removeItem(at: backupDirectory) }
 
         var preparedItems: [PreparedRuntimeItem] = []
+        defer {
+            for item in preparedItems {
+                try? fileManager.removeItem(at: item.stagedURL)
+            }
+        }
+
         for (item, payloadURL, targetItemURL, payloadHash) in differences {
+            if item.executable {
+                // Verify the executable while it is still next to its matching payload
+                // Info.plist. The target may contain an older Info.plist until commit time.
+                try run("/usr/bin/codesign", ["--verify", "--strict", payloadURL.path])
+            }
+
             let targetDirectory = targetItemURL.deletingLastPathComponent()
             try fileManager.createDirectory(at: targetDirectory, withIntermediateDirectories: true)
 
@@ -171,11 +187,6 @@ private final class RuntimeUpdater {
                 try fileManager.copyItem(at: targetItemURL, to: backupURL)
             }
             try fileManager.copyItem(at: payloadURL, to: stagedURL)
-            if item.executable {
-                try fileManager.setAttributes([.posixPermissions: 0o755],
-                                              ofItemAtPath: stagedURL.path)
-                try run("/usr/bin/codesign", ["--verify", "--strict", stagedURL.path])
-            }
             preparedItems.append(PreparedRuntimeItem(
                 definition: item,
                 payloadURL: payloadURL,
@@ -185,11 +196,12 @@ private final class RuntimeUpdater {
                 targetExisted: targetExisted,
                 payloadHash: payloadHash
             ))
-        }
-
-        defer {
-            for item in preparedItems {
-                try? fileManager.removeItem(at: item.stagedURL)
+            if item.executable {
+                try fileManager.setAttributes([.posixPermissions: 0o755],
+                                              ofItemAtPath: stagedURL.path)
+            }
+            guard try sha256(of: stagedURL) == sha256(of: payloadURL) else {
+                throw CoreUpdaterError.checksumMismatch(item.relativePath)
             }
         }
 
@@ -268,6 +280,32 @@ private final class RuntimeUpdater {
         SHA256.hash(data: Data(text.utf8)).map { String(format: "%02x", $0) }.joined()
     }
 
+    private func removeStaleTransactionFiles(from targetURL: URL) throws {
+        for item in runtimeItems {
+            let targetItemURL = targetURL.appendingPathComponent(item.relativePath)
+            let targetDirectory = targetItemURL.deletingLastPathComponent()
+            guard fileManager.fileExists(atPath: targetDirectory.path) else { continue }
+
+            let candidates = try fileManager.contentsOfDirectory(
+                at: targetDirectory,
+                includingPropertiesForKeys: nil,
+                options: [.skipsSubdirectoryDescendants]
+            )
+            for candidate in candidates {
+                let name = candidate.lastPathComponent
+                let prefixes = [
+                    ".\(targetItemURL.lastPathComponent).update-",
+                    ".\(targetItemURL.lastPathComponent).rollback-",
+                ]
+                guard prefixes.contains(where: { prefix in
+                    name.hasPrefix(prefix) &&
+                        UUID(uuidString: String(name.dropFirst(prefix.count))) != nil
+                }) else { continue }
+                try fileManager.removeItem(at: candidate)
+            }
+        }
+    }
+
     private func anyFileIsInUse(_ urls: [URL]) throws -> Bool {
         for url in urls {
             let process = Process()
@@ -334,7 +372,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
             defer: false
         )
         window.center()
-        window.title = "shadPS4-lbp3 Runtime Updater"
+        window.title = "shadPS4 Update"
         window.isReleasedWhenClosed = false
 
         let titleLabel = NSTextField(labelWithString: "Обновление runtime shadPS4")
