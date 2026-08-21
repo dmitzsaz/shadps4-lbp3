@@ -51,6 +51,13 @@ for relative_path in $RUNTIME_FILES; do
     fi
 done
 
+PARTYCHAT_HELP=$("$RUNTIME_BUNDLE/Contents/MacOS/partychat" --help 2>&1 || true)
+if ! print -r -- "$PARTYCHAT_HELP" | /usr/bin/grep -Fq 'serve [flags]' || \
+    ! print -r -- "$PARTYCHAT_HELP" | /usr/bin/grep -Fq 'index [flags]'; then
+    print -u2 "PartyChat payload is missing the required serve/index commands"
+    exit 1
+fi
+
 STAGE_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/shadps4-core-updater.XXXXXX")
 trap 'rm -rf -- "$STAGE_ROOT"' EXIT
 STAGED_BUNDLE="$STAGE_ROOT/shadPS4-update.app"
