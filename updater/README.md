@@ -6,7 +6,7 @@ Build the minimal macOS updater with the current runtime bundle embedded:
 ./updater/build-updater.sh
 ```
 
-The resulting bundle is always `updater-dist/shadPS4-lbp3.app`. Open it, select the
+The resulting bundle is always `updater-dist/shadPS4-update.app`. Open it, select the
 `shadPS4-lbp3.app` that contains the game, and the updater replaces the launcher, core,
 PartyChat, Vulkan libraries, ICD JSON, Info.plist, and license files. It verifies every SHA-256
 and refreshes the ad-hoc bundle signature while preserving `Resources/Game`,
