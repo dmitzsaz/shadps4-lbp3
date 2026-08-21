@@ -11,19 +11,24 @@ private let requiredBundleName = "shadPS4-lbp3.app"
 
 private struct RuntimeItem {
     let relativePath: String
+    let payloadName: String
     let executable: Bool
 }
 
 private let runtimeItems = [
-    RuntimeItem(relativePath: "Contents/MacOS/shadps4", executable: true),
-    RuntimeItem(relativePath: "Contents/MacOS/shadps4-core", executable: true),
-    RuntimeItem(relativePath: "Contents/MacOS/partychat", executable: true),
-    RuntimeItem(relativePath: "Contents/MacOS/libvulkan.dylib", executable: true),
-    RuntimeItem(relativePath: "Contents/MacOS/libvulkan_kosmickrisp.dylib", executable: true),
-    RuntimeItem(relativePath: "Contents/MacOS/kosmickrisp_mesa_icd.json", executable: false),
-    RuntimeItem(relativePath: "Contents/Info.plist", executable: false),
-    RuntimeItem(relativePath: "Contents/Resources/LICENSE-shadPS4.txt", executable: false),
-    RuntimeItem(relativePath: "Contents/Resources/LICENSE-PartyChat.txt", executable: false),
+    RuntimeItem(relativePath: "Contents/MacOS/shadps4", payloadName: "shadps4", executable: true),
+    RuntimeItem(relativePath: "Contents/MacOS/shadps4-core", payloadName: "shadps4-core", executable: true),
+    RuntimeItem(relativePath: "Contents/MacOS/partychat", payloadName: "partychat", executable: true),
+    RuntimeItem(relativePath: "Contents/MacOS/libvulkan.dylib", payloadName: "libvulkan.dylib", executable: true),
+    RuntimeItem(relativePath: "Contents/MacOS/libvulkan_kosmickrisp.dylib",
+                payloadName: "libvulkan_kosmickrisp.dylib", executable: true),
+    RuntimeItem(relativePath: "Contents/MacOS/kosmickrisp_mesa_icd.json",
+                payloadName: "kosmickrisp_mesa_icd.json", executable: false),
+    RuntimeItem(relativePath: "Contents/Info.plist", payloadName: "Info.plist", executable: false),
+    RuntimeItem(relativePath: "Contents/Resources/LICENSE-shadPS4.txt",
+                payloadName: "LICENSE-shadPS4.txt", executable: false),
+    RuntimeItem(relativePath: "Contents/Resources/LICENSE-PartyChat.txt",
+                payloadName: "LICENSE-PartyChat.txt", executable: false),
 ]
 
 private enum CoreUpdaterError: LocalizedError {
@@ -126,7 +131,7 @@ private final class RuntimeUpdater {
         var differences: [(RuntimeItem, URL, URL, String)] = []
         var manifestEntries: [String] = []
         for item in runtimeItems {
-            let payloadURL = payloadRootURL.appendingPathComponent(item.relativePath)
+            let payloadURL = payloadRootURL.appendingPathComponent(item.payloadName)
             guard fileManager.fileExists(atPath: payloadURL.path) else {
                 throw CoreUpdaterError.missingPayload(item.relativePath)
             }
@@ -365,6 +370,8 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func buildWindow() {
+        let updaterVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString")
+            as? String ?? "?"
         window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 540, height: 245),
             styleMask: [.titled, .closable, .miniaturizable],
@@ -372,10 +379,10 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
             defer: false
         )
         window.center()
-        window.title = "shadPS4 Update"
+        window.title = "shadPS4 Update \(updaterVersion)"
         window.isReleasedWhenClosed = false
 
-        let titleLabel = NSTextField(labelWithString: "Обновление runtime shadPS4")
+        let titleLabel = NSTextField(labelWithString: "Обновление runtime shadPS4 · \(updaterVersion)")
         titleLabel.font = .systemFont(ofSize: 22, weight: .semibold)
         titleLabel.alignment = .center
 
@@ -485,8 +492,13 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
         progressIndicator.stopAnimation(nil)
         statusLabel.stringValue = "Обновление не выполнено"
 
-        let alert = NSAlert(error: error)
+        let updaterVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString")
+            as? String ?? "?"
+        let alert = NSAlert()
         alert.alertStyle = .critical
+        alert.messageText = "Обновление не выполнено"
+        alert.informativeText = "Updater \(updaterVersion)\n\n\(error.localizedDescription)"
+        alert.addButton(withTitle: "OK")
         alert.beginSheetModal(for: window)
     }
 

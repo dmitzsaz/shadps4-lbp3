@@ -56,8 +56,7 @@ trap 'rm -rf -- "$STAGE_ROOT"' EXIT
 STAGED_BUNDLE="$STAGE_ROOT/shadPS4-update.app"
 PAYLOAD_ROOT="$STAGED_BUNDLE/Contents/Resources/Runtime"
 
-mkdir -p "$STAGED_BUNDLE/Contents/MacOS" \
-    "$PAYLOAD_ROOT/Contents/MacOS" "$PAYLOAD_ROOT/Contents/Resources"
+mkdir -p "$STAGED_BUNDLE/Contents/MacOS" "$PAYLOAD_ROOT"
 /usr/bin/xcrun swiftc \
     -O \
     -whole-module-optimization \
@@ -69,22 +68,28 @@ mkdir -p "$STAGED_BUNDLE/Contents/MacOS" \
 
 cp "$SCRIPT_DIR/Info.plist" "$STAGED_BUNDLE/Contents/Info.plist"
 for relative_path in $RUNTIME_FILES; do
-    cp "$RUNTIME_BUNDLE/$relative_path" "$PAYLOAD_ROOT/$relative_path"
+    payload_path="$PAYLOAD_ROOT/${relative_path:t}"
+    /bin/cp -X "$RUNTIME_BUNDLE/$relative_path" "$payload_path"
+    /usr/bin/xattr -c "$payload_path"
 done
 chmod 755 "$STAGED_BUNDLE/Contents/MacOS/shadps4-runtime-updater" \
-    "$PAYLOAD_ROOT/Contents/MacOS/shadps4" \
-    "$PAYLOAD_ROOT/Contents/MacOS/shadps4-core" \
-    "$PAYLOAD_ROOT/Contents/MacOS/partychat" \
-    "$PAYLOAD_ROOT/Contents/MacOS/libvulkan.dylib" \
-    "$PAYLOAD_ROOT/Contents/MacOS/libvulkan_kosmickrisp.dylib"
+    "$PAYLOAD_ROOT/shadps4" \
+    "$PAYLOAD_ROOT/shadps4-core" \
+    "$PAYLOAD_ROOT/partychat" \
+    "$PAYLOAD_ROOT/libvulkan.dylib" \
+    "$PAYLOAD_ROOT/libvulkan_kosmickrisp.dylib"
+chmod 644 "$PAYLOAD_ROOT/kosmickrisp_mesa_icd.json" \
+    "$PAYLOAD_ROOT/Info.plist" \
+    "$PAYLOAD_ROOT/LICENSE-shadPS4.txt" \
+    "$PAYLOAD_ROOT/LICENSE-PartyChat.txt"
 
 /usr/bin/plutil -lint "$STAGED_BUNDLE/Contents/Info.plist"
 for signed_payload in \
-    "$PAYLOAD_ROOT/Contents/MacOS/shadps4" \
-    "$PAYLOAD_ROOT/Contents/MacOS/shadps4-core" \
-    "$PAYLOAD_ROOT/Contents/MacOS/partychat" \
-    "$PAYLOAD_ROOT/Contents/MacOS/libvulkan.dylib" \
-    "$PAYLOAD_ROOT/Contents/MacOS/libvulkan_kosmickrisp.dylib"; do
+    "$PAYLOAD_ROOT/shadps4" \
+    "$PAYLOAD_ROOT/shadps4-core" \
+    "$PAYLOAD_ROOT/partychat" \
+    "$PAYLOAD_ROOT/libvulkan.dylib" \
+    "$PAYLOAD_ROOT/libvulkan_kosmickrisp.dylib"; do
     /usr/bin/codesign --force --sign - "$signed_payload"
 done
 /usr/bin/codesign --force --deep --sign - "$STAGED_BUNDLE"
