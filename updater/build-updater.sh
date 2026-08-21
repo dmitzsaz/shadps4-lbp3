@@ -17,11 +17,11 @@ while [[ "$POLICY_SEARCH_ROOT" != "/" ]]; do
 done
 
 OUTPUT_PARENT=${1:-"$DELIVERY_ROOT/updater-dist"}
-BUNDLE_PATH="$OUTPUT_PARENT/shadPS4-update.app"
+BUNDLE_PATH="$OUTPUT_PARENT/shadPS4-lbp3.app"
 RUNTIME_BUNDLE=${SHADPS4_RUNTIME_BUNDLE:-"$DELIVERY_ROOT/shadPS4-lbp3.app"}
 
-if [[ "${BUNDLE_PATH:t}" != "shadPS4-update.app" ]]; then
-    print -u2 "Updater bundle must be named shadPS4-update.app"
+if [[ "${BUNDLE_PATH:t}" != "shadPS4-lbp3.app" ]]; then
+    print -u2 "Updater bundle must be named shadPS4-lbp3.app"
     exit 2
 fi
 if [[ "${RUNTIME_BUNDLE:t}" != "shadPS4-lbp3.app" || ! -d "$RUNTIME_BUNDLE" ]]; then
@@ -60,7 +60,7 @@ fi
 
 STAGE_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/shadps4-core-updater.XXXXXX")
 trap 'rm -rf -- "$STAGE_ROOT"' EXIT
-STAGED_BUNDLE="$STAGE_ROOT/shadPS4-update.app"
+STAGED_BUNDLE="$STAGE_ROOT/shadPS4-lbp3.app"
 PAYLOAD_ROOT="$STAGED_BUNDLE/Contents/Resources/Runtime"
 
 mkdir -p "$STAGED_BUNDLE/Contents/MacOS" "$PAYLOAD_ROOT"
