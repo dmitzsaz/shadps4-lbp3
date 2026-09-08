@@ -1,0 +1,18 @@
+--- a/src/kosmickrisp/bridge/mtl_encoder.m
++++ b/src/kosmickrisp/bridge/mtl_encoder.m
+@@ -493,7 +493,14 @@
+       id<MTL4ComputeCommandEncoder> enc =
+          (id<MTL4ComputeCommandEncoder>)encoder;
+       id<MTL4CounterHeap> h = (id<MTL4CounterHeap>)heap;
+-      [enc writeTimestampWithGranularity:MTL4TimestampGranularityRelaxed
++      /* Relaxed samples may all describe the same encoder boundary. Opt-in
++       * diagnostics need distinct command positions; leave normal queries alone. */
++      const char *precise = getenv("MESA_KK_PRECISE_COMPUTE_TIMESTAMPS");
++      MTL4TimestampGranularity granularity =
++         precise && strcmp(precise, "1") == 0
++            ? MTL4TimestampGranularityPrecise
++            : MTL4TimestampGranularityRelaxed;
++      [enc writeTimestampWithGranularity:granularity
+                                 intoHeap:h
+                                  atIndex:index];
+    }

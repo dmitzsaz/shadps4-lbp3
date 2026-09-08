@@ -1,5 +1,5 @@
 diff --git a/src/kosmickrisp/bridge/mtl_encoder.h b/src/kosmickrisp/bridge/mtl_encoder.h
-index 07d8bd03eab..569df6fbc8b 100644
+index 02fe86f4f35..0852aa3c0e9 100644
 --- a/src/kosmickrisp/bridge/mtl_encoder.h
 +++ b/src/kosmickrisp/bridge/mtl_encoder.h
 @@ -14,7 +14,8 @@
@@ -13,7 +13,7 @@ index 07d8bd03eab..569df6fbc8b 100644
                                        enum mtl_stages after_stages,
                                        enum mtl_stages before_queue_stages);
 diff --git a/src/kosmickrisp/bridge/mtl_encoder.m b/src/kosmickrisp/bridge/mtl_encoder.m
-index 3735d6a8636..3179277a213 100644
+index 2c355627c13..76bdd33e26a 100644
 --- a/src/kosmickrisp/bridge/mtl_encoder.m
 +++ b/src/kosmickrisp/bridge/mtl_encoder.m
 @@ -24,14 +24,13 @@
@@ -35,10 +35,10 @@ index 3735d6a8636..3179277a213 100644
  }
  
 diff --git a/src/kosmickrisp/bridge/mtl_types.h b/src/kosmickrisp/bridge/mtl_types.h
-index 76256c2f86a..8be00fd0517 100644
+index 26a97944424..4d7871394d4 100644
 --- a/src/kosmickrisp/bridge/mtl_types.h
 +++ b/src/kosmickrisp/bridge/mtl_types.h
-@@ -235,6 +235,12 @@ enum mtl_barrier_scope {
+@@ -252,6 +252,12 @@ enum mtl_barrier_scope {
     MTL_BARRIER_SCOPE_RENDER_TARGETS = 1 << 2,
  };
  
@@ -52,7 +52,7 @@ index 76256c2f86a..8be00fd0517 100644
     MTL_STAGE_VERTEX = 1 << 0,
     MTL_STAGE_FRAGMENT = 1 << 1,
 diff --git a/src/kosmickrisp/bridge/stubs/mtl_encoder.c b/src/kosmickrisp/bridge/stubs/mtl_encoder.c
-index a64f73a9806..ea2ad40fe38 100644
+index 57810abf185..631c28a5367 100644
 --- a/src/kosmickrisp/bridge/stubs/mtl_encoder.c
 +++ b/src/kosmickrisp/bridge/stubs/mtl_encoder.c
 @@ -14,7 +14,8 @@ mtl_end_encoding(void *encoder)
@@ -66,10 +66,10 @@ index a64f73a9806..ea2ad40fe38 100644
  }
  
 diff --git a/src/kosmickrisp/vulkan/kk_cmd_buffer.c b/src/kosmickrisp/vulkan/kk_cmd_buffer.c
-index f9ff3360b5d..ef37149c285 100644
+index ddc03cfa0c4..8be12df4a37 100644
 --- a/src/kosmickrisp/vulkan/kk_cmd_buffer.c
 +++ b/src/kosmickrisp/vulkan/kk_cmd_buffer.c
-@@ -175,6 +175,23 @@ kk_reset_encoder_state(struct kk_encoder_state *es)
+@@ -182,6 +182,23 @@ kk_reset_encoder_state(struct kk_encoder_state *es)
     mtl_command_allocator_reset(es->allocator);
  }
  
@@ -93,7 +93,7 @@ index f9ff3360b5d..ef37149c285 100644
  void
  kk_reset_cmd_buffer_internal(struct kk_cmd_buffer *cmd)
  {
-@@ -195,17 +212,24 @@ kk_reset_cmd_buffer_internal(struct kk_cmd_buffer *cmd)
+@@ -202,17 +219,24 @@ kk_reset_cmd_buffer_internal(struct kk_cmd_buffer *cmd)
  
     memset(&cmd->state, 0, sizeof(cmd->state));
     cmd->uses_heap = false;
@@ -119,7 +119,7 @@ index f9ff3360b5d..ef37149c285 100644
     cmd->submitted = false;
     cmd->one_time_submit = false;
  }
-@@ -262,8 +286,16 @@ cs_start_render(struct kk_cmd_buffer *cmd)
+@@ -283,8 +307,16 @@ cs_start_render(struct kk_cmd_buffer *cmd)
     uint32_t view_mask = state->render.view_mask;
     assert(state->render_pass_descriptor);
  
@@ -138,8 +138,8 @@ index f9ff3360b5d..ef37149c285 100644
     cmd->gfx.encoder = mtl_new_render_command_encoder_with_descriptor(
        cmd->gfx.cmd_buf, state->render_pass_descriptor);
  
-@@ -312,11 +344,22 @@ kk_start_compute_encoder(struct kk_encoder_state *es, mtl_device *handle,
-    mtl_compute_set_argument_table(es->encoder, argument_table);
+@@ -343,10 +375,19 @@ kk_start_compute_encoder(struct kk_cmd_buffer *cmd, bool pre_gfx)
+    kk_encoder_state_update_debug(cmd, es);
  }
  
 +static void
@@ -149,28 +149,24 @@ index f9ff3360b5d..ef37149c285 100644
  mtl_compute_encoder *
  cs_get_compute(struct kk_cmd_buffer *cmd, bool pre_gfx)
  {
-    struct kk_device *dev = kk_cmd_buffer_device(cmd);
     mtl_compute_encoder *encoder;
 +
-+   /* A compute command recorded between two render passes must follow the
-+    * retained graphics work, so finish and append graphics before opening (or
-+    * extending) the compute command buffer. */
++   /* Keep retained render work ahead of compute recorded between passes. */
 +   if (!cmd->gfx.encoder && cmd->gfx.cmd_buf)
 +      kk_finish_command_buffer(cmd, &cmd->gfx);
 +
     /* If we are not inside a render, we can just take pre_gfx. */
     if (!cmd->gfx.encoder || pre_gfx) {
        if (!cmd->pre_gfx->encoder) {
-@@ -336,10 +379,19 @@ cs_get_compute(struct kk_cmd_buffer *cmd, bool pre_gfx)
+@@ -364,10 +405,19 @@ cs_get_compute(struct kk_cmd_buffer *cmd, bool pre_gfx)
  }
  
  static void
 -kk_stop_encoder(struct kk_cmd_buffer *cmd, struct kk_encoder_state *es)
--{
++kk_end_encoder(struct kk_cmd_buffer *cmd, struct kk_encoder_state *es)
+ {
 -   /* TODO_KOSMICKRISP This is probably overkill */
 -   mtl_barrier_after_stages(es->encoder, MTL_STAGE_ALL, MTL_STAGE_ALL);
-+kk_end_encoder(struct kk_cmd_buffer *cmd, struct kk_encoder_state *es)
-+{
 +   assert(es->encoder != NULL);
 +   assert(es->cmd_buf != NULL);
 +
@@ -185,7 +181,7 @@ index f9ff3360b5d..ef37149c285 100644
     mtl_end_encoding(es->encoder);
     mtl_release(es->encoder);
     es->encoder = NULL;
-@@ -351,6 +403,18 @@ kk_stop_encoder(struct kk_cmd_buffer *cmd, struct kk_encoder_state *es)
+@@ -379,6 +429,18 @@ kk_stop_encoder(struct kk_cmd_buffer *cmd, struct kk_encoder_state *es)
     }
  
     util_dynarray_clear(&es->ts_resolves);
@@ -204,7 +200,7 @@ index f9ff3360b5d..ef37149c285 100644
  
     mtl_end_command_buffer(es->cmd_buf);
  
-@@ -358,11 +422,50 @@ kk_stop_encoder(struct kk_cmd_buffer *cmd, struct kk_encoder_state *es)
+@@ -386,11 +448,50 @@ kk_stop_encoder(struct kk_cmd_buffer *cmd, struct kk_encoder_state *es)
     es->cmd_buf = NULL;
  }
  
@@ -256,10 +252,10 @@ index f9ff3360b5d..ef37149c285 100644
        /* Submit pre_gfx now that its encoder is closed. Command buffers are
         * appended here (rather than at creation) so submit_cmd_bufs stays in
 diff --git a/src/kosmickrisp/vulkan/kk_cmd_buffer.h b/src/kosmickrisp/vulkan/kk_cmd_buffer.h
-index fa923006278..4418cde4643 100644
+index 44d779a05dd..de482a68741 100644
 --- a/src/kosmickrisp/vulkan/kk_cmd_buffer.h
 +++ b/src/kosmickrisp/vulkan/kk_cmd_buffer.h
-@@ -254,6 +254,10 @@ struct kk_cmd_buffer {
+@@ -263,6 +263,10 @@ struct kk_cmd_buffer {
     /* Metal command buffers are single-shot: a resubmission must re-record
      * by replaying the enqueued commands (see rerecord_cmd_buffer). */
     bool submitted;
@@ -270,7 +266,7 @@ index fa923006278..4418cde4643 100644
  };
  
  VK_DEFINE_HANDLE_CASTS(kk_cmd_buffer, vk.base, VkCommandBuffer,
-@@ -291,6 +295,7 @@ void kk_reset_cmd_buffer_internal(struct kk_cmd_buffer *cmd);
+@@ -300,6 +304,7 @@ void kk_reset_cmd_buffer_internal(struct kk_cmd_buffer *cmd);
  void cs_start_render(struct kk_cmd_buffer *cmd);
  mtl_render_encoder *cs_get_render(struct kk_cmd_buffer *cmd);
  mtl_compute_encoder *cs_get_compute(struct kk_cmd_buffer *cmd, bool pre_gfx);
@@ -279,10 +275,10 @@ index fa923006278..4418cde4643 100644
  void kk_cmd_bind_root_to_argument_table(struct kk_cmd_buffer *cmd,
                                          uint64_t addr);
 diff --git a/src/kosmickrisp/vulkan/kk_cmd_draw.c b/src/kosmickrisp/vulkan/kk_cmd_draw.c
-index 924eb2d6e54..828f8b56427 100644
+index 63c10b9c5eb..f7954de762d 100644
 --- a/src/kosmickrisp/vulkan/kk_cmd_draw.c
 +++ b/src/kosmickrisp/vulkan/kk_cmd_draw.c
-@@ -557,8 +557,9 @@ kk_CmdEndRendering2KHR(VkCommandBuffer commandBuffer,
+@@ -628,8 +628,9 @@ kk_CmdEndRendering2KHR(VkCommandBuffer commandBuffer,
  
     kk_apply_attachment_store_ops(cmd, false);
  
@@ -295,10 +291,10 @@ index 924eb2d6e54..828f8b56427 100644
     cmd->state.gfx.render_pass_descriptor = NULL;
  
 diff --git a/src/kosmickrisp/vulkan/kk_query_pool.c b/src/kosmickrisp/vulkan/kk_query_pool.c
-index f8c35afdd8d..6ea63cda5c3 100644
+index 1bda0523af3..fb32f5f16a9 100644
 --- a/src/kosmickrisp/vulkan/kk_query_pool.c
 +++ b/src/kosmickrisp/vulkan/kk_query_pool.c
-@@ -412,6 +412,7 @@ kk_CmdBeginQuery(VkCommandBuffer commandBuffer, VkQueryPool queryPool,
+@@ -422,6 +422,7 @@ kk_CmdBeginQuery(VkCommandBuffer commandBuffer, VkQueryPool queryPool,
  {
     VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
     VK_FROM_HANDLE(kk_query_pool, pool, queryPool);

@@ -1,0 +1,27 @@
+--- a/src/kosmickrisp/vulkan/kk_cmd_pool.c
++++ b/src/kosmickrisp/vulkan/kk_cmd_pool.c
+@@ -47,6 +47,7 @@
+       kk_cmd_bo_destroy(pool, bo);
+ 
+    list_inithead(&pool->free_bos);
++   pool->num_free_bos = 0;
+ }
+ 
+ VkResult
+@@ -72,7 +73,7 @@
+ {
+    list_for_each_entry_safe(struct kk_cmd_bo, bo, bos, link) {
+       list_del(&bo->link);
+-      if (pool->num_free_bos > KK_CMD_POOL_BO_MAX) {
++      if (pool->num_free_bos >= KK_CMD_POOL_BO_MAX) {
+          kk_cmd_bo_destroy(pool, bo);
+       } else {
+          list_addtail(&bo->link, &pool->free_bos);
+@@ -103,6 +104,7 @@
+    }
+ 
+    list_inithead(&pool->free_bos);
++   pool->num_free_bos = 0;
+ 
+    *pCmdPool = kk_cmd_pool_to_handle(pool);
+ 

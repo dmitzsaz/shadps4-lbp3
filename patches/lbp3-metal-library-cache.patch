@@ -1,0 +1,56 @@
+diff --git a/src/kosmickrisp/bridge/mtl_compiler.m b/src/kosmickrisp/bridge/mtl_compiler.m
+index 1b689f173e7..6841272b06a 100644
+--- a/src/kosmickrisp/bridge/mtl_compiler.m
++++ b/src/kosmickrisp/bridge/mtl_compiler.m
+@@ -12,6 +12,9 @@
+ #include <Metal/MTL4LibraryFunctionDescriptor.h>
+ #include <Metal/MTL4RenderPipeline.h>
+ #include <Metal/MTLDevice.h>
++#include <objc/runtime.h>
++
++static char library_cache_key;
+ 
+ /* Compiler */
+ mtl_compiler *
+@@ -27,6 +30,14 @@
+ 
+       if (compiler == nil) {
+          fprintf(stderr, "Failed to create MTL4Compiler: %s\n", [error.localizedDescription UTF8String]);
++      } else {
++         /* Pipeline state variants often reuse identical stage sources. Keep
++          * libraries per compiler/device, with bounded retention. */
++         NSCache *cache = [[NSCache new] autorelease];
++         cache.countLimit = 4096;
++         cache.totalCostLimit = 64 * 1024 * 1024;
++         objc_setAssociatedObject(compiler, &library_cache_key, cache,
++                                  OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+       }
+ 
+       return compiler;
+@@ -43,6 +54,15 @@
+    @autoreleasepool {
+       id<MTL4Compiler> comp = (id<MTL4Compiler>)compiler;
+       NSString *ns_src = [NSString stringWithCString:src encoding:NSASCIIStringEncoding];
++      NSCache *cache = objc_getAssociatedObject(comp, &library_cache_key);
++      NSArray *key = @[ @(msl_version), @(math_mode), @(math_fp_fns), ns_src ];
++      /* Retain under the same lock as insertion: eviction must not release a
++       * library between lookup and returning the owned reference to the caller. */
++      @synchronized (cache) {
++         id<MTLLibrary> cached = [cache objectForKey:key];
++         if (cached != nil)
++            return [cached retain];
++      }
+ 
+       MTLCompileOptions *opts = [[MTLCompileOptions new] autorelease];
+       opts.languageVersion = (MTLLanguageVersion)msl_version;
+@@ -58,6 +78,10 @@
+ 
+       if (lib == nil) {
+          fprintf(stderr, "Failed to create MTLLibrary: %s\n", [error.localizedDescription UTF8String]);
++      } else {
++         @synchronized (cache) {
++            [cache setObject:lib forKey:key cost:strlen(src)];
++         }
+       }
+ 
+       return lib;
