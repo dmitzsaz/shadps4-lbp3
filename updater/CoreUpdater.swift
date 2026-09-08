@@ -29,6 +29,8 @@ private let runtimeItems = [
                 payloadName: "LICENSE-shadPS4.txt", executable: false),
     RuntimeItem(relativePath: "Contents/Resources/LICENSE-PartyChat.txt",
                 payloadName: "LICENSE-PartyChat.txt", executable: false),
+    RuntimeItem(relativePath: "Contents/Resources/BuildInfo.json",
+                payloadName: "BuildInfo.json", executable: false),
 ]
 
 private enum CoreUpdaterError: LocalizedError {
@@ -110,6 +112,11 @@ private final class RuntimeUpdater {
             throw CoreUpdaterError.missingPayload("Runtime")
         }
 
+        // The resource seal covers the complete embedded payload. The launcher
+        // retains its source app's seal, which cannot be checked outside that app;
+        // the destination's complete seal is verified after the transaction.
+        try run("/usr/bin/codesign", ["--verify", "--deep", "--strict", ownBundleURL.path])
+
         if let bundleIdentifier = Bundle(url: targetURL)?.bundleIdentifier,
            !NSRunningApplication.runningApplications(withBundleIdentifier: bundleIdentifier).isEmpty {
             throw CoreUpdaterError.targetIsRunning
@@ -172,7 +179,7 @@ private final class RuntimeUpdater {
         }
 
         for (item, payloadURL, targetItemURL, payloadHash) in differences {
-            if item.executable {
+            if item.executable && item.payloadName != "shadps4" {
                 // Verify the executable while it is still next to its matching payload
                 // Info.plist. The target may contain an older Info.plist until commit time.
                 try run("/usr/bin/codesign", ["--verify", "--strict", payloadURL.path])
@@ -443,7 +450,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
         panel.allowsMultipleSelection = false
         panel.canChooseFiles = true
         panel.canChooseDirectories = false
-        panel.directoryURL = fileManagerDesktopURL()
+        panel.directoryURL = defaultApplicationDirectory()
 
         panel.beginSheetModal(for: window) { [weak self] response in
             guard response == .OK, let targetURL = panel.url else { return }
@@ -502,8 +509,8 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
         alert.beginSheetModal(for: window)
     }
 
-    private func fileManagerDesktopURL() -> URL {
-        FileManager.default.urls(for: .desktopDirectory, in: .userDomainMask).first
+    private func defaultApplicationDirectory() -> URL {
+        FileManager.default.urls(for: .applicationDirectory, in: .localDomainMask).first
             ?? FileManager.default.homeDirectoryForCurrentUser
     }
 }

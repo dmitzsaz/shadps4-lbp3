@@ -18,7 +18,7 @@ done
 
 OUTPUT_PARENT=${1:-"$DELIVERY_ROOT/updater-dist"}
 BUNDLE_PATH="$OUTPUT_PARENT/shadPS4-update.app"
-RUNTIME_BUNDLE=${SHADPS4_RUNTIME_BUNDLE:-"$DELIVERY_ROOT/shadPS4-lbp3.app"}
+RUNTIME_BUNDLE=${SHADPS4_RUNTIME_BUNDLE:-"/Applications/shadPS4-lbp3.app"}
 
 if [[ "${BUNDLE_PATH:t}" != "shadPS4-update.app" ]]; then
     print -u2 "Updater bundle must be named shadPS4-update.app"
@@ -33,6 +33,10 @@ if [[ "${RUNTIME_BUNDLE:A}" == "${BUNDLE_PATH:A}" ]]; then
     exit 2
 fi
 
+# The launcher carries its application's resource seal and cannot be verified
+# as a detached executable. Validate the complete source before copying it.
+/usr/bin/codesign --verify --deep --strict "$RUNTIME_BUNDLE"
+
 RUNTIME_FILES=(
     Contents/MacOS/shadps4
     Contents/MacOS/shadps4-core
@@ -43,6 +47,7 @@ RUNTIME_FILES=(
     Contents/Info.plist
     Contents/Resources/LICENSE-shadPS4.txt
     Contents/Resources/LICENSE-PartyChat.txt
+    Contents/Resources/BuildInfo.json
 )
 for relative_path in $RUNTIME_FILES; do
     if [[ ! -f "$RUNTIME_BUNDLE/$relative_path" ]]; then
@@ -76,8 +81,9 @@ mkdir -p "$STAGED_BUNDLE/Contents/MacOS" "$PAYLOAD_ROOT"
 cp "$SCRIPT_DIR/Info.plist" "$STAGED_BUNDLE/Contents/Info.plist"
 for relative_path in $RUNTIME_FILES; do
     payload_path="$PAYLOAD_ROOT/${relative_path:t}"
-    /bin/cp -X "$RUNTIME_BUNDLE/$relative_path" "$payload_path"
-    /usr/bin/xattr -c "$payload_path"
+    # The ICD JSON also has a generic code signature stored in extended
+    # attributes because it lives in Contents/MacOS. Preserve that signature.
+    /usr/bin/ditto "$RUNTIME_BUNDLE/$relative_path" "$payload_path"
 done
 chmod 755 "$STAGED_BUNDLE/Contents/MacOS/shadps4-runtime-updater" \
     "$PAYLOAD_ROOT/shadps4" \
@@ -88,18 +94,20 @@ chmod 755 "$STAGED_BUNDLE/Contents/MacOS/shadps4-runtime-updater" \
 chmod 644 "$PAYLOAD_ROOT/kosmickrisp_mesa_icd.json" \
     "$PAYLOAD_ROOT/Info.plist" \
     "$PAYLOAD_ROOT/LICENSE-shadPS4.txt" \
-    "$PAYLOAD_ROOT/LICENSE-PartyChat.txt"
+    "$PAYLOAD_ROOT/LICENSE-PartyChat.txt" \
+    "$PAYLOAD_ROOT/BuildInfo.json"
 
 /usr/bin/plutil -lint "$STAGED_BUNDLE/Contents/Info.plist"
 for signed_payload in \
-    "$PAYLOAD_ROOT/shadps4" \
     "$PAYLOAD_ROOT/shadps4-core" \
     "$PAYLOAD_ROOT/partychat" \
     "$PAYLOAD_ROOT/libvulkan.dylib" \
-    "$PAYLOAD_ROOT/libvulkan_kosmickrisp.dylib"; do
-    /usr/bin/codesign --force --sign - "$signed_payload"
+    "$PAYLOAD_ROOT/libvulkan_kosmickrisp.dylib" \
+    "$PAYLOAD_ROOT/kosmickrisp_mesa_icd.json"; do
+    /usr/bin/codesign --verify --strict "$signed_payload"
 done
-/usr/bin/codesign --force --deep --sign - "$STAGED_BUNDLE"
+/usr/bin/codesign --force --sign - "$STAGED_BUNDLE/Contents/MacOS/shadps4-runtime-updater"
+/usr/bin/codesign --force --sign - "$STAGED_BUNDLE"
 /usr/bin/codesign --verify --deep --strict "$STAGED_BUNDLE"
 
 mkdir -p "$OUTPUT_PARENT"
