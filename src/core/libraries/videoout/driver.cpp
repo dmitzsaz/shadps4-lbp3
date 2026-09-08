@@ -3,7 +3,6 @@
 
 #include "common/assert.h"
 #include "common/debug.h"
-#include "common/elf_info.h"
 #include "common/thread.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
@@ -12,6 +11,7 @@
 #include "core/libraries/videoout/driver.h"
 #include "core/libraries/videoout/videoout_error.h"
 #include "imgui/renderer/imgui_core.h"
+#include "input/input_movie.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
 
@@ -19,10 +19,6 @@ extern std::unique_ptr<Vulkan::Presenter> presenter;
 extern std::unique_ptr<AmdGpu::Liverpool> liverpool;
 
 namespace Libraries::VideoOut {
-
-[[nodiscard]] static bool IsLbp3Title() noexcept {
-    return Common::ElfInfo::Instance().GameSerial() == "CUSA00063";
-}
 
 constexpr static bool Is32BppPixelFormat(PixelFormat format) {
     switch (format) {
@@ -51,9 +47,6 @@ VideoOutDriver::VideoOutDriver(u32 width, u32 height) {
     main_port.resolution.full_height = height;
     main_port.resolution.pane_width = width;
     main_port.resolution.pane_height = height;
-    if (IsLbp3Title()) {
-        LOG_INFO(Lib_VideoOut, "LBP3 built-in 30 Hz presentation cap enabled");
-    }
     present_thread = std::jthread([&](std::stop_token token) { PresentThread(token); });
 }
 
@@ -243,15 +236,20 @@ int VideoOutDriver::ChangeBufferAttribute(VideoOutPort* port, s32 attributeIndex
 }
 
 void VideoOutDriver::Flip(const Request& req) {
-    // Update HDR status before presenting.
-    presenter->SetHDR(req.port->is_hdr);
-
-    // Present the frame.
-    presenter->Present(req.frame);
-
-    // Update flip status.
+    using Clock = std::chrono::steady_clock;
+    const bool record_timing = Core::PerfTelemetry::IsEnabled();
+    const bool is_hdr = req.port->is_hdr;
+    Core::PerfTelemetry::FlipTiming timing{
+        .prepare_begin = req.prepare_begin,
+        .ready = req.ready,
+        .videoout_flip_rate = req.port->flip_rate,
+        .videoout_vblank_count = req.port->vblank_status.count,
+    };
+    // PrepareFrame already submitted the guest output snapshot into an independent
+    // presentation frame before this request was queued. Publish the guest flip at
+    // this vblank so waiting guest work can resume while the host acquires a drawable.
+    // The previous guest output is released; the current output stays owned by VideoOut.
     auto* port = req.port;
-    u32 pending_flips{};
     {
         std::unique_lock lock{port->port_mutex};
         auto& flip_status = port->flip_status;
@@ -264,8 +262,11 @@ void VideoOutDriver::Flip(const Request& req) {
             --flip_status.gc_queue_num;
         }
         --flip_status.flip_pending_num;
-        pending_flips = flip_status.flip_pending_num;
     }
+
+    // Advance the input movie before waking the next guest frame. Host redraws
+    // and frame pacing do not advance the controller replay clock.
+    Input::Movie::Flip();
 
     // Trigger flip events for the port.
     for (auto event : port->flip_events) {
@@ -286,6 +287,19 @@ void VideoOutDriver::Flip(const Request& req) {
     }
     // save to prev buf index
     port->prev_index = req.index;
+    timing.feedback_end = record_timing ? Clock::now() : Clock::time_point{};
+
+    timing.present_begin = timing.feedback_end;
+    presenter->SetHDR(is_hdr);
+    presenter->Present(req.frame);
+    timing.present_end = record_timing ? Clock::now() : Clock::time_point{};
+
+    // Guest work may have queued another flip during the host presentation call.
+    u32 pending_flips{};
+    {
+        std::unique_lock lock{port->port_mutex};
+        pending_flips = port->flip_status.flip_pending_num;
+    }
 
     u32 request_depth{};
     {
@@ -295,7 +309,7 @@ void VideoOutDriver::Flip(const Request& req) {
     const auto [game_width, game_height] = DebugState.game_resolution;
     const auto [output_width, output_height] = DebugState.output_resolution;
     Core::PerfTelemetry::RecordFrame(pending_flips, request_depth, game_width, game_height,
-                                     output_width, output_height);
+                                     output_width, output_height, timing);
 }
 
 void VideoOutDriver::DrawBlankFrame() {
@@ -337,6 +351,9 @@ bool VideoOutDriver::SubmitFlip(VideoOutPort* port, s32 index, s64 flip_arg,
 }
 
 void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_arg, bool is_eop) {
+    using Clock = std::chrono::steady_clock;
+    const bool record_timing = Core::PerfTelemetry::IsEnabled();
+    const auto prepare_begin = record_timing ? Clock::now() : Clock::time_point{};
     Vulkan::Frame* frame;
     if (index == -1) {
         frame = presenter->PrepareBlankFrame(false);
@@ -346,6 +363,7 @@ void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_
         const auto& group = port->groups[buffer.group_index];
         frame = presenter->PrepareFrame(group, buffer.address_left);
     }
+    const auto ready = record_timing ? Clock::now() : Clock::time_point{};
 
     std::scoped_lock lock{mutex};
     requests.push({
@@ -354,15 +372,14 @@ void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_
         .flip_arg = flip_arg,
         .index = index,
         .eop = is_eop,
+        .prepare_begin = prepare_begin,
+        .ready = ready,
     });
 }
 
 void VideoOutDriver::PresentThread(std::stop_token token) {
     const u32 vblank_frequency = EmulatorSettings.GetVblankFrequency();
     const std::chrono::nanoseconds vblank_period(1000000000 / vblank_frequency);
-    const bool cap_lbp3_to_30 = IsLbp3Title();
-    constexpr auto lbp3_frame_period = std::chrono::nanoseconds(1000000000 / 30);
-    auto next_lbp3_flip = std::chrono::steady_clock::now();
 
     Common::SetCurrentThreadName("shadPS4:PresentThread");
     Common::SetCurrentThreadRealtime(vblank_period);
@@ -388,26 +405,12 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
             continue;
         }
 
-        // Keep LBP3 at its authored 30 FPS without changing guest time. Preserve the 30 Hz phase
-        // across the present thread's discrete wakeups so a 72 Hz display alternates 2/3 ticks
-        // instead of collapsing to 24 FPS.
+        // Honor the rate requested by the guest through sceVideoOutSetFlipRate.
         auto& vblank_status = main_port.vblank_status;
-        bool consume_flip = false;
-        if (cap_lbp3_to_30) {
-            const auto now = std::chrono::steady_clock::now();
-            if (now >= next_lbp3_flip) {
-                next_lbp3_flip += lbp3_frame_period;
-                if (now - next_lbp3_flip > lbp3_frame_period) {
-                    next_lbp3_flip = now + lbp3_frame_period;
-                }
-                consume_flip = true;
-            }
-        } else {
-            consume_flip = vblank_status.count % (main_port.flip_rate + 1) == 0;
-        }
-        if (consume_flip) {
+        if (vblank_status.count % (main_port.flip_rate + 1) == 0) {
             const auto request = receive_request();
             if (!request) {
+                Core::PerfTelemetry::Increment(Core::PerfTelemetry::Counter::EmptyFlipSlots);
                 if (timer.GetTotalWait().count() < 0) { // Dont draw too fast
                     if (!main_port.is_open) {
                         DrawBlankFrame();

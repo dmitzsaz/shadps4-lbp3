@@ -1,0 +1,57 @@
+; SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
+; SPDX-License-Identifier: GPL-2.0-or-later
+; dst[push.dst + invocation] = src[push.src + invocation] + push.bias
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main" %gid %src %dst %pc
+OpExecutionMode %main LocalSize 64 1 1
+OpDecorate %gid BuiltIn GlobalInvocationId
+OpDecorate %words ArrayStride 4
+OpMemberDecorate %Data 0 Offset 0
+OpDecorate %Data Block
+OpDecorate %src DescriptorSet 0
+OpDecorate %src Binding 0
+OpDecorate %dst DescriptorSet 0
+OpDecorate %dst Binding 1
+OpMemberDecorate %Push 0 Offset 0
+OpMemberDecorate %Push 1 Offset 4
+OpMemberDecorate %Push 2 Offset 8
+OpDecorate %Push Block
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%uint = OpTypeInt 32 0
+%v3uint = OpTypeVector %uint 3
+%zero = OpConstant %uint 0
+%one = OpConstant %uint 1
+%two = OpConstant %uint 2
+%words = OpTypeRuntimeArray %uint
+%Data = OpTypeStruct %words
+%storage_data = OpTypePointer StorageBuffer %Data
+%storage_uint = OpTypePointer StorageBuffer %uint
+%input_v3uint = OpTypePointer Input %v3uint
+%Push = OpTypeStruct %uint %uint %uint
+%push_data = OpTypePointer PushConstant %Push
+%push_uint = OpTypePointer PushConstant %uint
+%gid = OpVariable %input_v3uint Input
+%src = OpVariable %storage_data StorageBuffer
+%dst = OpVariable %storage_data StorageBuffer
+%pc = OpVariable %push_data PushConstant
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%id3 = OpLoad %v3uint %gid
+%id = OpCompositeExtract %uint %id3 0
+%src_base_ptr = OpAccessChain %push_uint %pc %zero
+%dst_base_ptr = OpAccessChain %push_uint %pc %one
+%bias_ptr = OpAccessChain %push_uint %pc %two
+%src_base = OpLoad %uint %src_base_ptr
+%dst_base = OpLoad %uint %dst_base_ptr
+%bias = OpLoad %uint %bias_ptr
+%src_idx = OpIAdd %uint %src_base %id
+%dst_idx = OpIAdd %uint %dst_base %id
+%src_ptr = OpAccessChain %storage_uint %src %zero %src_idx
+%dst_ptr = OpAccessChain %storage_uint %dst %zero %dst_idx
+%value = OpLoad %uint %src_ptr
+%result = OpIAdd %uint %value %bias
+OpStore %dst_ptr %result
+OpReturn
+OpFunctionEnd

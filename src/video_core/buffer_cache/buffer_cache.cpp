@@ -14,6 +14,7 @@
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/buffer_cache/memory_tracker.h"
+#include "video_core/buffer_cache/quad_indices.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -62,11 +63,16 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
     : instance{instance_}, scheduler{scheduler_}, liverpool{liverpool_},
       memory{Core::Memory::Instance()}, texture_cache{texture_cache_},
       fault_manager{instance, scheduler, *this, CACHING_PAGEBITS, CACHING_NUMPAGES},
-      staging_buffer{instance, scheduler, MemoryUsage::Upload, StagingBufferSize},
-      stream_buffer{instance, scheduler, MemoryUsage::Stream, UboStreamBufferSize},
-      quad_index_buffer{instance, scheduler, MemoryUsage::Stream, QuadIndexBufferSize},
-      download_buffer{instance, scheduler, MemoryUsage::Download, DownloadBufferSize},
-      device_buffer{instance, scheduler, MemoryUsage::DeviceLocal, DeviceBufferSize},
+      staging_buffer{instance, scheduler, MemoryUsage::Upload, StagingBufferSize,
+                     Core::PerfTelemetry::GpuWaitResource::UploadStaging},
+      stream_buffer{instance, scheduler, MemoryUsage::Stream, UboStreamBufferSize,
+                    Core::PerfTelemetry::GpuWaitResource::UniformStream},
+      quad_index_buffer{instance, scheduler, MemoryUsage::Stream, QuadIndexBufferSize,
+                        Core::PerfTelemetry::GpuWaitResource::QuadIndex},
+      download_buffer{instance, scheduler, MemoryUsage::Download, DownloadBufferSize,
+                      Core::PerfTelemetry::GpuWaitResource::Download},
+      device_buffer{instance, scheduler, MemoryUsage::DeviceLocal, DeviceBufferSize,
+                    Core::PerfTelemetry::GpuWaitResource::DeviceUtility},
       gds_buffer{instance, scheduler, MemoryUsage::Stream, 0, AllFlags, DataShareBufferSize},
   bda_pagetable_buffer{instance, scheduler, MemoryUsage::DeviceLocal,
                            0,        AllFlags,  BDA_PAGETABLE_SIZE} {
@@ -582,6 +588,52 @@ void BufferCache::BindVertexBuffers(
                               host_offsets.data(), host_sizes.data(),
                               host_strides.data());
   }
+}
+
+std::optional<BufferCache::ExpandedQuadIndices> BufferCache::TryExpandQuadIndices(u32 index_offset) {
+    const auto& regs = liverpool->regs;
+    if (regs.index_buffer_type.swap_mode != AmdGpu::IndexSwapMode::None ||
+        (regs.enable_primitive_id & 1) != 0) {
+        return std::nullopt;
+    }
+    const auto type = regs.index_buffer_type.index_type;
+    if (type != AmdGpu::IndexType::Index16 && type != AmdGpu::IndexType::Index32) {
+        return std::nullopt;
+    }
+    const u64 output_count = QuadListIndexCount(regs.num_indices);
+    if (!output_count || output_count > GetQuadIndexCount()) {
+        return std::nullopt;
+    }
+    const bool index16 = type == AmdGpu::IndexType::Index16;
+    const u32 index_size = index16 ? sizeof(u16) : sizeof(u32);
+    const VAddr address = regs.index_base_address.Address<VAddr>() + u64{index_offset} * index_size;
+    const u64 source_bytes = u64{regs.num_indices / 4} * 4 * index_size;
+    // Imported memory deliberately bypasses GPU dirty tracking. It must also be
+    // excluded: coherent backing does not imply that a queued GPU write is done.
+    if (IsRegionGpuModified(address, source_bytes) || IsHostImportedRange(address, source_bytes)) {
+        return std::nullopt;
+    }
+    const Core::PerfTelemetry::ScopedTimer timer{Core::PerfTelemetry::TimeMetric::QuadIndexExpandCpu};
+    const auto [mapped, offset] = stream_buffer.Map(output_count * index_size, index_size, false);
+    if (!mapped) {
+        return std::nullopt;
+    }
+    memory->CopySparseMemory(address, mapped, source_bytes);
+    const bool restart_enabled = (regs.enable_primitive_restart & 1) != 0;
+    const u32 count = index16
+        ? ExpandQuadIndicesInPlace(std::span{reinterpret_cast<u16*>(mapped), size_t(output_count)},
+            regs.num_indices, restart_enabled ? std::optional<u16>(regs.primitive_restart_index) : std::nullopt)
+        : ExpandQuadIndicesInPlace(std::span{reinterpret_cast<u32*>(mapped), size_t(output_count)},
+            regs.num_indices, restart_enabled ? std::optional<u32>(regs.primitive_restart_index) : std::nullopt);
+    stream_buffer.Commit();
+    if (count == 0) {
+        return std::nullopt;
+    }
+    ASSERT(count == output_count);
+    Core::PerfTelemetry::Increment(Core::PerfTelemetry::Counter::ExpandedQuadIndexBytes,
+                                   output_count * index_size);
+    return ExpandedQuadIndices{stream_buffer.Handle(), offset, count,
+                               index16 ? vk::IndexType::eUint16 : vk::IndexType::eUint32};
 }
 
 void BufferCache::BindIndexBuffer(
@@ -1326,6 +1378,8 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
   if (copies.empty()) {
     return VK_NULL_HANDLE;
   }
+  const Core::PerfTelemetry::ScopedGpuWaitContext upload_context{
+      Core::PerfTelemetry::GpuWaitContext::BufferUpload};
   const auto [staging, offset] = staging_buffer.Map(total_size_bytes);
   if (staging) {
     for (auto &copy : copies) {

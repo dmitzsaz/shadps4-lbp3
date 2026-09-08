@@ -1,11 +1,89 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <array>
+#include <cstring>
 #include "common/assert.h"
 #include "shader_recompiler/frontend/decode.h"
 #include "shader_recompiler/frontend/fetch_shader.h"
 
 namespace Shader::Gcn {
+
+namespace {
+
+constexpr size_t MaxCachedCodeWords = 1024;
+constexpr size_t MaxCachedAttributes = 64;
+
+class FetchShaderCache {
+public:
+    const FetchShaderData* Find(const u32* code) const {
+        for (const auto& entry : sets[SetIndex(code)].entries) {
+            if (entry.address != nullptr && entry.address == code &&
+                MatchesCode(code, entry.code)) {
+                return &entry.data;
+            }
+        }
+        return nullptr;
+    }
+
+    void Insert(const u32* code, std::span<const u32> snapshot, const FetchShaderData& data) {
+        auto& set = sets[SetIndex(code)];
+        auto it = std::ranges::find(set.entries, code, &Entry::address);
+        auto& entry = it != set.entries.end() ? *it : set.entries[set.next++ % Ways];
+        entry.address = nullptr;
+        entry.code.assign(snapshot.begin(), snapshot.end());
+        entry.data = data;
+        entry.address = code;
+    }
+
+private:
+    static constexpr size_t NumSets = 32;
+    static constexpr size_t Ways = 4;
+
+    struct Entry {
+        const u32* address{};
+        std::vector<u32> code;
+        FetchShaderData data;
+    };
+    struct Set {
+        std::array<Entry, Ways> entries;
+        size_t next{};
+    };
+
+    static size_t SetIndex(const u32* code) {
+        // Mix aligned guest pointers instead of selecting only their low bits.
+        const u64 address = reinterpret_cast<uintptr_t>(code) >> 2;
+        return ((address ^ (address >> 16)) * 0x9e3779b97f4a7c15ULL) >> 59;
+    }
+
+    static bool MatchesCode(const u32* code, std::span<const u32> snapshot) {
+        // A shader can be replaced by a shorter one and its following pages unmapped.
+        // Compare one 4 KiB region at a time, stopping at the first changed prefix;
+        // an unchanged prefix still contains the same instruction boundaries/terminator.
+        constexpr size_t ComparePageBytes = 4096;
+        auto* current = reinterpret_cast<const u8*>(code);
+        auto* saved = reinterpret_cast<const u8*>(snapshot.data());
+        size_t remaining = snapshot.size_bytes();
+        while (remaining != 0) {
+            const size_t page_remaining =
+                ComparePageBytes - (reinterpret_cast<uintptr_t>(current) % ComparePageBytes);
+            const size_t size = std::min(remaining, page_remaining);
+            if (std::memcmp(current, saved, size) != 0) {
+                return false;
+            }
+            current += size;
+            saved += size;
+            remaining -= size;
+        }
+        return true;
+    }
+
+    // At most 128 entries, each with <= 4 KiB of code and 64 attributes.
+    std::array<Set, NumSets> sets;
+};
+
+} // namespace
 
 /**
  * s_load_dwordx4 s[8:11], s[2:3], 0x00
@@ -51,8 +129,17 @@ std::optional<FetchShaderData> ParseFetchShader(const Shader::Info& info) {
     }
 
     const auto* code = GetFetchShaderCode(info, info.fetch_shader_sgpr_base);
+    // The GPU command processor and asynchronous compiler own independent caches.
+    // Only decoded instructions are reused; vertex descriptors and runtime state
+    // continue to be read by StageSpecialization for each draw.
+    thread_local FetchShaderCache cache;
+    if (const auto* data = cache.Find(code)) {
+        return *data;
+    }
+
+    std::array<u32, MaxCachedCodeWords> snapshot;
     FetchShaderData data{};
-    GcnCodeSlice code_slice(code, code + std::numeric_limits<u32>::max());
+    GcnCodeSlice code_slice(code, code + std::numeric_limits<u32>::max(), snapshot);
     GcnDecodeContext decoder;
 
     struct VsharpLoad {
@@ -67,6 +154,9 @@ std::optional<FetchShaderData> ParseFetchShader(const Shader::Info& info) {
         data.size += inst.length;
 
         if (inst.opcode == Opcode::S_SETPC_B64) {
+            if (data.size <= sizeof(snapshot) && data.attributes.size() <= MaxCachedAttributes) {
+                cache.Insert(code, std::span{snapshot}.first(data.size / sizeof(u32)), data);
+            }
             break;
         }
 

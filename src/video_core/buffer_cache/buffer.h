@@ -4,6 +4,7 @@
 #pragma once
 
 #include "common/types.h"
+#include "core/gpu_wait_telemetry.h"
 #include "core/memory.h"
 #include "video_core/amdgpu/resource.h"
 #include "video_core/renderer_vulkan/vk_common.h"
@@ -218,7 +219,8 @@ class StreamBuffer : public Buffer {
 public:
   explicit StreamBuffer(const Vulkan::Instance &instance,
                         Vulkan::Scheduler &scheduler, MemoryUsage usage,
-                        u64 size_bytes_);
+                        u64 size_bytes_,
+                        Core::PerfTelemetry::GpuWaitResource telemetry_resource_ = {});
 
   /// Reserves a region of memory from the stream buffer.
   std::pair<u8 *, u64> Map(u64 size, u64 alignment = 0, bool allow_wait = true);
@@ -245,6 +247,7 @@ public:
   }
 
 private:
+  Core::PerfTelemetry::GpuWaitResource telemetry_resource;
   struct Watch {
     u64 tick{};
     u64 upper_bound{};
@@ -265,6 +268,27 @@ private:
   std::vector<Watch> previous_watches;
   std::size_t wait_cursor{};
   u64 wait_bound{};
+};
+
+// Transient storage used by compute/transfer commands on one scheduler's queue.
+// All commands consuming a reservation must be recorded before the next Reserve().
+// No CPU mapping, deferred CPU consumer, or persistent descriptor may retain a range.
+// Unlike a host stream, reuse needs a GPU dependency rather than a host timeline wait.
+class GpuScratchBuffer {
+public:
+  GpuScratchBuffer(const Vulkan::Instance& instance, Vulkan::Scheduler& scheduler,
+                   u64 size_bytes);
+
+  std::optional<u64> Reserve(u64 size, u64 alignment = 0);
+
+  vk::Buffer Handle() const noexcept { return buffer.Handle(); }
+  u64 SizeBytes() const noexcept { return buffer.SizeBytes(); }
+
+private:
+  Vulkan::Scheduler& scheduler;
+  Buffer buffer;
+  u64 cursor{};
+  bool wrapped{};
 };
 
 } // namespace VideoCore

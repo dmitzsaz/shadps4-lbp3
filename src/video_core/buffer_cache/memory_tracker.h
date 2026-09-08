@@ -12,6 +12,8 @@
 #include "common/debug.h"
 #include "common/types.h"
 #include "core/emulator_settings.h"
+#include "core/gpu_wait_telemetry.h"
+#include "core/performance_telemetry.h"
 #include "video_core/buffer_cache/region_manager.h"
 
 namespace VideoCore {
@@ -81,7 +83,9 @@ public:
                     // in case we are racing with GPU thread trying to mark the page as GPU
                     // modified. If we need to flush the flush function is going to perform CPU
                     // state change.
-                    std::scoped_lock lk{manager->lock};
+                    Core::PerfTelemetry::ScopedFaultLock lk{
+                        manager->lock, Core::PerfTelemetry::Counter::BufferFaultLockWaits,
+                        Core::PerfTelemetry::TimeMetric::BufferFaultLockWait};
                     if (EmulatorSettings.GetReadbacksMode() != GpuReadbacksMode::Disabled &&
                         manager->template IsRegionModified<Type::GPU>(offset, size)) {
                         return true;
@@ -101,7 +105,9 @@ public:
     /// Invalidates cached GPU data without downloading it and makes CPU memory authoritative.
     void InvalidateRegion(VAddr cpu_addr, u64 size) noexcept {
         IteratePages<false>(cpu_addr, size, [](RegionManager* manager, u64 offset, size_t size) {
-            std::scoped_lock lk{manager->lock};
+            Core::PerfTelemetry::ScopedFaultLock lk{
+                manager->lock, Core::PerfTelemetry::Counter::BufferFaultLockWaits,
+                Core::PerfTelemetry::TimeMetric::BufferFaultLockWait};
             manager->template ChangeRegionState<Type::GPU, false>(manager->GetCpuAddr() + offset,
                                                                   size);
             manager->template ChangeRegionState<Type::CPU, true>(manager->GetCpuAddr() + offset,
@@ -121,7 +127,12 @@ public:
                                    manager->lock.unlock();
                                }
                            });
-        on_upload();
+        {
+            const Core::PerfTelemetry::ScopedGpuWaitContext tracker_context{
+                is_written ? Core::PerfTelemetry::GpuWaitContext::UploadTrackerLocks
+                           : Core::PerfTelemetry::GpuWaitContext::None};
+            on_upload();
+        }
         if (!is_written) {
             return;
         }

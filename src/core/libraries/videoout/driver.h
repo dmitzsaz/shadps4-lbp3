@@ -7,6 +7,7 @@
 #include "common/polyfill_thread.h"
 #include "core/libraries/videoout/video_out.h"
 
+#include <chrono>
 #include <condition_variable>
 #include <mutex>
 #include <queue>
@@ -99,6 +100,8 @@ private:
         s64 flip_arg;
         s32 index;
         bool eop;
+        std::chrono::steady_clock::time_point prepare_begin{};
+        std::chrono::steady_clock::time_point ready{};
 
         operator bool() const noexcept {
             return frame != nullptr;

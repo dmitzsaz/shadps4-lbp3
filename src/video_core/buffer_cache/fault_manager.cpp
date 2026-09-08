@@ -79,7 +79,11 @@ FaultManager::FaultManager(const Vulkan::Instance& instance, Vulkan::Scheduler& 
 
 void FaultManager::ProcessFaultBuffer() {
     if (u64 wait_tick = fault_areas[current_area]) {
-        scheduler.Wait(wait_tick);
+        scheduler.Wait(wait_tick, {.source = Core::PerfTelemetry::GpuWaitSource::FaultBufferReuse,
+                                   .resource_id = reinterpret_cast<u64>(this),
+                                   .capacity_bytes = download_buffer.SizeBytes(),
+                                   .request_bytes = PageFaultAreaSize,
+                                   .offset_bytes = current_area * PageFaultAreaSize});
         scheduler.PopPendingOperations();
     }
 

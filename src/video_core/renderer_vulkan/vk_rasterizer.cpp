@@ -246,11 +246,14 @@ bool Rasterizer::Draw(bool is_indexed, u32 index_offset) {
 
     const auto& regs = liverpool->regs;
     const u64 expanded_quad_index_count = (u64{regs.num_indices} / 4) * 6;
-    const bool expand_quad_list =
-        !is_indexed && regs.num_indices >= 4 &&
+    const bool quad_candidate =
+        regs.num_indices >= 4 &&
         regs.primitive_type == AmdGpu::PrimitiveType::QuadList &&
         regs.stage_enable.raw == AmdGpu::ShaderStageEnable::VgtStages::Vs &&
         expanded_quad_index_count <= buffer_cache.GetQuadIndexCount();
+    const auto expanded_indices = is_indexed && quad_candidate
+        ? buffer_cache.TryExpandQuadIndices(index_offset) : std::nullopt;
+    const bool expand_quad_list = quad_candidate && (!is_indexed || expanded_indices.has_value());
     const u32 expanded_index_count =
         expand_quad_list ? static_cast<u32>(expanded_quad_index_count) : 0;
     const GraphicsPipeline* pipeline = pipeline_cache.GetGraphicsPipeline(expand_quad_list);
@@ -269,7 +272,10 @@ bool Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     const auto state = BeginRendering(pipeline);
 
     buffer_cache.BindVertexBuffers(*pipeline, buffer_barriers);
-    if (is_indexed) {
+    if (expanded_indices) {
+        scheduler.CommandBuffer().bindIndexBuffer(expanded_indices->buffer, expanded_indices->offset,
+                                                  expanded_indices->type);
+    } else if (is_indexed) {
         buffer_cache.BindIndexBuffer(index_offset, buffer_barriers);
     } else if (expand_quad_list) {
         scheduler.CommandBuffer().bindIndexBuffer(buffer_cache.GetQuadIndexBuffer().Handle(), 0,
@@ -287,7 +293,10 @@ bool Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->Handle());
 
-    if (is_indexed) {
+    if (expanded_indices) {
+        cmdbuf.drawIndexed(expanded_indices->count, regs.num_instances.NumInstances(), 0,
+                           s32(vertex_offset), instance_offset);
+    } else if (is_indexed) {
         cmdbuf.drawIndexed(regs.num_indices, regs.num_instances.NumInstances(), 0,
                            s32(vertex_offset), instance_offset);
     } else if (expand_quad_list) {
@@ -298,6 +307,19 @@ bool Rasterizer::Draw(bool is_indexed, u32 index_offset) {
                     instance_offset);
     }
     Core::PerfTelemetry::Increment(Core::PerfTelemetry::Counter::DrawsEmitted);
+    if (is_indexed && regs.primitive_type == AmdGpu::PrimitiveType::QuadList) {
+        Core::PerfTelemetry::Increment(Core::PerfTelemetry::Counter::IndexedQuadDraws);
+        Core::PerfTelemetry::Increment(expanded_indices
+            ? Core::PerfTelemetry::Counter::ExpandedIndexedQuadDraws
+            : Core::PerfTelemetry::Counter::IndexedQuadFallbacks);
+    }
+    if (scheduler.IsTimingRenderPass()) {
+        const auto stages = pipeline->GetStages();
+        const auto* ps = stages[u32(Shader::LogicalStage::Fragment)];
+        scheduler.RecordTimedDraw(vs_info.pgm_hash, ps ? ps->pgm_hash : 0,
+            u64{expand_quad_list ? expanded_index_count : regs.num_indices} *
+                regs.num_instances.NumInstances());
+    }
 
     ResetBindings();
     return true;
@@ -386,6 +408,12 @@ bool Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
         }
     }
     Core::PerfTelemetry::Increment(Core::PerfTelemetry::Counter::DrawsEmitted, max_count);
+    if (scheduler.IsTimingRenderPass()) {
+        const auto stages = pipeline->GetStages();
+        const auto* vs = stages[u32(Shader::LogicalStage::Vertex)];
+        const auto* ps = stages[u32(Shader::LogicalStage::Fragment)];
+        scheduler.RecordTimedDraw(vs ? vs->pgm_hash : 0, ps ? ps->pgm_hash : 0, 0, true);
+    }
 
     ResetBindings();
     return true;
@@ -1118,6 +1146,8 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
     if (state.num_layers == std::numeric_limits<u16>::max()) {
         state.num_layers = 1;
     }
+    state.MinimizeAttachmentlessArea(
+        pipeline->GetStages()[u32(Shader::LogicalStage::Fragment)] != nullptr);
 
     return state;
 }

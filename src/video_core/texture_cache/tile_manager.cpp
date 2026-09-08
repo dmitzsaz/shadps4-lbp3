@@ -20,8 +20,7 @@
 namespace VideoCore {
 
 static u64 ScratchBufferSize(const Vulkan::Instance& instance) {
-    // Keep enough queued tile/detile traffic to avoid forcing a full GPU wait whenever a busy
-    // frame crosses a small fixed ring. Scale conservatively on lower-memory devices.
+    // Bound transient device storage. GPU barriers order reuse without waiting on the CPU.
     return std::clamp(instance.GetTotalMemoryBudget() / 32, 256_MB, 512_MB);
 }
 
@@ -31,6 +30,15 @@ struct TilingInfo {
     u32 num_mips;
     std::array<ImageInfo::MipInfo, 16> mips;
 };
+
+static Vulkan::GpuTiming::Work TimingWork(const ImageInfo& info, bool tiler) {
+    return {.kind = tiler ? Vulkan::GpuTiming::Kind::Tile : Vulkan::GpuTiming::Kind::Detile,
+            .address = info.guest_address,
+            .bytes = info.guest_size,
+            .width = info.size.width, .height = info.size.height, .depth = info.size.depth,
+            .pitch = info.pitch, .bits = info.num_bits, .tile_mode = u32(info.tile_mode),
+            .mips = info.guest_resources.levels, .layers = info.guest_resources.layers};
+}
 
 static u32 GetMacroMipMask(const ImageInfo& info, u32 num_mips) {
     if (!AmdGpu::IsMacroTiled(info.array_mode)) {
@@ -66,7 +74,7 @@ static u32 GetMacroMipMask(const ImageInfo& info, u32 num_mips) {
 TileManager::TileManager(const Vulkan::Instance& instance, Vulkan::Scheduler& scheduler,
                          StreamBuffer& stream_buffer_)
     : instance{instance}, scheduler{scheduler}, stream_buffer{stream_buffer_},
-      scratch_buffer{instance, scheduler, MemoryUsage::DeviceLocal, ScratchBufferSize(instance)} {
+      scratch_buffer{instance, scheduler, ScratchBufferSize(instance)} {
     const auto device = instance.GetDevice();
     Vulkan::SetObjectName(device, scratch_buffer.Handle(), "Tile scratch ring");
     const std::array<vk::DescriptorSetLayoutBinding, 3> bindings = {{
@@ -118,7 +126,6 @@ TileManager::~TileManager() = default;
 
 TileManager::ScratchBuffer TileManager::GetScratchBuffer(u32 size) {
     if (const auto offset = scratch_buffer.Reserve(size, instance.StorageMinAlignment())) {
-        scratch_buffer.Commit(false);
         return {scratch_buffer.Handle(), static_cast<u32>(*offset), VK_NULL_HANDLE};
     }
 
@@ -245,6 +252,7 @@ TileManager::Result TileManager::DetileImage(vk::Buffer in_buffer, u32 in_offset
     scheduler.EndRendering();
 
     const auto cmdbuf = scheduler.CommandBuffer();
+    const auto timing = scheduler.BeginGpuWork(TimingWork(info, false));
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, GetTilingPipeline(info, false));
 
     const vk::DescriptorBufferInfo tiled_buffer_info{
@@ -289,6 +297,8 @@ TileManager::Result TileManager::DetileImage(vk::Buffer in_buffer, u32 in_offset
 
     const auto dim_x = (info.guest_size / (info.num_bits / 8)) / 64;
     cmdbuf.dispatch(dim_x, 1, 1);
+    scheduler.EndGpuWork(timing);
+    // The caller must record the image upload before reserving scratch storage again.
     return {scratch.buffer, scratch.offset};
 }
 
@@ -334,6 +344,10 @@ void TileManager::TileImage(Image& in_image, std::span<vk::BufferImageCopy> buff
     for (auto& copy : buffer_copies) {
         copy.bufferOffset += scratch.offset;
     }
+    // Download already ends rendering. Do it here before the timestamp so the
+    // complete download + tiler scope is measured outside the render encoder.
+    scheduler.EndRendering();
+    const auto timing = scheduler.BeginGpuWork(TimingWork(info, true));
     in_image.Download(buffer_copies, scratch.buffer, scratch.offset, copy_size);
 
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, GetTilingPipeline(info, true));
@@ -380,6 +394,7 @@ void TileManager::TileImage(Image& in_image, std::span<vk::BufferImageCopy> buff
 
     const auto dim_x = (info.guest_size / (info.num_bits / 8)) / 64;
     cmdbuf.dispatch(dim_x, 1, 1);
+    scheduler.EndGpuWork(timing);
 }
 
 } // namespace VideoCore

@@ -8,6 +8,7 @@
 #include <thread>
 #include <queue>
 #include "common/types.h"
+#include "core/gpu_wait_telemetry.h"
 #include "video_core/renderer_vulkan/vk_common.h"
 
 namespace Vulkan {
@@ -44,7 +45,8 @@ public:
     void Refresh();
 
     /// Waits for a tick to be hit on the GPU
-    void Wait(u64 tick);
+    void Wait(u64 tick, const Core::PerfTelemetry::GpuWaitInfo& info = {},
+              std::source_location caller = std::source_location::current());
 
 protected:
     const Instance& instance;

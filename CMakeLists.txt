@@ -844,6 +844,9 @@ set(CORE src/core/aerolib/stubs.cpp
          src/core/lbp3_online.h
          src/core/performance_telemetry.cpp
          src/core/performance_telemetry.h
+         src/core/gpu_wait_telemetry.cpp
+         src/core/gpu_wait_telemetry.h
+         src/core/gpu_wait_log.h
          src/core/address_space.cpp
          src/core/address_space.h
          src/core/file_sys/devices/base_device.cpp
@@ -1110,6 +1113,8 @@ set(VIDEO_CORE src/video_core/amdgpu/cb_db_extent.h
                src/video_core/renderer_vulkan/vk_resource_pool.h
                src/video_core/renderer_vulkan/vk_scheduler.cpp
                src/video_core/renderer_vulkan/vk_scheduler.h
+               src/video_core/renderer_vulkan/vk_gpu_timing.cpp
+               src/video_core/renderer_vulkan/vk_gpu_timing.h
                src/video_core/renderer_vulkan/vk_shader_hle.cpp
                src/video_core/renderer_vulkan/vk_shader_hle.h
                src/video_core/renderer_vulkan/vk_shader_util.cpp
@@ -1185,6 +1190,8 @@ set(IMGUI src/imgui/imgui_config.h
 )
 
 set(INPUT src/input/controller.cpp
+          src/input/input_movie.cpp
+          src/input/input_movie.h
           src/input/controller.h
           src/input/input_handler.cpp
           src/input/input_handler.h

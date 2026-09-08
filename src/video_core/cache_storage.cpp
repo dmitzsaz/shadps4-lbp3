@@ -371,6 +371,24 @@ void DataBase::ForEachBlob(BlobType type, const std::function<void(std::vector<u
     }
 }
 
+size_t DataBase::CountBlobs(BlobType type) const {
+    const auto& ext = GetBlobFileExtension(type);
+    size_t count{};
+    if (cache_uses_archive) {
+        const auto num_files = mz_zip_reader_get_num_files(&zip_ar);
+        for (int index = 0; index < num_files; ++index) {
+            std::array<char, MZ_ZIP_MAX_ARCHIVE_FILENAME_SIZE> file_name{};
+            mz_zip_reader_get_filename(&zip_ar, index, file_name.data(), file_name.size());
+            count += std::string_view{file_name.data()}.ends_with(ext);
+        }
+    } else {
+        for (const auto& entry : std::filesystem::directory_iterator{cache_path}) {
+            count += entry.path().extension().string().ends_with(ext);
+        }
+    }
+    return count;
+}
+
 void DataBase::FinishPreload() {
     if (cache_uses_archive) {
         mz_zip_writer_init_from_reader(&zip_ar, cache_path.string().c_str());

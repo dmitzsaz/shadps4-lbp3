@@ -1,0 +1,47 @@
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint Vertex %main "main" %vertex %instance %position %output
+OpDecorate %vertex BuiltIn VertexIndex
+OpDecorate %instance BuiltIn InstanceIndex
+OpDecorate %position BuiltIn Position
+OpDecorate %array ArrayStride 4
+OpMemberDecorate %block 0 Offset 0
+OpDecorate %block Block
+OpDecorate %output DescriptorSet 0
+OpDecorate %output Binding 0
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%uint = OpTypeInt 32 0
+%int = OpTypeInt 32 1
+%float = OpTypeFloat 32
+%vec4 = OpTypeVector %float 4
+%zero = OpConstant %uint 0
+%three = OpConstant %uint 3
+%value = OpConstant %uint 305397760
+%fzero = OpConstant %float 0
+%fone = OpConstant %float 1
+%pos = OpConstantComposite %vec4 %fzero %fzero %fzero %fone
+%array = OpTypeRuntimeArray %uint
+%block = OpTypeStruct %array
+%ptr_block = OpTypePointer StorageBuffer %block
+%ptr_uint = OpTypePointer StorageBuffer %uint
+%ptr_int = OpTypePointer Input %int
+%ptr_pos = OpTypePointer Output %vec4
+%vertex = OpVariable %ptr_int Input
+%instance = OpVariable %ptr_int Input
+%position = OpVariable %ptr_pos Output
+%output = OpVariable %ptr_block StorageBuffer
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%v_i = OpLoad %int %vertex
+%i_i = OpLoad %int %instance
+%v = OpBitcast %uint %v_i
+%i = OpBitcast %uint %i_i
+%base = OpIMul %uint %i %three
+%index = OpIAdd %uint %base %v
+%result = OpIAdd %uint %value %index
+%dst = OpAccessChain %ptr_uint %output %zero %index
+OpStore %dst %result
+OpStore %position %pos
+OpReturn
+OpFunctionEnd

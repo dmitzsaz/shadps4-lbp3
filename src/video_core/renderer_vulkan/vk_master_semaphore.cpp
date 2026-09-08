@@ -45,7 +45,8 @@ void MasterSemaphore::Refresh() {
                                              std::memory_order_relaxed));
 }
 
-void MasterSemaphore::Wait(u64 tick) {
+void MasterSemaphore::Wait(u64 tick, const Core::PerfTelemetry::GpuWaitInfo& info,
+                            std::source_location caller) {
     // No need to wait if the GPU is ahead of the tick
     if (IsFree(tick)) {
         return;
@@ -56,8 +57,8 @@ void MasterSemaphore::Wait(u64 tick) {
         return;
     }
 
-    Core::PerfTelemetry::Increment(Core::PerfTelemetry::Counter::GpuWaits);
-    Core::PerfTelemetry::ScopedTimer telemetry_timer{Core::PerfTelemetry::TimeMetric::GpuWait};
+    Core::PerfTelemetry::ScopedGpuWait telemetry_wait{
+        reinterpret_cast<u64>(this), tick, KnownGpuTick(), CurrentTick(), info, caller};
 
     // If none of the above is hit, fallback to a regular wait
     const vk::SemaphoreWaitInfo wait_info = {

@@ -10,6 +10,8 @@
 #include "core/user_settings.h"
 #include "imgui/renderer/imgui_core.h"
 #include "input/controller.h"
+#include "input/input_movie.h"
+#include "core/libraries/kernel/time.h"
 #include "pad.h"
 
 #include <algorithm>
@@ -41,6 +43,14 @@ static bool g_initialized = false;
 static u64 pad_handle_counter = 1;
 static std::unordered_map<HandleKey, s32, HandleKeyHash> pad_handle_map{};
 static std::unordered_map<s32, GameController*> handle_to_controller_map{};
+
+static u32 MovieSlot(const GameController& controller) {
+    const auto& controllers = *Common::Singleton<GameControllers>::Instance();
+    for (u32 slot = 0; slot < 5; ++slot) {
+        if (controllers[slot] == &controller) return slot;
+    }
+    return 5;
+}
 
 int PS4_SYSV_ABI scePadClose(s32 handle) {
     LOG_WARNING(Lib_Pad, "called, handle: {}", handle);
@@ -152,6 +162,10 @@ int PS4_SYSV_ABI scePadGetControllerInformation(s32 handle, OrbisPadControllerIn
     pInfo->connectedCount = static_cast<u8>(std::clamp(connected_count, 0, 0xff));
     pInfo->deviceClass = OrbisPadDeviceClass::Standard;
     pInfo->connected = connected;
+    if (Input::Movie::Replaying()) {
+        Input::Movie::Connection(MovieSlot(*it->second), pInfo->connected, pInfo->connectedCount);
+        connected = pInfo->connected;
+    }
     if (connected) {
         pInfo->deviceClass = EmulatorSettings.IsUsingSpecialPad()
                                  ? (OrbisPadDeviceClass)EmulatorSettings.GetSpecialPadClass()
@@ -499,10 +513,17 @@ int PS4_SYSV_ABI scePadRead(s32 handle, OrbisPadData* pData, s32 num) {
     if (it == handle_to_controller_map.end()) {
         return ORBIS_PAD_ERROR_INVALID_HANDLE;
     }
+    if (!pData || num < 1 || num > 64) return ORBIS_PAD_ERROR_INVALID_ARG;
     auto& controller = *it->second;
+    const u32 slot = Input::Movie::Active() ? MovieSlot(controller) : 5;
+    if (Input::Movie::Replaying()) {
+        return *Input::Movie::Read(slot, pData, num, false, Libraries::Kernel::sceKernelGetProcessTime());
+    }
     int ret_num = controller.ReadStates(states.data(), num, &connected, &connected_count);
-    return ProcessStates(handle, pData, controller, states.data(), ret_num, connected,
-                         connected_count);
+    const int result = ProcessStates(handle, pData, controller, states.data(), ret_num, connected,
+                                      connected_count);
+    if (Input::Movie::Active()) Input::Movie::Record(slot, {pData, size_t(result)});
+    return result;
 }
 
 int PS4_SYSV_ABI scePadReadBlasterForTracker() {
@@ -531,12 +552,19 @@ int PS4_SYSV_ABI scePadReadState(s32 handle, OrbisPadData* pData) {
     if (it == handle_to_controller_map.end()) {
         return ORBIS_PAD_ERROR_INVALID_HANDLE;
     }
+    if (!pData) return ORBIS_PAD_ERROR_INVALID_ARG;
     auto& controller = *it->second;
+    const u32 slot = Input::Movie::Active() ? MovieSlot(controller) : 5;
+    if (Input::Movie::Replaying()) {
+        Input::Movie::Read(slot, pData, 1, true, Libraries::Kernel::sceKernelGetProcessTime());
+        return ORBIS_OK;
+    }
     int connected_count = 0;
     bool connected = false;
     Input::State state;
     controller.ReadState(&state, &connected, &connected_count);
     ProcessStates(handle, pData, controller, &state, 1, connected, connected_count);
+    if (Input::Movie::Active()) Input::Movie::Record(slot, {pData, 1});
     return ORBIS_OK;
 }
 

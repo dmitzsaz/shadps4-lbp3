@@ -6,6 +6,7 @@
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "core/emulator_settings.h"
+#include "core/performance_telemetry.h"
 #include "imgui/renderer/imgui_core.h"
 #include "sdl_window.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -103,6 +104,8 @@ void Swapchain::SetHDR(bool hdr) {
 }
 
 bool Swapchain::AcquireNextImage() {
+    Core::PerfTelemetry::ScopedTimer telemetry_timer{
+        Core::PerfTelemetry::TimeMetric::SwapchainAcquireCpu};
     vk::Device device = instance.GetDevice();
     vk::Result result =
         device.acquireNextImageKHR(swapchain, std::numeric_limits<u64>::max(),
@@ -128,7 +131,8 @@ bool Swapchain::AcquireNextImage() {
 }
 
 bool Swapchain::Present() {
-
+    Core::PerfTelemetry::ScopedTimer telemetry_timer{
+        Core::PerfTelemetry::TimeMetric::SwapchainPresentCpu};
     const vk::PresentInfoKHR present_info = {
         .waitSemaphoreCount = 1,
         .pWaitSemaphores = &present_ready[image_index],

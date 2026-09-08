@@ -16,6 +16,7 @@
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/texture_cache/host_compatibility.h"
 #include "video_core/texture_cache/texture_cache.h"
+#include "core/performance_telemetry.h"
 #include "video_core/texture_cache/tile_manager.h"
 
 namespace VideoCore {
@@ -133,6 +134,8 @@ void TextureCache::DownloadImageMemory(ImageId image_id, bool sync, bool gc_reti
     const VAddr image_addr = image.info.guest_address;
     const u32 image_size = image.info.guest_size;
     const u64 image_uid = image.image_uid;
+    const Core::PerfTelemetry::ScopedGpuWaitContext download_context{
+        Core::PerfTelemetry::GpuWaitContext::ImageDownload, image_addr, image_size};
     boost::container::small_vector<vk::BufferImageCopy, 8> buffer_copies;
     for (u32 mip = 0; mip < image.info.guest_resources.levels; ++mip) {
         const auto& mip_info = image.info.guest_mips_layout[mip];
@@ -278,7 +281,11 @@ void TextureCache::MarkAsMaybeDirty(ImageId image_id, Image& image) {
 }
 
 void TextureCache::InvalidateMemory(VAddr addr, size_t size) {
-    std::scoped_lock lock{mutex};
+    Core::PerfTelemetry::ScopedFaultLock lock{
+        mutex, Core::PerfTelemetry::Counter::TextureFaultLockWaits,
+        Core::PerfTelemetry::TimeMetric::TextureFaultLockWait};
+    const Core::PerfTelemetry::ScopedGpuWaitContext lock_context{
+        Core::PerfTelemetry::GpuWaitContext::TextureCacheLock};
     const auto pages_start = PageManager::GetPageAddr(addr);
     const auto pages_end = PageManager::GetNextPageAddr(addr + size - 1);
     ForEachImageInRegion(pages_start, pages_end - pages_start, [&](ImageId image_id, Image& image) {
@@ -316,6 +323,8 @@ void TextureCache::InvalidateMemoryFromGPU(VAddr address, size_t max_size) {
         return;
     }
     std::scoped_lock lock{mutex};
+    const Core::PerfTelemetry::ScopedGpuWaitContext lock_context{
+        Core::PerfTelemetry::GpuWaitContext::TextureCacheLock};
     ForEachImageInRegion(address, max_size, [&](ImageId image_id, Image& image) {
         image.InvalidateTexelBufferSync();
         // Page-table candidates can merely share an edge page. Only a real byte-range overlap
@@ -336,12 +345,16 @@ void TextureCache::InvalidateTexelBufferSync(VAddr address, size_t size) {
         return;
     }
     std::scoped_lock lock{mutex};
+    const Core::PerfTelemetry::ScopedGpuWaitContext lock_context{
+        Core::PerfTelemetry::GpuWaitContext::TextureCacheLock};
     ForEachImageInRegion(address, size,
                          [](ImageId, Image& image) { image.InvalidateTexelBufferSync(); });
 }
 
 void TextureCache::UnmapMemory(VAddr cpu_addr, size_t size) {
     std::scoped_lock lk{mutex};
+    const Core::PerfTelemetry::ScopedGpuWaitContext lock_context{
+        Core::PerfTelemetry::GpuWaitContext::TextureCacheLock};
 
     ImageIds deleted_images;
     ForEachImageInRegion(cpu_addr, size, [&](ImageId id, Image&) { deleted_images.push_back(id); });
@@ -805,6 +818,8 @@ void TextureCache::SynchronizeDimensionalAlias(ImageId image_id) {
 
 void TextureCache::MarkDimensionalAliasesStale(ImageId authoritative_id) {
     std::scoped_lock lock{mutex};
+    const Core::PerfTelemetry::ScopedGpuWaitContext lock_context{
+        Core::PerfTelemetry::GpuWaitContext::TextureCacheLock};
     auto& authoritative = slot_images[authoritative_id];
     authoritative.flags &= ~ImageFlagBits::DimensionalAliasStale;
 
@@ -826,6 +841,8 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     ASSERT(info.guest_address != 0);
 
     std::scoped_lock lock{mutex};
+    const Core::PerfTelemetry::ScopedGpuWaitContext lock_context{
+        Core::PerfTelemetry::GpuWaitContext::TextureCacheLock};
     ImageIds image_ids;
     ForEachImageInRegion(info.guest_address, info.guest_size,
                          [&](ImageId image_id, Image& image) { image_ids.push_back(image_id); });
@@ -1106,6 +1123,9 @@ void TextureCache::RefreshImage(Image& image) {
     if (False(image.flags & ImageFlagBits::Dirty) || image.info.num_samples > 1) {
         return;
     }
+    const Core::PerfTelemetry::ScopedGpuWaitContext refresh_context{
+        Core::PerfTelemetry::GpuWaitContext::ImageRefresh, image.info.guest_address,
+        image.info.guest_size};
 
     RENDERER_TRACE;
     TRACE_HINT(fmt::format("{:x}:{:x}", image.info.guest_address, image.info.guest_size));
@@ -1368,6 +1388,8 @@ void TextureCache::GarbageCollectImages() {
         return;
     }
     std::scoped_lock lock{mutex};
+    const Core::PerfTelemetry::ScopedGpuWaitContext lock_context{
+        Core::PerfTelemetry::GpuWaitContext::TextureCacheLock};
     bool pressured = false;
     bool aggressive = false;
     u64 ticks_to_destroy = 0;

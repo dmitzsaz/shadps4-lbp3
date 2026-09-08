@@ -19,6 +19,7 @@
 #include "core/libraries/libs.h"
 #include "core/libraries/videoout/video_out.h"
 #include "core/memory.h"
+#include "core/performance_telemetry.h"
 #include "core/platform.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/amdgpu/pm4_cmds.h"
@@ -113,6 +114,8 @@ static void ResetSubmissionLock(Platform::InterruptId irq) {
 
 static void WaitGpuIdle() {
     HLE_TRACE;
+    Core::PerfTelemetry::ScopedTimer telemetry_timer{
+        Core::PerfTelemetry::TimeMetric::GnmSubmitWait};
     std::unique_lock lock{m_submission};
     cv_lock.wait(lock, [] { return submission_lock == 0; });
 }

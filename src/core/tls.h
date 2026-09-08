@@ -24,6 +24,18 @@ union DtvEntry {
     u8* pointer;
 };
 
+// A DTV belongs to the current guest thread. Module loading only appends slots;
+// existing TLS blocks remain alive until that thread exits (unloading is unsupported).
+// A stale generation, new slot or unallocated block must use the linker's locked path.
+inline u8* TryGetTlsAddress(const DtvEntry* dtv, u32 generation, u64 module_index,
+                            u64 offset) noexcept {
+    if (dtv[0].counter != generation || module_index == 0 || module_index > dtv[1].counter) {
+        return nullptr;
+    }
+    u8* address = dtv[module_index + 1].pointer;
+    return address ? address + offset : nullptr;
+}
+
 struct Tcb {
     Tcb* tcb_self;
     DtvEntry* tcb_dtv;

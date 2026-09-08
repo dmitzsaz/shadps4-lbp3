@@ -328,3 +328,24 @@ gtest_discover_tests(shadps4_http_test
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
     DISCOVERY_TIMEOUT 60
 )
+
+# Standalone fetch parser/cache regression; requires no Vulkan device or game.
+add_executable(shadps4_fetch_shader_cache_test
+    gcn/fetch_shader_cache.cpp
+    ${CMAKE_SOURCE_DIR}/src/shader_recompiler/frontend/fetch_shader.cpp
+    ${CMAKE_SOURCE_DIR}/src/shader_recompiler/frontend/decode.cpp
+    ${CMAKE_SOURCE_DIR}/src/shader_recompiler/frontend/format.cpp
+)
+target_include_directories(shadps4_fetch_shader_cache_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_compile_features(shadps4_fetch_shader_cache_test PRIVATE cxx_std_23)
+target_link_libraries(shadps4_fetch_shader_cache_test PRIVATE
+    fmt::fmt spdlog::spdlog magic_enum::magic_enum Boost::headers Vulkan::Headers half::half
+)
+add_test(NAME fetch_shader_cache COMMAND shadps4_fetch_shader_cache_test)
+
+add_executable(shadps4_tls_fast_path_test tls_fast_path.cpp)
+find_package(Threads REQUIRED)
+target_include_directories(shadps4_tls_fast_path_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_compile_features(shadps4_tls_fast_path_test PRIVATE cxx_std_23)
+target_link_libraries(shadps4_tls_fast_path_test PRIVATE Threads::Threads)
+add_test(NAME tls_fast_path COMMAND shadps4_tls_fast_path_test)

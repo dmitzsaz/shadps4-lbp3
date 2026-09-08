@@ -13,6 +13,7 @@
 
 #include "common/lru_cache.h"
 #include "common/slot_vector.h"
+#include "core/gpu_wait_telemetry.h"
 #include "shader_recompiler/resource.h"
 #include "video_core/multi_level_page_table.h"
 #include "video_core/texture_cache/blit_helper.h"
@@ -117,6 +118,8 @@ public:
     /// Updates image contents if it was modified by CPU.
     void UpdateImage(ImageId image_id) {
         std::scoped_lock lock{mutex};
+        const Core::PerfTelemetry::ScopedGpuWaitContext lock_context{
+            Core::PerfTelemetry::GpuWaitContext::TextureCacheLock};
         Image& image = slot_images[image_id];
         TrackImage(image_id);
         TouchImage(image);

@@ -5,6 +5,7 @@
 #include "common/io_file.h"
 #include "common/path_util.h"
 #include "common/serdes.h"
+#include "common/scope_exit.h"
 #include "core/emulator_settings.h"
 #include "shader_recompiler/frontend/fetch_shader.h"
 #include "shader_recompiler/info.h"
@@ -14,6 +15,12 @@
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 
 #include <type_traits>
+#include <chrono>
+
+#ifdef __APPLE__
+#include "sdl_window.h"
+extern Frontend::WindowSDL* g_window;
+#endif
 
 namespace Serialization {
 /* You should increment versions below once corresponding serialization scheme is changed. */
@@ -513,9 +520,31 @@ void PipelineCache::WarmUp() {
 
     u32 num_pipelines{};
     u32 num_total_pipelines{};
+    const auto preload_total = Storage::DataBase::Instance().CountBlobs(Storage::BlobType::PipelineKey);
+    const auto preload_start = std::chrono::steady_clock::now();
+#ifdef __APPLE__
+    if (g_window && preload_total) {
+        Frontend::ShowGraphicsPreparation(g_window->GetSDLWindow(), 0, preload_total);
+    }
+    SCOPE_EXIT {
+        if (g_window && preload_total) {
+            Frontend::HideGraphicsPreparation(g_window->GetSDLWindow());
+        }
+    };
+    auto last_progress = preload_start;
+#endif
+    LOG_INFO(Render, "Preparing {} cached graphics/compute pipelines", preload_total);
 
     Storage::DataBase::Instance().ForEachBlob(
         Storage::BlobType::PipelineKey, [&](std::vector<u8>&& data) {
+#ifdef __APPLE__
+            const auto now = std::chrono::steady_clock::now();
+            if (g_window && now - last_progress >= std::chrono::milliseconds{250}) {
+                Frontend::ShowGraphicsPreparation(g_window->GetSDLWindow(), num_total_pipelines,
+                                                 preload_total);
+                last_progress = now;
+            }
+#endif
             ++num_total_pipelines;
 
             Serialization::Archive ar{std::move(data)};
@@ -542,7 +571,8 @@ void PipelineCache::WarmUp() {
             }
         });
 
-    LOG_INFO(Render, "Preloaded {} pipelines", num_pipelines);
+    LOG_INFO(Render, "Preloaded {} pipelines in {:.1f} seconds", num_pipelines,
+             std::chrono::duration<double>(std::chrono::steady_clock::now() - preload_start).count());
     if (num_total_pipelines > num_pipelines) {
         LOG_WARNING(Render, "{} stale pipelines were found. Consider re-generating the cache",
                     num_total_pipelines - num_pipelines);

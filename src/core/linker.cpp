@@ -435,17 +435,24 @@ bool Linker::Resolve(const std::string& name, Loader::SymbolType sym_type, Modul
 }
 
 void* Linker::TlsGetAddr(u64 module_index, u64 offset) {
+    // The common case only reads this thread's DTV and a published generation.
+    // Do not serialize all guest workers on the global module mutex for that lookup.
+    DtvEntry* dtv_table = GetTcbBase()->tcb_dtv;
+    if (u8* address = TryGetTlsAddress(dtv_table, GenerationCounter(), module_index, offset)) {
+        return address;
+    }
+
     std::scoped_lock lk{mutex};
 
-    DtvEntry* dtv_table = GetTcbBase()->tcb_dtv;
-    if (dtv_table[0].counter != dtv_generation_counter) {
+    const u32 generation = GenerationCounter();
+    if (dtv_table[0].counter != generation) {
         // Generation counter changed, a dynamic module was either loaded or unloaded.
         const u32 old_num_dtvs = dtv_table[1].counter;
         ASSERT_MSG(max_tls_index > old_num_dtvs, "Module unloading unsupported");
         // Module was loaded, increase DTV table size.
         DtvEntry* new_dtv_table = new DtvEntry[max_tls_index + 2]{};
         std::memcpy(new_dtv_table + 2, dtv_table + 2, old_num_dtvs * sizeof(DtvEntry));
-        new_dtv_table[0].counter = dtv_generation_counter;
+        new_dtv_table[0].counter = generation;
         new_dtv_table[1].counter = max_tls_index;
         delete[] dtv_table;
 

@@ -97,4 +97,10 @@ private:
 void SetWindowIcon(SDL_Window* window, const std::vector<u8>& png);
 void SetDefaultWindowIcon(SDL_Window* window);
 
+#ifdef __APPLE__
+// Native overlay: Vulkan presentation is not available while its pipelines are loading.
+void ShowGraphicsPreparation(SDL_Window* window, size_t completed, size_t total);
+void HideGraphicsPreparation(SDL_Window* window);
+#endif
+
 } // namespace Frontend

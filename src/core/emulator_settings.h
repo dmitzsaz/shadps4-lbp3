@@ -8,6 +8,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -523,6 +524,8 @@ public:
 
     std::filesystem::path GetHomeDir();
     void SetHomeDir(const std::filesystem::path& dir);
+    // Session-only home for controller replays; never serialized to config.json.
+    void SetRuntimeHomeDir(const std::filesystem::path& dir) { m_runtime_home = dir; }
     std::filesystem::path GetSysModulesDir();
     void SetSysModulesDir(const std::filesystem::path& dir);
     std::filesystem::path GetFontsDir();
@@ -532,6 +535,7 @@ public:
 
 private:
     GeneralSettings m_general{};
+    std::optional<std::filesystem::path> m_runtime_home;
     LogSettings m_log{};
     DebugSettings m_debug{};
     InputSettings m_input{};

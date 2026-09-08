@@ -5,6 +5,7 @@
 
 #include <condition_variable>
 
+#include "common/assert.h"
 #include "core/libraries/videoout/buffer.h"
 #include "imgui/imgui_texture.h"
 #include "video_core/renderer_vulkan/host_passes/fsr_pass.h"
@@ -37,6 +38,15 @@ struct Frame {
     u8 id{};
 
     ImTextureID imgui_texture;
+
+    // Optional redraws must not block the thread that delivers new guest flips.
+    [[nodiscard]] bool IsPresentComplete(vk::Device device) const {
+        const auto result = device.getFenceStatus(present_done);
+        ASSERT_MSG(result == vk::Result::eSuccess || result == vk::Result::eNotReady,
+                   "Unexpected fence status while checking frame reuse: {}",
+                   vk::to_string(result));
+        return result == vk::Result::eSuccess;
+    }
 };
 
 enum SchedulerType {
@@ -128,7 +138,7 @@ private:
     vk::UniqueCommandPool command_pool;
     std::vector<Frame> present_frames;
     std::queue<Frame*> free_queue;
-    Frame* last_submit_frame;
+    Frame* last_submit_frame{};
     std::mutex free_mutex;
     std::condition_variable free_cv;
     std::condition_variable_any frame_cv;

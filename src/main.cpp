@@ -12,6 +12,7 @@
 #include <vector>
 #include <CLI/CLI.hpp>
 #include <SDL3/SDL_messagebox.h>
+#include <SDL3/SDL_events.h>
 
 #include "common/arch.h"
 #include "common/key_manager.h"
@@ -27,6 +28,8 @@
 #include "core/performance_telemetry.h"
 #include "core/user_settings.h"
 #include "emulator.h"
+#include "input/input_movie.h"
+#include "video_core/renderdoc.h"
 #include "imgui/big_picture/big_picture.h"
 
 #ifdef _WIN32
@@ -108,6 +111,7 @@ int main(int argc, char* argv[]) {
     bool configGlobal = false;
     bool bigPicture = false;
     bool perfTelemetry = false;
+    std::optional<std::string> perfOutput;
     bool lbp3Online = false;
 
     std::optional<std::filesystem::path> addGameFolder;
@@ -139,6 +143,9 @@ int main(int argc, char* argv[]) {
     app.add_flag("--log-append", Common::Log::g_should_append);
     app.add_flag("--perf-telemetry", perfTelemetry,
                  "Record detailed per-frame performance telemetry CSV files");
+    app.add_option("--perf-output", perfOutput,
+                   "Existing directory for this session's performance telemetry")
+        ->check(CLI::ExistingDirectory);
     app.add_flag("--lbp3-online", lbp3Online,
                  "Enable the local LBP3 helper backend and P2P transport");
     app.add_option("--lbp3-patch-bubbles", lbp3PatchBubblesStr,
@@ -180,6 +187,9 @@ int main(int argc, char* argv[]) {
     }
 
     Core::PerfTelemetry::SetStartRequested(perfTelemetry);
+    if (perfOutput) {
+        Core::PerfTelemetry::SetOutputDirectory(*perfOutput);
+    }
 
     if (waitPid)
         Core::Debugger::WaitForPid(*waitPid);
@@ -226,6 +236,41 @@ int main(int argc, char* argv[]) {
     std::shared_ptr<EmulatorSettingsImpl> emu_settings = std::make_shared<EmulatorSettingsImpl>();
     EmulatorSettingsImpl::SetInstance(emu_settings);
     emu_settings->Load();
+
+    const auto input_path = [](const char* name) -> std::filesystem::path {
+        const char* value = std::getenv(name);
+        return value ? std::filesystem::path{value} : std::filesystem::path{};
+    };
+    const auto input_record = input_path("SHADPS4_INPUT_RECORD");
+    const auto input_replay = input_path("SHADPS4_INPUT_REPLAY");
+    const auto input_report = input_path("SHADPS4_INPUT_REPORT");
+    const auto replay_home = input_path("SHADPS4_REPLAY_HOME");
+    const auto input_screenshots = input_path("SHADPS4_INPUT_SCREENSHOTS");
+    if ((!input_record.empty() || !input_replay.empty()) && !input_screenshots.empty()) {
+        std::filesystem::create_directories(input_screenshots);
+        Common::FS::SetUserPath(Common::FS::PathType::ScreenshotsDir, input_screenshots);
+    }
+    if (!input_replay.empty()) {
+        // Replays write only to a fresh working copy, never to the live profile.
+        if (replay_home.empty() || !std::filesystem::is_directory(replay_home) ||
+            std::filesystem::equivalent(replay_home, EmulatorSettings.GetHomeDir())) {
+            std::cerr << "Controller replay requires a separate existing SHADPS4_REPLAY_HOME\n";
+            return 1;
+        }
+        EmulatorSettings.SetRuntimeHomeDir(replay_home);
+    } else if (!replay_home.empty()) {
+        std::cerr << "SHADPS4_REPLAY_HOME requires an input replay\n";
+        return 1;
+    }
+    std::string input_error;
+    if (!Input::Movie::Configure(input_record, input_replay, input_report, [] {
+            SDL_Event event{};
+            event.type = SDL_EVENT_QUIT;
+            SDL_PushEvent(&event);
+        }, [] { VideoCore::RequestScreenshot(VideoCore::ScreenshotRequest::GameOnly); }, input_error)) {
+        std::cerr << input_error << '\n';
+        return 1;
+    }
 
     // Configure logger appropriately
     Common::Log::g_should_append |= EmulatorSettings.IsLogAppend();

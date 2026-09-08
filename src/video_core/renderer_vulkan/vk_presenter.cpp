@@ -498,7 +498,8 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
     : window{window_}, liverpool{liverpool_},
       instance{window, EmulatorSettings.GetGpuId(), EmulatorSettings.IsVkValidationEnabled(),
                EmulatorSettings.IsVkCrashDiagnosticEnabled()},
-      draw_scheduler{instance}, present_scheduler{instance}, flip_scheduler{instance},
+      draw_scheduler{instance, "draw"}, present_scheduler{instance, "present"},
+      flip_scheduler{instance, "cpu_flip"},
       swapchain{instance, window},
       rasterizer{std::make_unique<Rasterizer>(instance, draw_scheduler, liverpool)},
       texture_cache{rasterizer->GetTextureCache()} {
@@ -624,23 +625,23 @@ void Presenter::RecreateFrame(Frame* frame, u32 width, u32 height) {
 }
 
 Frame* Presenter::PrepareLastFrame() {
+    Core::PerfTelemetry::ScopedTimer telemetry_timer{
+        Core::PerfTelemetry::TimeMetric::ReusePrepareCpu};
     if (last_submit_frame == nullptr) {
         return nullptr;
     }
 
     Frame* frame = last_submit_frame;
 
-    while (true) {
-        vk::Result result = instance.GetDevice().waitForFences(frame->present_done, false,
-                                                               std::numeric_limits<u64>::max());
-        if (result == vk::Result::eSuccess) {
-            break;
+    {
+        Core::PerfTelemetry::ScopedTimer fence_timer{
+            Core::PerfTelemetry::TimeMetric::ReuseFenceWait};
+        if (!frame->IsPresentComplete(instance.GetDevice())) {
+            // The previous image is already scheduled for display. Leave it alone
+            // until complete, so a new guest frame can be handled on the next tick.
+            Core::PerfTelemetry::Increment(Core::PerfTelemetry::Counter::ReuseSkippedBusy);
+            return nullptr;
         }
-        if (result == vk::Result::eTimeout) {
-            continue;
-        }
-        ASSERT_MSG(result != vk::Result::eErrorDeviceLost,
-                   "Device lost during waiting for a frame");
     }
 
     auto& scheduler = flip_scheduler;
@@ -862,6 +863,9 @@ Frame* Presenter::PrepareBlankFrame(bool present_thread) {
 
 void Presenter::Present(Frame* frame, bool is_reusing_frame) {
     Core::PerfTelemetry::Increment(Core::PerfTelemetry::Counter::PresentCalls);
+    if (is_reusing_frame) {
+        Core::PerfTelemetry::Increment(Core::PerfTelemetry::Counter::ReusedPresents);
+    }
     Core::PerfTelemetry::ScopedTimer telemetry_timer{Core::PerfTelemetry::TimeMetric::PresentCpu};
     // Free the frame for reuse
     const auto free_frame = [&] {

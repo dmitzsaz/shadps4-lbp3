@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "core/performance_telemetry.h"
+#include "core/gpu_wait_log.h"
 
 #include <algorithm>
 #include <array>
@@ -20,15 +21,16 @@
 
 #ifndef _WIN32
 #include <sys/resource.h>
+#include <unistd.h>
 #endif
 
 #ifdef __APPLE__
 #include <dlfcn.h>
+#include <mach-o/dyld.h>
 #include <mach/mach.h>
 #include <mach/mach_time.h>
 #include <mach/thread_info.h>
 #include <mach/thread_status.h>
-#include <mach-o/dyld.h>
 #include <pthread.h>
 #endif
 
@@ -47,6 +49,7 @@ using Clock = std::chrono::steady_clock;
 constexpr size_t CounterCount = static_cast<size_t>(Counter::Count);
 constexpr size_t TimeMetricCount = static_cast<size_t>(TimeMetric::Count);
 std::atomic_bool start_requested{};
+std::filesystem::path output_directory;
 
 struct ProcessSnapshot {
     u64 cpu_ns{};
@@ -67,8 +70,8 @@ struct ProcessSnapshot {
         mach_task_basic_info_data_t task_info_data{};
         mach_msg_type_number_t task_info_count = MACH_TASK_BASIC_INFO_COUNT;
         if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO,
-                      reinterpret_cast<task_info_t>(&task_info_data), &task_info_count) ==
-            KERN_SUCCESS) {
+                      reinterpret_cast<task_info_t>(&task_info_data),
+                      &task_info_count) == KERN_SUCCESS) {
             result.rss_bytes = task_info_data.resident_size;
         }
 #else
@@ -114,8 +117,8 @@ struct ProcessSnapshot {
     localtime_r(&now_time, &local_tm);
 #endif
     std::ostringstream out;
-    out << std::put_time(&local_tm, "%Y%m%d_%H%M%S") << '_' << std::setw(3)
-        << std::setfill('0') << millis;
+    out << std::put_time(&local_tm, "%Y%m%d_%H%M%S") << '_' << std::setw(3) << std::setfill('0')
+        << millis;
     return out.str();
 }
 
@@ -153,11 +156,12 @@ public:
         }
 
         const auto telemetry_dir =
-            Common::FS::GetUserPath(Common::FS::PathType::LogDir) / "telemetry";
+            output_directory.empty()
+                ? Common::FS::GetUserPath(Common::FS::PathType::LogDir) / "telemetry"
+                : output_directory;
         std::filesystem::create_directories(telemetry_dir);
-        const auto stem = telemetry_dir /
-                          (std::string{Common::ElfInfo::Instance().GameSerial()} + '_' +
-                           MakeTimestamp());
+        const auto stem = telemetry_dir / (std::string{Common::ElfInfo::Instance().GameSerial()} +
+                                           '_' + MakeTimestamp());
         frame_path = stem.string() + "_frames.csv";
         sample_path = stem.string() + "_samples.csv";
         thread_path = stem.string() + "_threads.csv";
@@ -167,8 +171,7 @@ public:
         samples.open(sample_path, std::ios::out | std::ios::trunc);
         threads.open(thread_path, std::ios::out | std::ios::trunc);
         metadata.open(meta_path, std::ios::out | std::ios::trunc);
-        if (!frames.is_open() || !samples.is_open() || !threads.is_open() ||
-            !metadata.is_open()) {
+        if (!frames.is_open() || !samples.is_open() || !threads.is_open() || !metadata.is_open()) {
             LOG_ERROR(Core, "Could not open performance telemetry files in {}",
                       telemetry_dir.string());
             return;
@@ -191,11 +194,33 @@ public:
                   "direct_fault_submits,direct_fault_finishes,direct_visibility_barriers,"
                   "ordered_guest_releases,guest_fence_submits,lbp3_ng_cpu_hle_dispatches,"
                   "lbp3_ng_cpu_hle_releases,"
-                  "guest_stall_ms,guest_stall_active\n";
+                  "guest_stall_ms,guest_stall_active,submit_mutex_wait_ms,queue_submit_cpu_ms,"
+                  "command_pool_wait_ms,command_buffer_acquire_cpu_ms,submit_pending_ops_cpu_ms,"
+                  "vk_empty_submits,command_buffer_acquires,"
+                  "reused_presents,empty_flip_slots,swapchain_acquire_cpu_ms,"
+                  "swapchain_present_cpu_ms,reuse_prepare_cpu_ms,reuse_fence_wait_ms,"
+                  "gnm_submit_wait_ms,flip_timing_valid,flip_prepare_start_ms,flip_ready_ms,"
+                  "flip_present_start_ms,flip_present_end_ms,flip_prepare_cpu_ms,"
+                  "flip_queue_wait_ms,flip_present_cpu_ms,flip_signal_cpu_ms,reuse_skipped_busy,"
+                  "videoout_flip_rate,videoout_vblank_count,flip_feedback_end_ms,"
+                  "texture_fault_lock_wait_ms,buffer_fault_lock_wait_ms,"
+                  "texture_fault_lock_waits,buffer_fault_lock_waits,"
+                  "tile_scratch_reservations,tile_scratch_bytes,tile_scratch_reuse_barriers,"
+                  "indexed_quad_draws,expanded_indexed_quad_draws,indexed_quad_fallbacks,"
+                  "expanded_quad_index_bytes,quad_index_expand_cpu_ms\n";
         samples << "elapsed_ms,thread_id,thread_name,kind,pc,image,image_offset,symbol,"
                    "symbol_offset,samples\n";
         threads << "elapsed_ms,thread_id,thread_name,cpu_percent,run_state\n";
         metadata << "serial=" << Common::ElfInfo::Instance().GameSerial() << '\n';
+        metadata << "flip_timing_version=1\n"
+                    "flip_timing_clock=steady_clock relative to start_steady_ns; -1 if invalid\n"
+                    "flip_ready_semantics=host request ready, not GPU completion\n"
+                    "flip_present_end_semantics=host present returned, not display scanout\n"
+                    "videoout_rate_version=1\n"
+                    "videoout_flip_rate_semantics=guest requested extra vblanks per flip\n"
+                    "flip_feedback_version=1\n"
+                    "flip_feedback_end_semantics=guest events and previous output label published\n"
+                    "flip_signal_cpu_ms_semantics=CPU tail after host Present returns\n";
         metadata << "eboot_base=0x" << std::hex << MemoryPatcher::g_eboot_address << '\n';
         metadata << "eboot_size=0x" << MemoryPatcher::g_eboot_image_size << std::dec << '\n';
         metadata << "frames=" << frame_path.string() << '\n';
@@ -212,6 +237,36 @@ public:
 
         frame_number = 0;
         start_time = Clock::now();
+        metadata << "start_unix_ns="
+                 << std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::system_clock::now().time_since_epoch())
+                        .count()
+                 << '\n';
+        metadata << "start_steady_ns="
+                 << std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        start_time.time_since_epoch())
+                        .count()
+                 << '\n';
+#ifdef __APPLE__
+        mach_timebase_info_data_t timebase{};
+        mach_timebase_info(&timebase);
+        metadata << "start_mach_absolute_ticks=" << mach_absolute_time() << '\n';
+        metadata << "mach_timebase_numer=" << timebase.numer << '\n';
+        metadata << "mach_timebase_denom=" << timebase.denom << '\n';
+        metadata << "pid=" << getpid() << '\n';
+#endif
+        metadata.flush();
+        const auto gpu_wait_path = std::filesystem::path{stem.string() + "_gpu_waits.csv"};
+        const bool gpu_wait_open = gpu_wait_log.Open(gpu_wait_path, start_time);
+        metadata << "gpu_wait_attribution_version=1\ngpu_wait_log_open=" << gpu_wait_open << '\n'
+                 << "gpu_waits=" << gpu_wait_path.string() << '\n'
+                 << "gpu_wait_clock=steady_clock relative to start_steady_ns\n"
+                    "gpu_wait_semantics=blocking semaphore fallback only; includes final tick refresh\n"
+                    "gpu_wait_context_bits=1:texture_cache_lock,2:image_refresh,4:buffer_upload,"
+                    "8:upload_tracker_locks,16:image_download\n"
+                    "gpu_wait_retention=two rotating CSV files, at most 4 MiB each; latest events\n"
+                    "fault_lock_wait_semantics=wall time of contended acquisitions, summed across threads\n";
+        metadata.flush();
         last_frame_time = start_time;
         last_frame_flush = start_time;
         last_process = GetProcessSnapshot();
@@ -231,6 +286,7 @@ public:
         if (!enabled.exchange(false, std::memory_order_acq_rel)) {
             return;
         }
+        gpu_wait_log.Close();
 #ifdef __APPLE__
         sampler.request_stop();
         if (sampler.joinable()) {
@@ -264,12 +320,17 @@ public:
         if (!IsEnabled()) {
             return;
         }
-        timings[static_cast<size_t>(metric)].fetch_add(duration.count(),
-                                                       std::memory_order_relaxed);
+        timings[static_cast<size_t>(metric)].fetch_add(duration.count(), std::memory_order_relaxed);
+    }
+
+    void RecordGpuWait(const GpuWaitEvent& event) noexcept {
+        if (IsEnabled()) {
+            gpu_wait_log.Record(event);
+        }
     }
 
     void RecordFrame(u32 pending_flips, u32 request_depth, u32 game_width, u32 game_height,
-                     u32 output_width, u32 output_height) {
+                     u32 output_width, u32 output_height, const FlipTiming& flip_timing) {
         if (!IsEnabled()) {
             return;
         }
@@ -296,9 +357,9 @@ public:
         const double frame_ms = static_cast<double>(frame_ns) / 1'000'000.0;
         const double fps = frame_ns > 0 ? 1'000'000'000.0 / static_cast<double>(frame_ns) : 0.0;
         const double process_cpu_percent =
-            frame_ns > 0 ? 100.0 * static_cast<double>(process_delta_ns) /
-                               static_cast<double>(frame_ns)
-                         : 0.0;
+            frame_ns > 0
+                ? 100.0 * static_cast<double>(process_delta_ns) / static_cast<double>(frame_ns)
+                : 0.0;
 
         const auto guest_stall = Common::GetGuestTimeStallTracker().GetSnapshot();
         const auto guest_stall_delta = guest_stall.elapsed - last_guest_stall;
@@ -310,6 +371,16 @@ public:
         const auto milliseconds = [&](TimeMetric value) {
             return static_cast<double>(frame_timings[static_cast<size_t>(value)]) / 1'000'000.0;
         };
+        const bool flip_timing_valid = flip_timing.prepare_begin >= start_time &&
+                                       flip_timing.ready >= flip_timing.prepare_begin &&
+                                       flip_timing.present_begin >= flip_timing.ready &&
+                                       flip_timing.present_end >= flip_timing.present_begin &&
+                                       now >= flip_timing.present_end;
+        const auto flip_ms = [&](Clock::time_point begin, Clock::time_point end) {
+            return flip_timing_valid
+                       ? std::chrono::duration<double, std::milli>(end - begin).count()
+                       : -1.0;
+        };
 
         ++frame_number;
         recorded_frames.store(frame_number, std::memory_order_relaxed);
@@ -320,9 +391,8 @@ public:
                << static_cast<double>(process.rss_bytes) / (1024.0 * 1024.0) << ',' << game_width
                << ',' << game_height << ',' << output_width << ',' << output_height << ','
                << pending_flips << ',' << request_depth << ','
-               << milliseconds(TimeMetric::GpuFrameCpu) << ','
-               << milliseconds(TimeMetric::DrawCpu) << ','
-               << milliseconds(TimeMetric::DispatchCpu) << ','
+               << milliseconds(TimeMetric::GpuFrameCpu) << ',' << milliseconds(TimeMetric::DrawCpu)
+               << ',' << milliseconds(TimeMetric::DispatchCpu) << ','
                << milliseconds(TimeMetric::ResourceBindCpu) << ','
                << milliseconds(TimeMetric::OnSubmitCpu) << ','
                << milliseconds(TimeMetric::RasterFlushCpu) << ','
@@ -330,9 +400,8 @@ public:
                << milliseconds(TimeMetric::PresentCpu) << ','
                << milliseconds(TimeMetric::FramePoolWait) << ','
                << milliseconds(TimeMetric::PresentFenceWait) << ','
-               << milliseconds(TimeMetric::VkSubmitCpu) << ','
-               << milliseconds(TimeMetric::GpuWait) << ','
-               << milliseconds(TimeMetric::GraphicsPipelineCompile) << ','
+               << milliseconds(TimeMetric::VkSubmitCpu) << ',' << milliseconds(TimeMetric::GpuWait)
+               << ',' << milliseconds(TimeMetric::GraphicsPipelineCompile) << ','
                << milliseconds(TimeMetric::ComputePipelineCompile) << ','
                << milliseconds(TimeMetric::GuestShaderCompile) << ','
                << milliseconds(TimeMetric::HostShaderCompile) << ','
@@ -341,33 +410,63 @@ public:
                << ',' << counter(Counter::DrawsEmitted) << ','
                << counter(Counter::IndirectDrawCalls) << ',' << counter(Counter::DispatchCalls)
                << ',' << counter(Counter::DispatchesEmitted) << ','
-               << counter(Counter::DescriptorWrites) << ','
-               << counter(Counter::RenderPassBegins) << ',' << counter(Counter::RenderPassEnds)
-               << ',' << counter(Counter::VkSubmits) << ',' << counter(Counter::GpuWaits) << ','
-               << counter(Counter::GpuFrames) << ',' << counter(Counter::GfxSubmits) << ','
-               << counter(Counter::AscSubmits) << ',' << counter(Counter::GfxDwords) << ','
-               << counter(Counter::AscDwords) << ','
+               << counter(Counter::DescriptorWrites) << ',' << counter(Counter::RenderPassBegins)
+               << ',' << counter(Counter::RenderPassEnds) << ',' << counter(Counter::VkSubmits)
+               << ',' << counter(Counter::GpuWaits) << ',' << counter(Counter::GpuFrames) << ','
+               << counter(Counter::GfxSubmits) << ',' << counter(Counter::AscSubmits) << ','
+               << counter(Counter::GfxDwords) << ',' << counter(Counter::AscDwords) << ','
                << counter(Counter::GraphicsPipelineCompiles) << ','
                << counter(Counter::ComputePipelineCompiles) << ','
                << counter(Counter::GuestShaderCompiles) << ','
-               << counter(Counter::HostShaderCompiles) << ','
-               << counter(Counter::GuestWriteFaults) << ','
-               << counter(Counter::GuestReadFaults) << ',' << counter(Counter::PresentCalls) << ','
-               << counter(Counter::DirectImportAttempts) << ','
+               << counter(Counter::HostShaderCompiles) << ',' << counter(Counter::GuestWriteFaults)
+               << ',' << counter(Counter::GuestReadFaults) << ',' << counter(Counter::PresentCalls)
+               << ',' << counter(Counter::DirectImportAttempts) << ','
                << counter(Counter::DirectImportSuccesses) << ','
                << counter(Counter::DirectImportFailures) << ','
                << counter(Counter::DirectBufferBinds) << ','
                << counter(Counter::DirectReadbackBytes) << ','
-               << counter(Counter::DirectUploadBytes) << ','
-               << counter(Counter::DirectFaultSubmits) << ','
-               << counter(Counter::DirectFaultFinishes) << ','
+               << counter(Counter::DirectUploadBytes) << ',' << counter(Counter::DirectFaultSubmits)
+               << ',' << counter(Counter::DirectFaultFinishes) << ','
                << counter(Counter::DirectVisibilityBarriers) << ','
                << counter(Counter::OrderedGuestReleases) << ','
                << counter(Counter::GuestFenceSubmits) << ','
                << counter(Counter::Lbp3NgCpuHleDispatches) << ','
                << counter(Counter::Lbp3NgCpuHleReleases) << ','
                << std::chrono::duration<double, std::milli>(guest_stall_delta).count() << ','
-               << (guest_stall.active ? 1 : 0) << '\n';
+               << (guest_stall.active ? 1 : 0) << ',' << milliseconds(TimeMetric::SubmitMutexWait)
+               << ',' << milliseconds(TimeMetric::QueueSubmitCpu) << ','
+               << milliseconds(TimeMetric::CommandPoolWait) << ','
+               << milliseconds(TimeMetric::CommandBufferAcquireCpu) << ','
+               << milliseconds(TimeMetric::SubmitPendingOpsCpu) << ','
+               << counter(Counter::VkEmptySubmits) << ',' << counter(Counter::CommandBufferAcquires)
+               << ',' << counter(Counter::ReusedPresents) << ',' << counter(Counter::EmptyFlipSlots)
+               << ',' << milliseconds(TimeMetric::SwapchainAcquireCpu) << ','
+               << milliseconds(TimeMetric::SwapchainPresentCpu) << ','
+               << milliseconds(TimeMetric::ReusePrepareCpu) << ','
+               << milliseconds(TimeMetric::ReuseFenceWait) << ','
+               << milliseconds(TimeMetric::GnmSubmitWait) << ',' << (flip_timing_valid ? 1 : 0)
+               << ',' << flip_ms(start_time, flip_timing.prepare_begin) << ','
+               << flip_ms(start_time, flip_timing.ready) << ','
+               << flip_ms(start_time, flip_timing.present_begin) << ','
+               << flip_ms(start_time, flip_timing.present_end) << ','
+               << flip_ms(flip_timing.prepare_begin, flip_timing.ready) << ','
+               << flip_ms(flip_timing.ready, flip_timing.present_begin) << ','
+               << flip_ms(flip_timing.present_begin, flip_timing.present_end) << ','
+               << flip_ms(flip_timing.present_end, now) << ',' << counter(Counter::ReuseSkippedBusy)
+               << ',' << flip_timing.videoout_flip_rate << ',' << flip_timing.videoout_vblank_count
+               << ',' << flip_ms(start_time, flip_timing.feedback_end) << ','
+               << milliseconds(TimeMetric::TextureFaultLockWait) << ','
+               << milliseconds(TimeMetric::BufferFaultLockWait) << ','
+               << counter(Counter::TextureFaultLockWaits) << ','
+               << counter(Counter::BufferFaultLockWaits) << ','
+               << counter(Counter::TileScratchReservations) << ','
+               << counter(Counter::TileScratchBytes) << ','
+               << counter(Counter::TileScratchReuseBarriers) << ','
+               << counter(Counter::IndexedQuadDraws) << ','
+               << counter(Counter::ExpandedIndexedQuadDraws) << ','
+               << counter(Counter::IndexedQuadFallbacks) << ','
+               << counter(Counter::ExpandedQuadIndexBytes) << ','
+               << milliseconds(TimeMetric::QuadIndexExpandCpu) << '\n';
 
         if (now - last_frame_flush >= std::chrono::seconds(1)) {
             frames.flush();
@@ -377,10 +476,9 @@ public:
 
 private:
 #ifdef __APPLE__
-    void FlushThreadSamples(
-        const Clock::time_point now,
-        const std::unordered_map<SampleKey, u32, SampleKeyHash>& sample_counts,
-        const std::unordered_map<u64, ThreadSample>& thread_samples) {
+    void FlushThreadSamples(const Clock::time_point now,
+                            const std::unordered_map<SampleKey, u32, SampleKeyHash>& sample_counts,
+                            const std::unordered_map<u64, ThreadSample>& thread_samples) {
         const auto elapsed_ms =
             std::chrono::duration_cast<std::chrono::milliseconds>(now - start_time).count();
 
@@ -398,9 +496,8 @@ private:
             ++rows_written;
 
             const auto thread_it = thread_samples.find(key.thread_id);
-            const std::string thread_name = thread_it != thread_samples.end()
-                                                ? thread_it->second.name
-                                                : std::string{"unknown"};
+            const std::string thread_name =
+                thread_it != thread_samples.end() ? thread_it->second.name : std::string{"unknown"};
             std::string kind{"host"};
             std::string image{"unknown"};
             std::string symbol;
@@ -493,14 +590,15 @@ private:
                     thread_basic_info_data_t basic{};
                     mach_msg_type_number_t basic_count = THREAD_BASIC_INFO_COUNT;
                     if (thread_info(thread, THREAD_BASIC_INFO,
-                                    reinterpret_cast<thread_info_t>(&basic), &basic_count) !=
-                        KERN_SUCCESS) {
+                                    reinterpret_cast<thread_info_t>(&basic),
+                                    &basic_count) != KERN_SUCCESS) {
                         mach_port_deallocate(mach_task_self(), thread);
                         continue;
                     }
 
                     char name_buffer[128]{};
-                    if (pthread_t pthread = pthread_from_mach_thread_np(thread); pthread != nullptr) {
+                    if (pthread_t pthread = pthread_from_mach_thread_np(thread);
+                        pthread != nullptr) {
                         pthread_getname_np(pthread, name_buffer, sizeof(name_buffer));
                     }
                     std::string name = name_buffer[0] != '\0'
@@ -533,9 +631,9 @@ private:
                               static_cast<vm_size_t>(thread_count) * sizeof(thread_t));
             }
 
-            AddTime(TimeMetric::SamplerOverhead,
-                    std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() -
-                                                                         sample_begin));
+            AddTime(
+                TimeMetric::SamplerOverhead,
+                std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - sample_begin));
             const auto now = Clock::now();
             if (now >= next_flush) {
                 FlushThreadSamples(now, sample_counts, thread_samples);
@@ -559,6 +657,7 @@ private:
     std::array<std::atomic<u64>, CounterCount> counters{};
     std::array<std::atomic<s64>, TimeMetricCount> timings{};
     std::mutex lifecycle_mutex;
+    GpuWaitLog gpu_wait_log;
     std::ofstream frames;
     std::ofstream samples;
     std::ofstream threads;
@@ -597,6 +696,10 @@ void SetStartRequested(bool requested) noexcept {
     start_requested.store(requested, std::memory_order_release);
 }
 
+void SetOutputDirectory(std::string directory) {
+    output_directory = std::move(directory);
+}
+
 bool IsStartRequested() noexcept {
     return start_requested.load(std::memory_order_acquire);
 }
@@ -617,10 +720,14 @@ void AddTime(TimeMetric metric, std::chrono::nanoseconds duration) noexcept {
     GetRecorder().AddTime(metric, duration);
 }
 
+void RecordGpuWait(const GpuWaitEvent& event) noexcept {
+    GetRecorder().RecordGpuWait(event);
+}
+
 void RecordFrame(u32 pending_flips, u32 request_depth, u32 game_width, u32 game_height,
-                 u32 output_width, u32 output_height) {
+                 u32 output_width, u32 output_height, const FlipTiming& flip_timing) {
     GetRecorder().RecordFrame(pending_flips, request_depth, game_width, game_height, output_width,
-                              output_height);
+                              output_height, flip_timing);
 }
 
 } // namespace Core::PerfTelemetry

@@ -13,17 +13,18 @@ namespace Vulkan {
 
 std::mutex Scheduler::submit_mutex;
 
-Scheduler::Scheduler(const Instance& instance)
-    : instance{instance}, master_semaphore{instance}, command_pool{instance, &master_semaphore} {
+Scheduler::Scheduler(const Instance& instance, const char* timing_role)
+    : instance{instance}, master_semaphore{instance}, command_pool{instance, &master_semaphore},
+      gpu_timing{instance, timing_role} {
 #if TRACY_GPU_ENABLED
     profiler_scope = reinterpret_cast<tracy::VkCtxScope*>(std::malloc(sizeof(tracy::VkCtxScope)));
 #endif
-    AllocateWorkerCommandBuffers();
     priority_pending_ops_thread =
         std::jthread(std::bind_front(&Scheduler::PriorityPendingOpsThread, this));
 }
 
 Scheduler::~Scheduler() {
+    gpu_timing.Collect(master_semaphore.KnownGpuTick());
 #if TRACY_GPU_ENABLED
     std::free(profiler_scope);
 #endif
@@ -34,9 +35,11 @@ void Scheduler::BeginRendering(const RenderState& new_state) {
         return;
     }
     EndRendering();
+    const auto cmdbuf = CommandBuffer();
     is_rendering = true;
     render_state = new_state;
     Core::PerfTelemetry::Increment(Core::PerfTelemetry::Counter::RenderPassBegins);
+    gpu_timing.BeginRenderPass(cmdbuf, new_state.width, new_state.height, new_state.num_layers);
 
     std::array<vk::RenderingAttachmentInfo, 8> color_attachments;
     for (u32 i = 0; i < render_state.num_color_attachments; ++i) {
@@ -82,7 +85,7 @@ void Scheduler::BeginRendering(const RenderState& new_state) {
         .pStencilAttachment = db.has_stencil ? &stencil_attachment : nullptr,
     };
 
-    current_cmdbuf.beginRendering(rendering_info);
+    cmdbuf.beginRendering(rendering_info);
 }
 
 void Scheduler::EndRendering() {
@@ -92,6 +95,7 @@ void Scheduler::EndRendering() {
     is_rendering = false;
     Core::PerfTelemetry::Increment(Core::PerfTelemetry::Counter::RenderPassEnds);
     current_cmdbuf.endRendering();
+    gpu_timing.EndRenderPass(current_cmdbuf);
 }
 
 void Scheduler::Flush(SubmitInfo& info) {
@@ -104,21 +108,22 @@ void Scheduler::Flush() {
     Flush(info);
 }
 
-void Scheduler::Finish() {
+void Scheduler::Finish(std::source_location caller) {
     // When finishing, we need to wait for the submission to have executed on the device.
     const u64 presubmit_tick = CurrentTick();
     SubmitInfo info{};
     SubmitExecution(info);
-    Wait(presubmit_tick);
+    Wait(presubmit_tick, {.source = Core::PerfTelemetry::GpuWaitSource::SchedulerFinish}, caller);
 }
 
-void Scheduler::Wait(u64 tick) {
+void Scheduler::Wait(u64 tick, const Core::PerfTelemetry::GpuWaitInfo& info,
+                      std::source_location caller) {
     if (tick >= master_semaphore.CurrentTick()) {
         // Make sure we are not waiting for the current tick without signalling
         SubmitInfo info{};
         Flush(info);
     }
-    master_semaphore.Wait(tick);
+    master_semaphore.Wait(tick, info, caller);
 }
 
 void Scheduler::PopPendingOperations() {
@@ -131,15 +136,20 @@ void Scheduler::PopPendingOperations() {
 }
 
 void Scheduler::AllocateWorkerCommandBuffers() {
+    Core::PerfTelemetry::ScopedTimer telemetry_timer{
+        Core::PerfTelemetry::TimeMetric::CommandBufferAcquireCpu};
     const vk::CommandBufferBeginInfo begin_info = {
         .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit,
     };
 
     current_cmdbuf = command_pool.Commit();
     Check(current_cmdbuf.begin(begin_info));
+    Core::PerfTelemetry::Increment(Core::PerfTelemetry::Counter::CommandBufferAcquires);
 
     // Invalidate dynamic state so it gets applied to the new command buffer.
     dynamic_state.Invalidate();
+    gpu_timing.Collect(master_semaphore.KnownGpuTick());
+    gpu_timing.Begin(current_cmdbuf, CurrentTick());
 
 #if TRACY_GPU_ENABLED
     auto* profiler_ctx = instance.GetProfilerContext();
@@ -154,19 +164,28 @@ void Scheduler::AllocateWorkerCommandBuffers() {
 void Scheduler::SubmitExecution(SubmitInfo& info) {
     Core::PerfTelemetry::Increment(Core::PerfTelemetry::Counter::VkSubmits);
     Core::PerfTelemetry::ScopedTimer telemetry_timer{Core::PerfTelemetry::TimeMetric::VkSubmitCpu};
-    std::scoped_lock lk{submit_mutex};
+    std::unique_lock lk{submit_mutex, std::defer_lock};
+    {
+        Core::PerfTelemetry::ScopedTimer lock_timer{
+            Core::PerfTelemetry::TimeMetric::SubmitMutexWait};
+        lk.lock();
+    }
     const u64 signal_value = master_semaphore.NextTick();
 
+    if (current_cmdbuf) {
 #if TRACY_GPU_ENABLED
-    auto* profiler_ctx = instance.GetProfilerContext();
-    if (profiler_ctx) {
-        profiler_scope->~VkCtxScope();
-        TracyVkCollect(profiler_ctx, current_cmdbuf);
-    }
+        auto* profiler_ctx = instance.GetProfilerContext();
+        if (profiler_ctx) {
+            profiler_scope->~VkCtxScope();
+            TracyVkCollect(profiler_ctx, current_cmdbuf);
+        }
 #endif
-
-    EndRendering();
-    Check(current_cmdbuf.end());
+        EndRendering();
+        gpu_timing.End(current_cmdbuf, signal_value);
+        Check(current_cmdbuf.end());
+    } else {
+        Core::PerfTelemetry::Increment(Core::PerfTelemetry::Counter::VkEmptySubmits);
+    }
 
     const vk::Semaphore timeline = master_semaphore.Handle();
     info.AddSignal(timeline, signal_value);
@@ -188,21 +207,36 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
         .waitSemaphoreCount = info.num_wait_semas,
         .pWaitSemaphores = info.wait_semas.data(),
         .pWaitDstStageMask = wait_stage_masks.data(),
-        .commandBufferCount = 1U,
-        .pCommandBuffers = &current_cmdbuf,
+        .commandBufferCount = current_cmdbuf ? 1U : 0U,
+        .pCommandBuffers = current_cmdbuf ? &current_cmdbuf : nullptr,
         .signalSemaphoreCount = info.num_signal_semas,
         .pSignalSemaphores = info.signal_semas.data(),
     };
 
     ImGui::Core::TextureManager::Submit();
-    auto submit_result = instance.GetGraphicsQueue().submit(submit_info, info.fence);
-    ASSERT_MSG(submit_result != vk::Result::eErrorDeviceLost, "Device lost during submit");
+    {
+        Core::PerfTelemetry::ScopedTimer queue_timer{
+            Core::PerfTelemetry::TimeMetric::QueueSubmitCpu};
+        auto submit_result = instance.GetGraphicsQueue().submit(submit_info, info.fence);
+        ASSERT_MSG(submit_result != vk::Result::eErrorDeviceLost, "Device lost during submit");
+    }
+    // ImGui uploads and the queue submission above need external queue synchronization.
+    lk.unlock();
+    // Do not wait for an unused next buffer here: Liverpool must be able to release
+    // the guest submission lock after its terminal flush. Semaphore/fence-only submits
+    // still advance the timeline in queue order without consuming a command-pool slot.
+    current_cmdbuf = nullptr;
 
     master_semaphore.Refresh();
-    AllocateWorkerCommandBuffers();
+
+    gpu_timing.Collect(master_semaphore.KnownGpuTick());
 
     // Apply pending operations
-    PopPendingOperations();
+    {
+        Core::PerfTelemetry::ScopedTimer pending_timer{
+            Core::PerfTelemetry::TimeMetric::SubmitPendingOpsCpu};
+        PopPendingOperations();
+    }
 }
 
 void Scheduler::PriorityPendingOpsThread(std::stop_token stoken) {
@@ -222,7 +256,8 @@ void Scheduler::PriorityPendingOpsThread(std::stop_token stoken) {
             priority_pending_ops.pop();
         }
 
-        master_semaphore.Wait(op.gpu_tick);
+        master_semaphore.Wait(op.gpu_tick,
+                              {.source = Core::PerfTelemetry::GpuWaitSource::PriorityCallback});
         if (stoken.stop_requested()) {
             break;
         }

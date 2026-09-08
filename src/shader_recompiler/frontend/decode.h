@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <span>
 #include "shader_recompiler/frontend/instruction.h"
 
 namespace Shader::Gcn {
@@ -26,20 +27,35 @@ Opcode DecodeOpcode(u32 token);
 
 class GcnCodeSlice {
 public:
-    GcnCodeSlice(const u32* ptr, const u32* end) : m_ptr(ptr), m_end(end) {}
+    // An optional bounded snapshot records the words actually consumed by the decoder.
+    // Peeking and then reading a word must use the same value in the snapshot.
+    GcnCodeSlice(const u32* ptr, const u32* end, std::span<u32> snapshot = {})
+        : m_ptr(ptr), m_end(end), m_begin(ptr), m_snapshot(snapshot) {}
     GcnCodeSlice(const GcnCodeSlice& other) = default;
     ~GcnCodeSlice() = default;
 
     u32 at(u32 id) const {
+        if (!m_snapshot.empty()) {
+            const auto index = static_cast<size_t>(m_ptr - m_begin) + id;
+            if (index < m_snapshot.size()) {
+                while (m_snapshot_words <= index) {
+                    m_snapshot[m_snapshot_words] = m_begin[m_snapshot_words];
+                    ++m_snapshot_words;
+                }
+                return m_snapshot[index];
+            }
+        }
         return m_ptr[id];
     }
 
     u32 readu32() {
-        return *(m_ptr++);
+        const u32 value = at(0);
+        ++m_ptr;
+        return value;
     }
 
     u64 readu64() {
-        const u64 value = *(u64*)m_ptr;
+        const u64 value = m_snapshot.empty() ? *(u64*)m_ptr : u64{at(0)} | (u64{at(1)} << 32);
         m_ptr += 2;
         return value;
     }
@@ -51,6 +67,9 @@ public:
 private:
     const u32* m_ptr{};
     const u32* m_end{};
+    const u32* m_begin{};
+    std::span<u32> m_snapshot{};
+    mutable size_t m_snapshot_words{};
 };
 
 class GcnDecodeContext {

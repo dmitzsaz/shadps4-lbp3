@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <optional>
 #include "common/assert.h"
+#include "core/performance_telemetry.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_master_semaphore.h"
 #include "video_core/renderer_vulkan/vk_resource_pool.h"
@@ -111,7 +112,10 @@ std::size_t CommandPool::ManageOverflow() {
     // Vulkan command buffer. Keep the initial four-buffer pool bounded and
     // wait for its oldest submission instead of multiplying that backing.
     const auto oldest = std::ranges::min_element(ticks);
-    master_semaphore->Wait(*oldest);
+    Core::PerfTelemetry::ScopedTimer telemetry_timer{
+        Core::PerfTelemetry::TimeMetric::CommandPoolWait};
+    master_semaphore->Wait(*oldest, {.source = Core::PerfTelemetry::GpuWaitSource::CommandPool,
+                                    .resource_id = reinterpret_cast<u64>(this)});
     return std::distance(ticks.begin(), oldest);
 }
 
@@ -126,7 +130,9 @@ DescriptorHeap::DescriptorHeap(const Instance& instance, MasterSemaphore* master
 DescriptorHeap::~DescriptorHeap() {
     device.destroyDescriptorPool(curr_pool);
     for (const auto [pool, tick] : pending_pools) {
-        master_semaphore->Wait(tick);
+        master_semaphore->Wait(tick,
+                               {.source = Core::PerfTelemetry::GpuWaitSource::DescriptorRetirement,
+                                .resource_id = reinterpret_cast<u64>(this)});
         device.destroyDescriptorPool(pool);
     }
 }

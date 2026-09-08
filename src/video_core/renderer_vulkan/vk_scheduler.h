@@ -12,6 +12,7 @@
 #include "video_core/amdgpu/regs_color.h"
 #include "video_core/amdgpu/regs_primitive.h"
 #include "video_core/renderer_vulkan/vk_master_semaphore.h"
+#include "video_core/renderer_vulkan/vk_gpu_timing.h"
 #include "video_core/renderer_vulkan/vk_resource_pool.h"
 
 namespace tracy {
@@ -45,6 +46,21 @@ struct RenderState {
     u16 height;
     u16 num_layers;
     u16 num_color_attachments;
+
+    void MinimizeAttachmentlessArea(bool has_fragment_shader) {
+        if (has_fragment_shader || depth_stencil_attachment.image_view) {
+            return;
+        }
+        for (const auto& attachment : color_attachments) {
+            if (attachment.image_view) {
+                return;
+            }
+        }
+        // Pre-rasterization shader side effects still execute. Without either
+        // attachments or a fragment shader, no output depends on the render area.
+        // Guest occlusion counters are currently emulated outside Vulkan rendering.
+        width = height = 1;
+    }
 
     bool operator==(const RenderState& other) const noexcept {
         return std::memcmp(this, &other, sizeof(RenderState)) == 0;
@@ -347,7 +363,7 @@ struct DynamicState {
 
 class Scheduler {
 public:
-    explicit Scheduler(const Instance& instance);
+    explicit Scheduler(const Instance& instance, const char* timing_role = "other");
     ~Scheduler();
 
     /// Sends the current execution context to the GPU
@@ -359,10 +375,11 @@ public:
     void Flush();
 
     /// Sends the current execution context to the GPU and waits for it to complete.
-    void Finish();
+    void Finish(std::source_location caller = std::source_location::current());
 
     /// Waits for the given tick to trigger on the GPU.
-    void Wait(u64 tick);
+    void Wait(u64 tick, const Core::PerfTelemetry::GpuWaitInfo& info = {},
+              std::source_location caller = std::source_location::current());
 
     /// Attempts to execute operations whose tick the GPU has caught up with.
     void PopPendingOperations();
@@ -372,6 +389,21 @@ public:
 
     /// Ends current rendering scope.
     void EndRendering();
+
+    // Tile scopes call this after their natural EndRendering; diagnostics must
+    // not introduce additional render-pass splits. Tokens cannot cross a Flush.
+    GpuTiming::Token BeginGpuWork(const GpuTiming::Work& work) {
+        return gpu_timing.BeginWork(CommandBuffer(), work);
+    }
+    void EndGpuWork(GpuTiming::Token token) {
+        if (current_cmdbuf) gpu_timing.EndWork(current_cmdbuf, token);
+    }
+    bool IsTimingRenderPass() const {
+        return gpu_timing.IsTimingRenderPass();
+    }
+    void RecordTimedDraw(u64 vs, u64 ps, u64 vertices, bool indirect = false) {
+        gpu_timing.RecordDraw(vs, ps, vertices, indirect);
+    }
 
     /// Returns the current render state.
     const RenderState& GetRenderState() const {
@@ -383,8 +415,11 @@ public:
         return dynamic_state;
     }
 
-    /// Returns the current command buffer.
-    vk::CommandBuffer CommandBuffer() const {
+    /// Acquires a command buffer when recording starts; may wait for a free pool entry.
+    vk::CommandBuffer CommandBuffer() {
+        if (!current_cmdbuf) {
+            AllocateWorkerCommandBuffers();
+        }
         return current_cmdbuf;
     }
 
@@ -436,6 +471,7 @@ private:
     const Instance& instance;
     MasterSemaphore master_semaphore;
     CommandPool command_pool;
+    GpuTiming gpu_timing;
     DynamicState dynamic_state;
     vk::CommandBuffer current_cmdbuf;
     std::condition_variable_any event_cv;

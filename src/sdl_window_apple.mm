@@ -4,6 +4,9 @@
 #include <filesystem>
 #include <dlfcn.h>
 #include <Cocoa/Cocoa.h>
+#include <QuartzCore/QuartzCore.h>
+#include <objc/runtime.h>
+#include <SDL3/SDL_events.h>
 #include <SDL3/SDL_video.h>
 
 #include "sdl_window.h"
@@ -55,6 +58,74 @@ bool SetLaunchServicesDisplayName(NSString* name) {
 }
 
 } // namespace
+
+static char graphics_preparation_key;
+
+void ShowGraphicsPreparation(SDL_Window* window, size_t completed, size_t total) {
+    @autoreleasepool {
+        NSWindow* native = (NSWindow*)SDL_GetPointerProperty(
+            SDL_GetWindowProperties(window), SDL_PROP_WINDOW_COCOA_WINDOW_POINTER, nullptr);
+        if (native == nil) {
+            return;
+        }
+        NSView* overlay = objc_getAssociatedObject(native, &graphics_preparation_key);
+        if (overlay == nil) {
+            NSView* content = native.contentView;
+            overlay = [[[NSView alloc] initWithFrame:content.bounds] autorelease];
+            overlay.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+            overlay.wantsLayer = YES;
+            overlay.layer.backgroundColor = NSColor.blackColor.CGColor;
+            const CGFloat center = NSMidY(content.bounds);
+            NSTextField* title = [NSTextField labelWithString:@"Preparing graphics"];
+            title.frame = NSMakeRect(0, center + 30, content.bounds.size.width, 40);
+            title.alignment = NSTextAlignmentCenter;
+            title.textColor = NSColor.whiteColor;
+            title.font = [NSFont systemFontOfSize:26 weight:NSFontWeightMedium];
+            title.autoresizingMask = NSViewWidthSizable | NSViewMinYMargin | NSViewMaxYMargin;
+            [overlay addSubview:title];
+
+            NSTextField* detail = [NSTextField labelWithString:@""];
+            detail.tag = 1;
+            detail.frame = NSMakeRect(0, center - 40, content.bounds.size.width, 30);
+            detail.alignment = NSTextAlignmentCenter;
+            detail.textColor = NSColor.lightGrayColor;
+            detail.autoresizingMask = title.autoresizingMask;
+            [overlay addSubview:detail];
+
+            NSProgressIndicator* bar = [[[NSProgressIndicator alloc]
+                initWithFrame:NSMakeRect(NSMidX(content.bounds) - 180, center, 360, 20)] autorelease];
+            bar.indeterminate = NO;
+            bar.minValue = 0;
+            bar.maxValue = 100;
+            bar.autoresizingMask = NSViewMinXMargin | NSViewMaxXMargin |
+                                   NSViewMinYMargin | NSViewMaxYMargin;
+            [overlay addSubview:bar];
+            [content addSubview:overlay positioned:NSWindowAbove relativeTo:nil];
+            objc_setAssociatedObject(native, &graphics_preparation_key, overlay,
+                                     OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        }
+        NSTextField* detail = (NSTextField*)[overlay viewWithTag:1];
+        detail.stringValue = [NSString stringWithFormat:@"%zu / %zu — This may take a few minutes",
+                                                       completed, total];
+        [(NSProgressIndicator*)overlay.subviews[2]
+            setDoubleValue:total ? 100.0 * completed / total : 100.0];
+        // WarmUp runs on the main thread before the normal SDL event loop starts.
+        SDL_PumpEvents();
+        [native displayIfNeeded];
+        [CATransaction flush];
+    }
+}
+
+void HideGraphicsPreparation(SDL_Window* window) {
+    @autoreleasepool {
+        NSWindow* native = (NSWindow*)SDL_GetPointerProperty(
+            SDL_GetWindowProperties(window), SDL_PROP_WINDOW_COCOA_WINDOW_POINTER, nullptr);
+        NSView* overlay = objc_getAssociatedObject(native, &graphics_preparation_key);
+        [overlay removeFromSuperview];
+        objc_setAssociatedObject(native, &graphics_preparation_key, nil,
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+}
 
 void SetMacOSProcessName(std::string_view application_name) {
     @autoreleasepool {

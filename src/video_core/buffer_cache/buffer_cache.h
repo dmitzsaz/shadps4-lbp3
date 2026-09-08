@@ -136,6 +136,17 @@ public:
     void BindIndexBuffer(u32 index_offset,
                          boost::container::small_vector<vk::BufferMemoryBarrier2, 16>& barriers);
 
+    struct ExpandedQuadIndices {
+        vk::Buffer buffer;
+        u64 offset;
+        u32 count;
+        vk::IndexType type;
+    };
+
+    /// Expand CPU-authoritative indices without a readback or waiting for upload space.
+    /// GPU-written and imported ranges retain the existing primitive-emulation path.
+    [[nodiscard]] std::optional<ExpandedQuadIndices> TryExpandQuadIndices(u32 index_offset);
+
     /// Writes a value to GPU buffer. (uses command buffer to temporarily store the data)
     void FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds);
 

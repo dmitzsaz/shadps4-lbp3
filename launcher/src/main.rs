@@ -199,7 +199,8 @@ impl LauncherApp {
         if bundled_eboot.is_none() {
             config.prefer_bundled_game = false;
         }
-        if config.external_eboot.is_empty()
+        if bundled_eboot.is_none()
+            && config.external_eboot.is_empty()
             && let Some(candidate) = default_external_eboot()
         {
             config.external_eboot = candidate.to_string_lossy().into_owned();
@@ -322,7 +323,14 @@ impl LauncherApp {
         } else {
             self.config.clone()
         };
-        let arguments = build_core_args(&effective_config, &eboot, addon_root.as_deref());
+        let mut arguments = build_core_args(&effective_config, &eboot, addon_root.as_deref());
+        // Opt-in for this launcher process only. Pass explicit arguments because
+        // launchd does not inherit the recorder's environment.
+        if let Some(directory) = std::env::var_os("SHADPS4_PERF_OUTPUT") {
+            arguments.push(OsString::from("--perf-telemetry"));
+            arguments.push(OsString::from("--perf-output"));
+            arguments.push(directory);
+        }
 
         match launch_core_detached(&named_core, &arguments) {
             Ok(()) => true,
@@ -1014,6 +1022,11 @@ fn build_launch_agent_plist(
 
     let environment = [
         "HOME", "USER", "LOGNAME", "TMPDIR", "PATH", "LANG", "LC_ALL", "LC_CTYPE",
+        // launchd does not inherit the recorder's environment. These opt-in
+        // diagnostics and input movies are absent on ordinary GUI launches.
+        "SHADPS4_GPU_TIMING_DIR", "MESA_KK_PRECISE_COMPUTE_TIMESTAMPS",
+        "SHADPS4_INPUT_RECORD", "SHADPS4_INPUT_REPLAY", "SHADPS4_INPUT_REPORT", "SHADPS4_REPLAY_HOME",
+        "SHADPS4_INPUT_SCREENSHOTS",
     ]
     .into_iter()
     .filter_map(|name| std::env::var_os(name).map(|value| (name, value)))
@@ -1382,7 +1395,11 @@ fn parse_partychat_response(response: &str) -> Option<PartyChatState> {
     Some(PartyChatState::Running)
 }
 
-fn forward_to_core(arguments: &[OsString]) -> i32 {
+fn forward_to_core(arguments: &[OsString], use_launch_agent: bool) -> i32 {
+    if use_launch_agent && !game_path_from_arguments(arguments).is_some_and(|path| path.is_file()) {
+        eprintln!("{APP_NAME}: --launcher-launchd requires -g and a valid eboot.bin");
+        return 1;
+    }
     let core = core_executable_path();
     if !core.is_file() {
         eprintln!("{APP_NAME}: missing {}", core.display());
@@ -1398,6 +1415,17 @@ fn forward_to_core(arguments: &[OsString]) -> i32 {
         },
         None => core,
     };
+    if use_launch_agent {
+        if let Err(error) = launch_core_detached(&named_core, arguments) {
+            eprintln!("{APP_NAME}: failed to start core through launchd: {error}");
+            return 1;
+        }
+        // The same Interactive launch agent as the GUI owns the game. Keep this
+        // process alive for capture tools; monitor_launch_agent exits on game shutdown.
+        loop {
+            thread::park();
+        }
+    }
     let mut command = Command::new(&named_core);
     command.args(arguments);
     if let Some(parent) = named_core.parent() {
@@ -1427,10 +1455,15 @@ fn run_gui(initial_eboot: Option<PathBuf>) -> eframe::Result<()> {
 }
 
 fn main() {
-    let arguments = std::env::args_os()
+    let mut arguments = std::env::args_os()
         .skip(1)
         .filter(|argument| !argument.to_string_lossy().starts_with("-psn_"))
         .collect::<Vec<_>>();
+    let use_launch_agent = arguments.iter().any(|argument| argument == "--launcher-launchd");
+    arguments.retain(|argument| argument != "--launcher-launchd");
+    if use_launch_agent {
+        std::process::exit(forward_to_core(&arguments, true));
+    }
     if arguments
         .iter()
         .any(|argument| argument == OsStr::new(LAUNCHER_UI_ARGUMENT))
@@ -1442,7 +1475,7 @@ fn main() {
         return;
     }
     if !arguments.is_empty() {
-        std::process::exit(forward_to_core(&arguments));
+        std::process::exit(forward_to_core(&arguments, false));
     }
     if let Err(error) = run_gui(None) {
         eprintln!("{APP_NAME}: {error}");
@@ -1494,6 +1527,19 @@ mod tests {
         assert!(plist.contains("<string>-g</string>"));
         assert!(plist.contains("<key>KeepAlive</key>\n    <false/>"));
         assert!(plist.contains("<string>Interactive</string>"));
+        for name in [
+            "SHADPS4_GPU_TIMING_DIR", "MESA_KK_PRECISE_COMPUTE_TIMESTAMPS",
+            "SHADPS4_INPUT_RECORD", "SHADPS4_INPUT_REPLAY", "SHADPS4_INPUT_REPORT",
+            "SHADPS4_REPLAY_HOME", "SHADPS4_INPUT_SCREENSHOTS",
+        ] {
+            let key = format!("<key>{name}</key>");
+            if let Some(value) = std::env::var_os(name) {
+                assert!(plist.contains(&key));
+                assert!(plist.contains(&format!("<string>{}</string>", xml_escape(&value.to_string_lossy()))));
+            } else {
+                assert!(!plist.contains(&key));
+            }
+        }
     }
 
     #[test]

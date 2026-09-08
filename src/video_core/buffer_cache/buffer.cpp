@@ -5,6 +5,7 @@
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "core/performance_telemetry.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
@@ -358,8 +359,10 @@ constexpr u64 WATCHES_RESERVE_CHUNK = 0x1000;
 
 StreamBuffer::StreamBuffer(const Vulkan::Instance &instance,
                            Vulkan::Scheduler &scheduler, MemoryUsage usage,
-                           u64 size_bytes)
-    : Buffer{instance, scheduler, usage, 0, AllFlags, size_bytes} {
+                           u64 size_bytes,
+                           Core::PerfTelemetry::GpuWaitResource telemetry_resource_)
+    : Buffer{instance, scheduler, usage, 0, AllFlags, size_bytes},
+      telemetry_resource{telemetry_resource_} {
   ReserveWatches(current_watches, WATCHES_INITIAL_RESERVE);
   ReserveWatches(previous_watches, WATCHES_INITIAL_RESERVE);
   const auto device = instance.GetDevice();
@@ -461,7 +464,13 @@ bool StreamBuffer::WaitPendingOperations(u64 requested_upper_bound,
     if (!scheduler->IsFree(watch.tick) && !allow_wait) {
       return false;
     }
-    scheduler->Wait(watch.tick);
+    scheduler->Wait(watch.tick,
+                    {.source = Core::PerfTelemetry::GpuWaitSource::StreamReuse,
+                     .resource = telemetry_resource,
+                     .resource_id = reinterpret_cast<u64>(this),
+                     .capacity_bytes = size_bytes,
+                     .request_bytes = mapped_size,
+                     .offset_bytes = offset});
     // Download-buffer callbacks consume the mapped bytes on the CPU after the
     // GPU reaches this tick. Run those callbacks before the ring is allowed to
     // reuse the same range. Waiting on the semaphore alone only makes the
@@ -473,6 +482,56 @@ bool StreamBuffer::WaitPendingOperations(u64 requested_upper_bound,
     ++wait_cursor;
   }
   return true;
+}
+
+GpuScratchBuffer::GpuScratchBuffer(const Vulkan::Instance& instance,
+                                   Vulkan::Scheduler& scheduler_, u64 size_bytes)
+    : scheduler{scheduler_},
+      buffer{instance, scheduler_, MemoryUsage::DeviceLocal, 0, AllFlags, size_bytes} {}
+
+std::optional<u64> GpuScratchBuffer::Reserve(u64 size, u64 alignment) {
+  if (size == 0 || size > SizeBytes()) {
+    return std::nullopt;
+  }
+
+  u64 offset = alignment ? Common::AlignUp(cursor, alignment) : cursor;
+  if (offset > SizeBytes() - size) {
+    offset = 0;
+    wrapped = true;
+  }
+
+  if (wrapped) {
+    // Earlier detile->image-copy / image-copy->tile uses are already recorded on
+    // this queue, possibly in earlier submissions. Order their reads AND writes
+    // before this range is overwritten. In particular, a compute write must not
+    // overtake the transfer read that still consumes a previous detile result.
+    // This is GPU-only storage: no host data or callback needs a completed tick.
+    scheduler.EndRendering();
+    const vk::BufferMemoryBarrier2 reuse_barrier{
+        .srcStageMask = vk::PipelineStageFlagBits2::eComputeShader |
+                        vk::PipelineStageFlagBits2::eTransfer,
+        .srcAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader |
+                        vk::PipelineStageFlagBits2::eTransfer,
+        .dstAccessMask = vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite |
+                         vk::AccessFlagBits2::eTransferRead | vk::AccessFlagBits2::eTransferWrite,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .buffer = buffer.Handle(),
+        .offset = offset,
+        .size = size,
+    };
+    scheduler.CommandBuffer().pipelineBarrier2(vk::DependencyInfo{
+        .bufferMemoryBarrierCount = 1,
+        .pBufferMemoryBarriers = &reuse_barrier,
+    });
+    Core::PerfTelemetry::Increment(Core::PerfTelemetry::Counter::TileScratchReuseBarriers);
+  }
+
+  cursor = offset + size;
+  Core::PerfTelemetry::Increment(Core::PerfTelemetry::Counter::TileScratchReservations);
+  Core::PerfTelemetry::Increment(Core::PerfTelemetry::Counter::TileScratchBytes, size);
+  return offset;
 }
 
 } // namespace VideoCore

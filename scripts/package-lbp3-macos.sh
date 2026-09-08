@@ -38,6 +38,12 @@ if [[ -z ${SHADPS4_BUNDLED_ADDONS_DIR:-} && \
     print -u2 "SHADPS4_BUNDLED_ADDONS_DIR='$BUNDLE_PATH/Contents/Resources/Addons' to preserve it."
     exit 2
 fi
+if [[ -z ${SHADPS4_BUNDLED_DRY_DB:-} && \
+    -f "$BUNDLE_PATH/Contents/Resources/dry.db" ]]; then
+    print -u2 "Refusing to replace a bundle that contains dry.db. Re-run with "
+    print -u2 "SHADPS4_BUNDLED_DRY_DB='$BUNDLE_PATH/Contents/Resources/dry.db' to preserve it."
+    exit 2
+fi
 
 for required in "$CORE_BINARY" "$BUILD_DIR/libvulkan.dylib" \
     "$BUILD_DIR/libvulkan_kosmickrisp.dylib" "$BUILD_DIR/kosmickrisp_mesa_icd.json"; do
@@ -105,6 +111,20 @@ if [[ -n ${SHADPS4_BUNDLED_ADDONS_DIR:-} ]]; then
         print -u2 "Bundled add-on source must contain a CUSA00063 directory: $ADDONS_SOURCE"
         exit 1
     fi
+fi
+
+if [[ -n ${SHADPS4_BUNDLED_DRY_DB:-} ]]; then
+    DRY_SOURCE=$SHADPS4_BUNDLED_DRY_DB
+    if [[ ! -f "$DRY_SOURCE" ]]; then
+        print -u2 "Bundled Dry database does not exist: $DRY_SOURCE"
+        exit 1
+    fi
+    if [[ ! -x "$STAGED_MACOS/partychat" ]]; then
+        print -u2 "Bundling dry.db requires a PartyChat binary so its indexes can be verified."
+        exit 1
+    fi
+    cp "$DRY_SOURCE" "$STAGED_RESOURCES/dry.db"
+    "$STAGED_MACOS/partychat" index --lbp-archive-db "$STAGED_RESOURCES/dry.db"
 fi
 
 /usr/bin/plutil -lint "$STAGED_BUNDLE/Contents/Info.plist"
