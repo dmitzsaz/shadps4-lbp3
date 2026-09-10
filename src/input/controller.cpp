@@ -14,6 +14,7 @@
 #include "core/libraries/system/userservice.h"
 #include "core/user_settings.h"
 #include "input/controller.h"
+#include "input/profile_menu.h"
 
 namespace Input {
 
@@ -92,6 +93,7 @@ void State::UpdateAxisSmoothing() {
 GameController::GameController() : m_states_queue(64) {}
 
 void GameController::ReadState(State* state, bool* isConnected, int* connectedCount) {
+    std::lock_guard lock(m_states_queue_mutex);
     *isConnected = m_connected;
     *connectedCount = m_connected_count;
     *state = m_state;
@@ -99,12 +101,12 @@ void GameController::ReadState(State* state, bool* isConnected, int* connectedCo
 
 int GameController::ReadStates(State* states, int states_num, bool* isConnected,
                                int* connectedCount) {
+    std::lock_guard lock(m_states_queue_mutex);
     *isConnected = m_connected;
     *connectedCount = m_connected_count;
 
     int ret_num = 0;
     if (m_connected) {
-        std::lock_guard lg(m_states_queue_mutex);
         for (int i = 0; i < states_num; i++) {
             auto o_state = m_states_queue.Pop();
             if (!o_state) {
@@ -253,14 +255,56 @@ void GameControllers::CalculateOrientation(Libraries::Pad::OrbisFVector3& accele
 }
 
 void GameController::ConnectController(SDL_Gamepad* pad) {
+    std::lock_guard lock(m_states_queue_mutex);
     m_sdl_gamepad = pad;
     m_connected_count = 1;
     m_connected = true;
 }
 void GameController::DisconnectController() {
+    std::lock_guard lock(m_states_queue_mutex);
     m_sdl_gamepad = nullptr;
     m_connected_count = 0;
     m_connected = false;
+}
+
+void GameController::ClearInput() {
+    std::lock_guard lock(m_states_queue_mutex);
+    m_state = State{};
+    m_touch_count = m_secondary_touch_count = m_previous_touchnum = 0;
+    m_was_secondary_reset = false;
+    last_touch_down_timestamp = 0;
+    m_orientation = {0, 0, 0, 1};
+    m_last_update = {};
+    std::fill_n(gyro_buf, 3, 0.0f);
+    std::fill_n(accel_buf, 3, 0.0f);
+    accel_buf[1] = 9.81f;
+    while (m_states_queue.Pop()) {}
+    m_state.time = Libraries::Kernel::sceKernelGetProcessTime();
+    m_states_queue.Push(m_state);
+}
+
+bool GameControllers::AssignDeviceToProfile(SDL_JoystickID device, u8 profile_slot) {
+    if (profile_slot >= 4) return false;
+    auto* user = UserManagement.GetUserByPlayerIndex(profile_slot + 1);
+    if (!user) return false;
+    const u8 source = GetGamepadIndexFromJoystickId(device);
+    if (source >= 4) return false; // Removed/stale devices never address a controller slot.
+    if (source == profile_slot) return true;
+    auto* incoming = controllers[source]->m_sdl_gamepad;
+    auto* outgoing = controllers[profile_slot]->m_sdl_gamepad;
+    // Keep the logical pad objects and user IDs stable: existing scePad handles
+    // must continue to refer to the same profile after physical devices swap.
+    controllers[source]->ClearInput();
+    controllers[profile_slot]->ClearInput();
+    if (outgoing) controllers[source]->ConnectController(outgoing);
+    else controllers[source]->DisconnectController();
+    controllers[profile_slot]->user_id = user->user_id;
+    controllers[profile_slot]->ConnectController(incoming);
+    std::swap(controllers[source]->gyro_poll_rate, controllers[profile_slot]->gyro_poll_rate);
+    std::swap(controllers[source]->accel_poll_rate, controllers[profile_slot]->accel_poll_rate);
+    UserManagement.LoginUser(user, profile_slot + 1);
+    ResetLightbarColors();
+    return true;
 }
 
 bool is_first_check = true;
@@ -269,6 +313,7 @@ void GameControllers::TryOpenSDLControllers() {
     using namespace Libraries::UserService;
     int controller_count;
     s32 move_count = 0;
+    SDL_JoystickID profile_prompt = 0;
     SDL_JoystickID* new_joysticks = SDL_GetGamepads(&controller_count);
     LOG_INFO(Input, "{} controllers are currently connected", controller_count);
 
@@ -293,7 +338,7 @@ void GameControllers::TryOpenSDLControllers() {
                 auto u = UserManagement.GetUserByID(controllers[i]->user_id);
                 SDL_CloseGamepad(pad);
                 controllers[i]->DisconnectController();
-                controllers[i]->user_id = -1;
+                controllers[i]->ClearInput();
                 slot_taken[i] = false;
             }
         }
@@ -309,6 +354,7 @@ void GameControllers::TryOpenSDLControllers() {
             continue;
         }
 
+        bool assigned = false;
         for (int i = 0; i < 4; i++) {
             if (!slot_taken[i]) {
                 auto u = UserManagement.GetUserByPlayerIndex(i + 1);
@@ -320,10 +366,12 @@ void GameControllers::TryOpenSDLControllers() {
                 auto* c = controllers[i];
                 LOG_INFO(Input, "Gamepad registered for slot {}! Handle: {}", i,
                          SDL_GetGamepadID(pad));
+                assigned = true;
                 slot_taken[i] = true;
                 c->user_id = u->user_id;
                 UserManagement.LoginUser(u, i + 1);
                 c->ConnectController(pad);
+                if (i > 0) profile_prompt = id;
                 if (EmulatorSettings.IsMotionControlsEnabled()) {
                     if (SDL_SetGamepadSensorEnabled(c->m_sdl_gamepad, SDL_SENSOR_GYRO, true)) {
                         c->gyro_poll_rate =
@@ -345,6 +393,7 @@ void GameControllers::TryOpenSDLControllers() {
                 break;
             }
         }
+        if (!assigned) SDL_CloseGamepad(pad);
     }
     if (is_first_check) [[unlikely]] {
         is_first_check = false;
@@ -356,6 +405,8 @@ void GameControllers::TryOpenSDLControllers() {
         }
     }
     SDL_free(new_joysticks);
+    Profiles::Refresh();
+    if (profile_prompt) Profiles::Open(profile_prompt);
 }
 u8 GameController::GetTouchCount() {
     return m_touch_count;
@@ -416,7 +467,7 @@ void GameController::PushState() {
 
 u8 GameControllers::GetGamepadIndexFromJoystickId(SDL_JoystickID id) {
     auto g = SDL_GetGamepadFromID(id);
-    ASSERT(g != nullptr);
+    if (!g) return 255;
     for (int i = 0; i < 5; i++) {
         if (controllers[i]->m_sdl_gamepad == g) {
             return i;

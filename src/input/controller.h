@@ -91,6 +91,7 @@ public:
     virtual ~GameController() = default;
     void ConnectController(SDL_Gamepad* pad);
     void DisconnectController();
+    void ClearInput();
 
     void ReadState(State* state, bool* isConnected, int* connectedCount);
     int ReadStates(State* states, int states_num, bool* isConnected, int* connectedCount);
@@ -123,8 +124,8 @@ public:
     std::chrono::steady_clock::time_point GetLastUpdate();
     void SetLastUpdate(std::chrono::steady_clock::time_point lastUpdate);
 
-    float gyro_poll_rate;
-    float accel_poll_rate;
+    float gyro_poll_rate{};
+    float accel_poll_rate{};
     float gyro_buf[3] = {0.0f, 0.0f, 0.0f}, accel_buf[3] = {0.0f, 9.81f, 0.0f};
     s32 user_id = Libraries::UserService::ORBIS_USER_SERVICE_USER_ID_INVALID;
     SDL_Gamepad* m_sdl_gamepad = nullptr;
@@ -165,6 +166,7 @@ public:
         return controllers[i];
     }
     void TryOpenSDLControllers();
+    bool AssignDeviceToProfile(SDL_JoystickID device, u8 profile_slot);
     u8 GetGamepadIndexFromJoystickId(SDL_JoystickID id);
     static std::optional<u8> GetControllerIndexFromUserID(s32 user_id);
     static std::optional<u8> GetControllerIndexFromControllerID(s32 controller_id);

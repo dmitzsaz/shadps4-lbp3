@@ -610,5 +610,7 @@ public:
 bool UpdatePressedKeys(InputEvent event);
 
 void ActivateOutputsFromInputs();
+// Main thread only; discard held inputs when a system menu changes pad ownership.
+void ReleaseAllInputs();
 
 } // namespace Input

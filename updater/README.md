@@ -19,7 +19,8 @@ them. Only the rebuilt updater and the enclosing bundle seals are signed.
 The complete source bundle and updater resource seal are verified because the
 launcher cannot be validated separately from its original app resources. The
 ICD JSON's generic signature is retained in extended attributes.
-Version 1.7 carries the validated indexed QuadList and attachmentless render-area
+Version 1.8 adds one shared controller/profile menu for hotplug, Guide and F2,
+with session-only controller reassignment and occupied-profile swaps. It also carries the validated indexed QuadList and attachmentless render-area
 fixes, alongside controller replay and bounded performance diagnostics. The
 runtime uses KosmicKrisp/Metal on Apple Silicon and requires macOS 26 or newer;
 the updater UI itself can run on macOS 14 or newer.
@@ -31,7 +32,7 @@ Package for another Mac with Apple's archive format so the ICD signature survive
 
 ```sh
 ditto -c -k --sequesterRsrc --keepParent \
-  updater-dist/shadPS4-update.app shadPS4-update-v1.7.zip
+  updater-dist/shadPS4-update.app shadPS4-update-v1.8.zip
 ```
 
 Validate an updater, including an actual update and a second idempotent update,

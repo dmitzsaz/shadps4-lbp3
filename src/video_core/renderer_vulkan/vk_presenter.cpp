@@ -13,6 +13,7 @@
 #include "core/libraries/system/systemservice.h"
 #include "imgui/friends_layer.h"
 #include "imgui/invitation_prompt_layer.h"
+#include "input/profile_menu.h"
 #include "imgui/notifications_layer.h"
 #include "imgui/renderer/imgui_core.h"
 #include "imgui/renderer/imgui_impl_vulkan.h"
@@ -529,9 +530,11 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
     ImGui::Friends::Register();
     ImGui::ShadNetNotify::Register();
     ImGui::InvitationPrompt::Register();
+    Input::Profiles::Register();
 }
 
 Presenter::~Presenter() {
+    Input::Profiles::Unregister();
     ImGui::InvitationPrompt::Unregister();
     ImGui::ShadNetNotify::Unregister();
     ImGui::Friends::Unregister();

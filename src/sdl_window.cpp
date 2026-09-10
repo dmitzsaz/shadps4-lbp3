@@ -29,6 +29,7 @@
 #include "input/controller.h"
 #include "input/input_handler.h"
 #include "input/input_mouse.h"
+#include "input/profile_menu.h"
 #include "sdl_window.h"
 #include "video_core/renderdoc.h"
 
@@ -285,13 +286,18 @@ void WindowSDL::WaitEvent() {
         return;
     }
 
-    if (Libraries::Mouse::PushSDLEvent(event)) {
+    if (Input::Profiles::ProcessEvent(event)) return;
+
+    if (!Input::Profiles::IsOpen() && Libraries::Mouse::PushSDLEvent(event)) {
         return;
     }
 
     if (ImGui::Core::ProcessEvent(&event)) {
         return;
     }
+    if (Input::Profiles::IsOpen() &&
+        (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN || event.type == SDL_EVENT_MOUSE_BUTTON_UP ||
+         event.type == SDL_EVENT_MOUSE_WHEEL || event.type == SDL_EVENT_MOUSE_WHEEL_OFF)) return;
 
     switch (event.type) {
     case SDL_EVENT_WINDOW_RESIZED:
@@ -355,7 +361,7 @@ void WindowSDL::WaitEvent() {
         }
         break;
     case SDL_EVENT_CHANGE_CONTROLLER:
-        UNREACHABLE_MSG("todo");
+        Input::Profiles::Open();
         break;
     case SDL_EVENT_TOGGLE_SIMPLE_FPS:
         Overlay::ToggleSimpleFps();
@@ -483,6 +489,8 @@ void WindowSDL::OnKeyboardMouseInput(const SDL_Event* event) {
 }
 
 void WindowSDL::OnGamepadEvent(const SDL_Event* event) {
+    // SDL may still deliver queued events for a removed or unassigned device.
+    if (controllers.GetGamepadIndexFromJoystickId(event->gbutton.which) >= 4) return;
     bool input_down = event->type == SDL_EVENT_GAMEPAD_AXIS_MOTION ||
                       event->type == SDL_EVENT_GAMEPAD_BUTTON_DOWN;
     Input::InputEvent input_event = Input::InputBinding::GetInputEventFromSDLEvent(*event);
@@ -490,7 +498,9 @@ void WindowSDL::OnGamepadEvent(const SDL_Event* event) {
     // the touchpad button shouldn't be rebound to anything else,
     // as it would break the entire touchpad handling
     // You can still bind other things to it though
-    if (event->gbutton.button == SDL_GAMEPAD_BUTTON_TOUCHPAD) {
+    if ((event->type == SDL_EVENT_GAMEPAD_BUTTON_DOWN ||
+         event->type == SDL_EVENT_GAMEPAD_BUTTON_UP) &&
+        event->gbutton.button == SDL_GAMEPAD_BUTTON_TOUCHPAD) {
         controllers[controllers.GetGamepadIndexFromJoystickId(event->gbutton.which)]->Button(
             OrbisPadButtonDataOffset::TouchPad, input_down);
         return;

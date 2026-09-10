@@ -1190,6 +1190,8 @@ set(IMGUI src/imgui/imgui_config.h
 )
 
 set(INPUT src/input/controller.cpp
+          src/input/profile_menu.cpp
+          src/input/profile_menu.h
           src/input/input_movie.cpp
           src/input/input_movie.h
           src/input/controller.h

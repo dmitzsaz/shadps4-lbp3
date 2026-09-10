@@ -1021,4 +1021,13 @@ void ActivateOutputsFromInputs() {
     }
 }
 
+void ReleaseAllInputs() {
+    pressed_keys.clear();
+    toggled_keys.clear();
+    ActivateOutputsFromInputs();
+    for (u8 slot = 0; slot < 5; ++slot) {
+        ControllerOutput::controllers[slot]->ClearInput();
+    }
+}
+
 } // namespace Input
