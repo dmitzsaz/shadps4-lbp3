@@ -739,25 +739,20 @@ static void UpdateGamepads() {
     ImGuiIO& io = ImGui::GetIO();
     SdlData* bd = GetBackendData();
 
-    auto& controllers = *Common::Singleton<Input::GameControllers>::Instance();
-    SDL_Gamepad* SDLGamepad = controllers[0]->m_sdl_gamepad;
-    // Update list of gamepads to use
+    // Own a separate SDL reference for every entry. Never borrow the game's
+    // handles: CloseGamepads() releases this list on refresh/shutdown.
     if (bd->want_update_gamepads_list && bd->gamepad_mode != ImGui_ImplSDL3_GamepadMode_Manual) {
-        if (SDLGamepad) {
-            bd->gamepads.push_back(SDLGamepad);
-            bd->want_update_gamepads_list = false;
-        } else {
-            CloseGamepads();
-            int sdl_gamepads_count = 0;
-            const SDL_JoystickID* sdl_gamepads = SDL_GetGamepads(&sdl_gamepads_count);
-            for (int n = 0; n < sdl_gamepads_count; n++)
-                if (SDL_Gamepad* gamepad = SDL_OpenGamepad(sdl_gamepads[n])) {
-                    bd->gamepads.push_back(gamepad);
-                    if (bd->gamepad_mode == ImGui_ImplSDL3_GamepadMode_AutoFirst)
-                        break;
-                }
-            bd->want_update_gamepads_list = false;
+        CloseGamepads();
+        int count = 0;
+        SDL_JoystickID* devices = SDL_GetGamepads(&count);
+        for (int i = 0; i < count; ++i) {
+            if (SDL_Gamepad* gamepad = SDL_OpenGamepad(devices[i])) {
+                bd->gamepads.push_back(gamepad);
+                if (bd->gamepad_mode == ImGui_ImplSDL3_GamepadMode_AutoFirst) break;
+            }
         }
+        SDL_free(devices);
+        bd->want_update_gamepads_list = false;
     }
 
     // FIXME: Technically feeding gamepad shouldn't depend on this now that they are regular inputs.

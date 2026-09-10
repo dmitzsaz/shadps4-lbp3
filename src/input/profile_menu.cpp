@@ -51,22 +51,37 @@ void CloseMenu() {
     stick_direction = 0;
     ImGui::Core::ReleaseGamepadInputCapture();
 }
+// Called with mutex held. Selection follows physical input, never the profile
+// slot whose label happened to be selected by a different controller.
+bool SelectDeviceLocked(SDL_JoystickID device) {
+    if (!device || selected_device == device) return false;
+    for (u8 i = 0; i < profiles.size(); ++i) {
+        if (profiles[i].device == device) {
+            selected_device = device;
+            selected_profile = i;
+            stick_direction = 0;
+            return true;
+        }
+    }
+    return false;
+}
+bool KnownDevice(SDL_JoystickID device) {
+    return Common::Singleton<GameControllers>::Instance()->GetGamepadIndexFromJoystickId(device) < 4;
+}
 void MoveProfile(int direction) {
     for (int n = 0; n < 4; ++n) {
         selected_profile = (selected_profile + direction + 4) % 4;
         if (profiles[selected_profile].available) break;
     }
 }
-void MoveDevice(int direction) {
-    auto it = std::ranges::find(profiles, selected_device, &Profile::device);
-    int index = it == profiles.end() ? 0 : int(it - profiles.begin());
-    for (int n = 0; n < 4; ++n) {
-        index = (index + direction + 4) % 4;
-        if (profiles[index].device) {
-            selected_device = profiles[index].device;
-            selected_profile = index;
-            break;
-        }
+std::string DeviceName(SDL_Gamepad* pad) {
+    switch (SDL_GetRealGamepadType(pad)) {
+    case SDL_GAMEPAD_TYPE_PS5: return "DualSense";
+    case SDL_GAMEPAD_TYPE_PS4: return "DUALSHOCK 4";
+    default: {
+        const char* name = SDL_GetGamepadName(pad);
+        return name && *name ? name : "Геймпад";
+    }
     }
 }
 class Menu final : public ImGui::Layer {
@@ -75,53 +90,57 @@ public:
         std::lock_guard lock(mutex);
         if (!open) return;
         const auto& io = ImGui::GetIO();
-        const float width = std::min(660.0f, std::max(300.0f, io.DisplaySize.x - 32.0f));
+        const float width = std::min(700.0f, std::max(300.0f, io.DisplaySize.x - 32.0f));
         ImGui::SetNextWindowPos({io.DisplaySize.x / 2, io.DisplaySize.y / 2},
                                ImGuiCond_Always, {0.5f, 0.5f});
         ImGui::SetNextWindowSizeConstraints({width, 0}, {width, io.DisplaySize.y - 32});
         ImGui::SetNextWindowBgAlpha(1);
         ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0, 0, 0, 1));
-        // Pad/keyboard navigation is handled by device-aware SDL events, so a
-        // different controller cannot accidentally activate ImGui's global focus.
-        if (ImGui::Begin("Профили и контроллеры", nullptr,
+        // SDL handles navigation with device identity; ImGui only handles the mouse.
+        if (ImGui::Begin("Профиль игрока", nullptr,
                          ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoCollapse |
                          ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoNav |
                          ImGuiWindowFlags_NoMove)) {
-            ImGui::TextWrapped("Выберите контроллер и профиль для него.");
-            for (u8 i = 0; i < profiles.size(); ++i) {
-                const auto& profile = profiles[i];
+            const auto count = std::ranges::count_if(profiles, [](const Profile& p) { return p.device != 0; });
+            ImGui::Text("Подключено геймпадов: %d", int(count));
+            for (const auto& profile : profiles) {
                 if (!profile.device) continue;
-                ImGui::PushID(i);
-                const std::string label = "Контроллер " + std::to_string(i + 1);
+                ImGui::PushID(int(profile.device));
+                const std::string label = profile.controller + "  |  " + profile.name;
                 if (ImGui::Selectable(label.c_str(), selected_device == profile.device))
                     Send(SelectDevice, profile.device);
-                if (selected_device == profile.device)
-                    ImGui::TextWrapped("%s", profile.controller.c_str());
                 ImGui::PopID();
             }
-            if (!selected_device) ImGui::TextWrapped("Подключите контроллер, чтобы назначить профиль.");
-            ImGui::Separator();
-            for (u8 i = 0; i < profiles.size(); ++i) {
-                const auto& profile = profiles[i];
-                ImGui::PushID(100 + i);
-                ImGui::BeginDisabled(!profile.available || !selected_device);
-                const std::string label = std::to_string(i + 1) + ". " +
-                    (profile.available ? profile.name : "Профиль не настроен");
-                if (ImGui::Selectable(label.c_str(), selected_profile == i)) Send(SelectProfile, 0, i);
-                if (profile.device) ImGui::TextDisabled("%s", profile.device == selected_device
-                    ? "Назначен этому контроллеру" : "Занят — контроллеры поменяются местами");
+            if (!selected_device) {
+                ImGui::TextWrapped("Нет подключённых геймпадов.");
+            } else {
+                ImGui::TextWrapped("Нажмите кнопку на нужном геймпаде, чтобы выбрать его.");
+                ImGui::Separator();
+                const auto it = std::ranges::find(profiles, selected_device, &Profile::device);
+                ImGui::TextWrapped("Профиль для %s:", it == profiles.end() ? "геймпада" : it->controller.c_str());
+                for (u8 i = 0; i < profiles.size(); ++i) {
+                    const auto& profile = profiles[i];
+                    if (!profile.available) continue;
+                    ImGui::PushID(100 + i);
+                    std::string label = profile.name;
+                    if (profile.device == selected_device) label += "  (текущий)";
+                    else if (profile.device) label += "  |  " + profile.controller;
+                    else label += "  (свободен)";
+                    if (ImGui::Selectable(label.c_str(), selected_profile == i)) Send(SelectProfile, 0, i);
+                    ImGui::PopID();
+                }
+                const auto& target = profiles[selected_profile];
+                if (target.device && target.device != selected_device && it != profiles.end()) {
+                    ImGui::TextWrapped("%s перейдёт к профилю %s.", target.controller.c_str(), it->name.c_str());
+                }
+                ImGui::Separator();
+                ImGui::BeginDisabled(!target.available);
+                if (ImGui::Button("Выбрать и играть")) Send(Assign, selected_device, selected_profile);
                 ImGui::EndDisabled();
-                ImGui::PopID();
+                ImGui::SameLine();
             }
-            ImGui::Separator();
-            ImGui::BeginDisabled(!selected_device || !profiles[selected_profile].available);
-            if (ImGui::Button("Назначить")) Send(Assign, selected_device, selected_profile);
-            ImGui::EndDisabled();
-            ImGui::SameLine();
-            if (ImGui::Button("Готово")) Send(Close);
-            ImGui::TextWrapped("←/→: контроллер  ·  ↑/↓: профиль\n"
-                               "✕ / A: назначить  ·  ○ / B: закрыть\n"
-                               "PS / Xbox или F2: открыть меню");
+            if (ImGui::Button("Закрыть")) Send(Close);
+            ImGui::TextWrapped("Вверх / вниз: профиль. X / A: выбрать. Круг / B: закрыть.");
         }
         ImGui::End();
         ImGui::PopStyleColor();
@@ -140,19 +159,31 @@ void Refresh() {
     for (u8 i = 0; i < profiles.size(); ++i) {
         auto* user = UserManagement.GetUserByPlayerIndex(i + 1);
         auto* pad = controllers[i]->m_sdl_gamepad;
-        const char* name = pad ? SDL_GetGamepadName(pad) : nullptr;
-        profiles[i] = {user ? user->user_name : "", name ? name : "Контроллер",
-                       pad ? SDL_GetGamepadID(pad) : 0, user != nullptr};
+        // A non-null SDL handle can outlive a disconnected device.
+        const bool connected = pad && SDL_GamepadConnected(pad);
+        profiles[i] = {user ? user->user_name : "", connected ? DeviceName(pad) : "",
+                       connected ? SDL_GetGamepadID(pad) : 0, user != nullptr};
         found |= selected_device != 0 && profiles[i].device == selected_device;
+    }
+    // Two physical devices of the same model are valid. Give them distinct
+    // labels instead of deduplicating by name, model or VID/PID.
+    const auto names = profiles;
+    for (auto& profile : profiles) {
+        if (!profile.device) continue;
+        int count = 0, index = 1;
+        for (const auto& other : names) {
+            if (other.device && other.controller == profile.controller) {
+                ++count;
+                if (other.device < profile.device) ++index;
+            }
+        }
+        if (count > 1) profile.controller += " #" + std::to_string(index);
     }
     if (!found) {
         selected_device = 0;
-        for (u8 i = 0; i < profiles.size(); ++i) {
-            if (profiles[i].device) {
-                selected_device = profiles[i].device;
-                selected_profile = i;
-                break;
-            }
+        stick_direction = 0;
+        for (const auto& profile : profiles) {
+            if (SelectDeviceLocked(profile.device)) break;
         }
     }
 }
@@ -160,14 +191,11 @@ void Open(SDL_JoystickID device) {
     Refresh();
     ReleaseAllInputs();
     std::lock_guard lock(mutex);
-    for (u8 i = 0; i < profiles.size(); ++i) {
-        if (device && profiles[i].device == device) {
-            selected_device = device;
-            selected_profile = i;
-            break;
-        }
-    }
+    SelectDeviceLocked(device);
     if (!open) {
+        const auto current = std::ranges::find(profiles, selected_device, &Profile::device);
+        if (selected_device && current != profiles.end()) selected_profile = u8(current - profiles.begin());
+        stick_direction = 0;
         ImGui::Core::AcquireGamepadInputCapture();
         open = true;
     }
@@ -184,8 +212,10 @@ bool ProcessEvent(const SDL_Event& event) {
             if (profiles[slot].available) selected_profile = slot;
         } else if (event.user.code == Assign && slot < 4) {
             ReleaseAllInputs();
-            Common::Singleton<GameControllers>::Instance()->AssignDeviceToProfile(device, slot);
-            Refresh();
+            if (Common::Singleton<GameControllers>::Instance()->AssignDeviceToProfile(device, slot)) {
+                Refresh();
+                CloseMenu();
+            }
         }
         return true;
     }
@@ -195,8 +225,11 @@ bool ProcessEvent(const SDL_Event& event) {
     const bool shortcut = (event.type == SDL_EVENT_KEY_DOWN || event.type == SDL_EVENT_KEY_UP) &&
                           event.key.key == SDLK_F2;
     if (guide || shortcut) {
+        if (guide && !KnownDevice(event.gbutton.which)) return true;
         if ((guide && event.gbutton.down) || (shortcut && event.key.down && !event.key.repeat)) {
-            if (IsOpen()) CloseMenu();
+            bool same_device;
+            { std::lock_guard lock(mutex); same_device = !guide || selected_device == event.gbutton.which; }
+            if (IsOpen() && same_device) CloseMenu();
             else Open(guide ? event.gbutton.which : 0);
         }
         return true;
@@ -204,24 +237,33 @@ bool ProcessEvent(const SDL_Event& event) {
     if (!IsOpen()) return false;
     if (event.type == SDL_EVENT_KEY_DOWN || event.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN) {
         const bool keyboard = event.type == SDL_EVENT_KEY_DOWN;
+        if (!keyboard && !KnownDevice(event.gbutton.which)) return true;
+        if (keyboard && event.key.repeat) return true;
         const auto key = keyboard ? event.key.key : SDLK_UNKNOWN;
         const auto button = keyboard ? SDL_GAMEPAD_BUTTON_INVALID : SDL_GamepadButton(event.gbutton.button);
         std::lock_guard lock(mutex);
+        const bool switched = !keyboard && SelectDeviceLocked(event.gbutton.which);
+        // The first press on another pad selects it; it must not also confirm
+        // the profile previously highlighted for a different device.
+        if (switched) return true;
         if (key == SDLK_ESCAPE || button == SDL_GAMEPAD_BUTTON_EAST) Send(Close);
         else if (key == SDLK_RETURN || button == SDL_GAMEPAD_BUTTON_SOUTH)
             Send(Assign, selected_device, selected_profile);
         else if (key == SDLK_UP || button == SDL_GAMEPAD_BUTTON_DPAD_UP) MoveProfile(-1);
         else if (key == SDLK_DOWN || button == SDL_GAMEPAD_BUTTON_DPAD_DOWN) MoveProfile(1);
-        else if (key == SDLK_LEFT || button == SDL_GAMEPAD_BUTTON_DPAD_LEFT) MoveDevice(-1);
-        else if (key == SDLK_RIGHT || key == SDLK_TAB || button == SDL_GAMEPAD_BUTTON_DPAD_RIGHT) MoveDevice(1);
         return true;
     }
     if (event.type == SDL_EVENT_GAMEPAD_AXIS_MOTION) {
-        if (event.gaxis.axis == SDL_GAMEPAD_AXIS_LEFTY) {
+        if (event.gaxis.axis == SDL_GAMEPAD_AXIS_LEFTY && KnownDevice(event.gaxis.which)) {
             const int direction = event.gaxis.value < -18000 ? -1 : event.gaxis.value > 18000 ? 1 : 0;
             std::lock_guard lock(mutex);
-            if (direction && direction != stick_direction) MoveProfile(direction);
-            stick_direction = direction;
+            // Neutral/noisy input from another controller cannot steal focus.
+            if (selected_device != event.gaxis.which) {
+                if (direction) SelectDeviceLocked(event.gaxis.which);
+            } else {
+                if (direction && direction != stick_direction) MoveProfile(direction);
+                stick_direction = direction;
+            }
         }
         return true;
     }

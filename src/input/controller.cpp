@@ -15,6 +15,7 @@
 #include "core/user_settings.h"
 #include "input/controller.h"
 #include "input/profile_menu.h"
+#include "input/input_handler.h"
 
 namespace Input {
 
@@ -314,6 +315,7 @@ void GameControllers::TryOpenSDLControllers() {
     int controller_count;
     s32 move_count = 0;
     SDL_JoystickID profile_prompt = 0;
+    bool removed = false;
     SDL_JoystickID* new_joysticks = SDL_GetGamepads(&controller_count);
     LOG_INFO(Input, "{} controllers are currently connected", controller_count);
 
@@ -327,7 +329,7 @@ void GameControllers::TryOpenSDLControllers() {
             bool still_connected = false;
             ControllerType type = ControllerType::Standard;
             for (int j = 0; j < controller_count; j++) {
-                if (new_joysticks[j] == id) {
+                if (new_joysticks[j] == id && SDL_GamepadConnected(pad)) {
                     still_connected = true;
                     assigned_ids.insert(id);
                     slot_taken[i] = true;
@@ -335,10 +337,10 @@ void GameControllers::TryOpenSDLControllers() {
                 }
             }
             if (!still_connected) {
-                auto u = UserManagement.GetUserByID(controllers[i]->user_id);
                 SDL_CloseGamepad(pad);
                 controllers[i]->DisconnectController();
                 controllers[i]->ClearInput();
+                removed = true;
                 slot_taken[i] = false;
             }
         }
@@ -351,8 +353,12 @@ void GameControllers::TryOpenSDLControllers() {
 
         SDL_Gamepad* pad = SDL_OpenGamepad(id);
         if (!pad) {
+            LOG_WARNING(Input, "Could not open gamepad {}: {}", id, SDL_GetError());
             continue;
         }
+        LOG_INFO(Input, "Gamepad {}: name='{}', type={}, vendor={:04x}, product={:04x}",
+                 id, SDL_GetGamepadName(pad), int(SDL_GetRealGamepadType(pad)),
+                 SDL_GetGamepadVendor(pad), SDL_GetGamepadProduct(pad));
 
         bool assigned = false;
         for (int i = 0; i < 4; i++) {
@@ -366,12 +372,13 @@ void GameControllers::TryOpenSDLControllers() {
                 auto* c = controllers[i];
                 LOG_INFO(Input, "Gamepad registered for slot {}! Handle: {}", i,
                          SDL_GetGamepadID(pad));
+                const bool additional_device = std::ranges::any_of(slot_taken, [](bool taken) { return taken; });
                 assigned = true;
                 slot_taken[i] = true;
                 c->user_id = u->user_id;
                 UserManagement.LoginUser(u, i + 1);
                 c->ConnectController(pad);
-                if (i > 0) profile_prompt = id;
+                if (additional_device) profile_prompt = id;
                 if (EmulatorSettings.IsMotionControlsEnabled()) {
                     if (SDL_SetGamepadSensorEnabled(c->m_sdl_gamepad, SDL_SENSOR_GYRO, true)) {
                         c->gyro_poll_rate =
@@ -405,6 +412,7 @@ void GameControllers::TryOpenSDLControllers() {
         }
     }
     SDL_free(new_joysticks);
+    if (removed) ReleaseAllInputs();
     Profiles::Refresh();
     if (profile_prompt) Profiles::Open(profile_prompt);
 }
@@ -467,7 +475,7 @@ void GameController::PushState() {
 
 u8 GameControllers::GetGamepadIndexFromJoystickId(SDL_JoystickID id) {
     auto g = SDL_GetGamepadFromID(id);
-    if (!g) return 255;
+    if (!g || !SDL_GamepadConnected(g)) return 255;
     for (int i = 0; i < 5; i++) {
         if (controllers[i]->m_sdl_gamepad == g) {
             return i;
